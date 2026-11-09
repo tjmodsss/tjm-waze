@@ -1,3 +1,20 @@
+# tjm-waze
+
+The TJM Store's source for the CarPlay / Android Auto map on the instrument cluster: **TJM Waze
+Cluster** (the HMI app), **waze-on-cluster** (the Waze tool) and **cluster-render** (the cluster
+renderer), published as this repository's releases. The TJM Store
+([tjmodsss/tjm-store](https://github.com/tjmodsss/tjm-store)) installs them; it
+installs only from TJM's own repositories.
+
+Based on [idrive-apps](https://github.com/robertnisipeanu/idrive-apps) by Robert Nisipeanu,
+GPL-3.0-or-later (`LICENSE`; cluster-render's interface files MPL-2.0, `LICENSES/`). TJM's change:
+the app's tile name ("TJM Waze Cluster") and icon. The app keeps its id `robertn_waze_cluster`.
+Instagram [@tareqmods](https://www.instagram.com/tareqmods/).
+
+---
+
+## The original idrive-apps README
+
 # idrive-apps
 
 Tools and apps for the iDrive 7 head unit (MGU) of a BMW, installed from the

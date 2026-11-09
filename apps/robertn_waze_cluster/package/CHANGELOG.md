@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- TJM: the tile reads "TJM Waze Cluster" in every language, with the TJM icon.
+
 ## 0.6.4
 
 Map settings per driver profile, after eroobeeroo's #41. Show on, the HUD

@@ -60,8 +60,26 @@
  * listed slot stays where it is. A loss
  * with the slot locked does not climb the ladder, and after a lock a
  * take-over target is asked for once the slot is not locked, with stock
- * content shown there or not. */
+ * content shown there or not. Accepted, not mapped, for any target, with
+ * or without take-overs: a map the display accepted with no map status for
+ * 3 s, or a parked, shown or lingering scene whose own row the slot table
+ * reports unmapped (none mapped) for 3 s, is released and asked for again
+ * on the ladder, or at once when the slot comes back from a lock, never
+ * while it is locked; a row mapped again within the 3 s, or a parked
+ * scene the stock map stays ahead of, is left alone. The panel on its own scene id: shown with
+ * the map and the HUD at once, each released and asked for again in its
+ * warm scene alone; falling back to the HUD's id when the display refuses
+ * the scene as unknown, and when the guard disables its own id (two
+ * strikes), also at the next start, the map and the HUD untouched; never
+ * for failed fetches, an unknown client, a removed fetch, a busy slot or a
+ * removal; the HMI's speech dialog in 0x203, on the HUD's id, given way to.
+ * Giving way: the HUD to a list in 0x322 as shipped, asked for again
+ * yield_ms after it goes, a call's pop-up in 0x321 left alone; to one in
+ * 0x321 when hud_yield_slots names it; never to route guidance (BMW's, in its own
+ * slot or a yield slot, and the turn box); to nothing while a layer has
+ * yield false, and asked for again at once when one sets it while waiting. */
 #include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -104,6 +122,13 @@ struct FakePort : Port {
     bool confirm = true;
     bool available() const override { return up; }
     bool confirmed(const TargetSpec &) const override { return confirm; }
+    /* By target name: when the display accepted its map (Port::accepted_ms). */
+    std::map<std::string, int64_t> accepted;
+    int64_t accepted_ms(const TargetSpec &t) const override
+    {
+        auto a = accepted.find(t.name);
+        return a == accepted.end() ? -1 : a->second;
+    }
     void request(const TargetSpec &t) override { calls.push_back("request " + t.name); }
     void release(const TargetSpec &t) override { calls.push_back("release " + t.name); }
     void take_over(const TargetSpec &t, uint64_t content) override
@@ -933,6 +958,115 @@ static void take_overs_restart_when_shown()
     ok("and the next 1.5 s later", quiet && joined().find("take over map 0x1000300") != std::string::npos);
 }
 
+/* Car log 2026-11-12 08:04: the map parked behind the stock map after a
+ * lock, then a second lock unmaps ours (3 -> 0) with no map status; only
+ * the slot table tells. Released 3 s later and asked for again once the
+ * slot is free, not left parked while the take-overs unmap the stock map
+ * every 30 s. */
+static void not_mapped_map_after_lock()
+{
+    Rig r;
+    r.m.want(0, true, true);
+    r.m.tick(r.now);
+    r.rows(kMapSlot, 2, {{kHmiMap, 1}, {kMapScene, 3}});
+    r.m.on_parked(kMapScene, r.now);
+    r.m.tick(r.now);
+    ok("map: parked behind the stock map, a take-over", joined().find("take over map 0x1000300") != std::string::npos);
+    r.rows(kMapSlot, 1, {{kHmiMap, 0}, {kMapScene, 3}});
+    r.run(150);
+    r.rows(kMapSlot, 2, {{kHmiMap, 1}, {kMapScene, 3}});
+    r.run(1500);
+    joined();
+    r.rows(kMapSlot, 0, {{kHmiMap, 1}, {kMapScene, 3}, {kMapScene, 0}});
+    r.run(3500);
+    ok("map: a lock listing ours parked and unmapped: still mapped, kept", r.state(0) == TargetState::Parked &&
+                                                                           joined().find("release") == std::string::npos);
+    r.rows(kMapSlot, 0, {{kHmiMap, 1}, {kMapScene, 0}});
+    r.run(2990);
+    ok("map: ours unmapped in the locked slot, 2.99 s: kept",
+       r.state(0) == TargetState::Parked && joined().find("release") == std::string::npos);
+    r.run(10);
+    ok("map: 3 s: released, waiting", joined().find("release map") == 0 && r.state(0) == TargetState::Waiting &&
+                                          !r.m.requested(0));
+    r.rows(kMapSlot, 0, {{kHmiMap, 0}, {kMapScene, 0}});
+    r.run(100);
+    const std::string locked = joined();
+    ok("map: nothing asked for or taken over while the slot is locked",
+       locked.find("request") == std::string::npos && locked.find("take over") == std::string::npos);
+    r.rows(kMapSlot, 1, {{kHmiMap, 0}});
+    r.run(10);
+    ok("map: the lock gone: asked for again at once", calls_are("request map") && r.state(0) == TargetState::Acquiring);
+    r.rows(kMapSlot, 2, {{kHmiMap, 1}, {kMapScene, 3}});
+    r.m.on_parked(kMapScene, r.now);
+    r.m.tick(r.now);
+    ok("map: parked again: a take-over at once, the count started over",
+       joined().find("take over map 0x1000300") != std::string::npos);
+    r.run(1490);
+    const bool spaced = joined().find("take over") == std::string::npos;
+    r.run(10);
+    ok("map: and the next 1.5 s later", spaced && joined().find("take over map 0x1000300") != std::string::npos);
+    r.rows(kMapSlot, 2, {{kHmiMap, 3}, {kMapScene, 1}});
+    r.m.on_shown(kMapScene, r.now);
+    ok("map: and shown", r.state(0) == TargetState::Shown);
+
+    Rig k;   /* parked, the stock map staying ahead: the take-overs' business */
+    k.m.want(0, true, true);
+    k.m.tick(k.now);
+    k.rows(kMapSlot, 2, {{kHmiMap, 1}, {kMapScene, 3}});
+    k.m.on_parked(kMapScene, k.now);
+    k.run(20000);
+    const std::string ahead = joined();
+    ok("map: parked 20 s behind the stock map: taken over on its steps, never released",
+       k.state(0) == TargetState::Parked && ahead.find("release") == std::string::npos &&
+           ahead.find("take over map 0x1000300") != std::string::npos);
+}
+
+/* The panel (no take-overs) and the HUD: a shown scene the table reports
+ * unmapped with no map status, and a map the display accepted and never
+ * answered, are released and asked for again on the ladder. */
+static void not_mapped_panel_and_hud()
+{
+    Rig r;
+    r.m.want(1, true, false);
+    r.m.tick(r.now);
+    r.rows(kPanelSlot, 2, {{kPanelScene, 1}});
+    r.m.on_shown(kPanelScene, r.now);
+    joined();
+    r.rows(kPanelSlot, 1, {{kPanelScene, 0}});
+    r.run(1000);
+    r.rows(kPanelSlot, 2, {{kPanelScene, 1}});
+    r.run(5000);
+    ok("panel: its row unmapped 1 s, then mapped again: kept", r.state(1) == TargetState::Shown && calls_are(""));
+    r.rows(kPanelSlot, 1, {{kPanelScene, 0}});
+    r.run(2990);
+    ok("panel: shown, its row unmapped 2.99 s: kept", r.state(1) == TargetState::Shown && calls_are(""));
+    r.run(10);
+    ok("panel: 3 s: released, waiting on the ladder", calls_are("release panel") &&
+                                                          r.state(1) == TargetState::Waiting &&
+                                                          r.m.status(1).retry_ms == r.now + 2000);
+    r.run(2000);
+    ok("panel: asked for again 2 s later", calls_are("request panel") && r.state(1) == TargetState::Acquiring);
+
+    Rig h;
+    h.m.want(2, true, false);
+    h.m.tick(h.now);
+    joined();
+    h.port.accepted["hud"] = h.now;
+    h.run(2990);
+    ok("hud: its map accepted, no map status for 2.99 s: still acquiring",
+       h.state(2) == TargetState::Acquiring && calls_are(""));
+    h.run(10);
+    ok("hud: 3 s: released, waiting", calls_are("release hud") && h.state(2) == TargetState::Waiting);
+    h.port.accepted.clear();
+    h.run(2000);
+    ok("hud: asked for again on the ladder", calls_are("request hud"));
+    h.rows(kHudSlot, 2, {{kPanelScene, 1}});
+    h.m.on_shown(kPanelScene, h.now);
+    ok("hud: and shown", h.state(2) == TargetState::Shown);
+    h.run(10000);
+    ok("hud: shown with its row mapped: nothing more", calls_are("") && h.state(2) == TargetState::Shown);
+}
+
 /* Car log 2026-11-01 13:49: a 6 s lock with the map's 2 s retry due in it.
  * Nothing is asked for while the slot is reported disabled; the map is
  * asked for on the first tick the slot is reported free. */
@@ -1368,15 +1502,36 @@ static void rendering()
     r.m.on_shown(kMapScene, r.now);
     const int64_t shown = r.now;
     r.run(1510);
-    ok("shown again, still not subscribed: released, on the ladder (2 s) this time",
-       calls_are("release map") && r.state(0) == TargetState::Waiting &&
+    ok("shown again, still not subscribed: released and unpublished (a fresh offer next), on the ladder (2 s) this time",
+       calls_are("release map; unpublish map") && r.state(0) == TargetState::Waiting &&
            r.m.status(0).retry_ms == shown + SlotManager::kVerifyMs + 2000);
     r.run(2000);
-    ok("asked for again at the step", calls_are("request map"));
+    ok("asked for again at the step, published again", calls_are("publish map; request map"));
     r.m.on_subscription(kMapScene, true, false, kRenderer, r.now);
     r.run(100);
     r.m.on_shown(kMapScene, r.now);
     ok("subscribed: verified", r.m.status(0).rendering == Rendering::Verified && r.m.published(0));
+
+    /* the renderer never subscribing: every kReconnectAfter-th recovery in a row asks the unit to reconnect */
+    Rig k;
+    int stuck = 0;
+    k.m.on_renderer_stuck = [&stuck](int64_t) { stuck++; };
+    k.m.on_subscription(kMapScene, true, false, kRenderer, k.now);    /* subscription lines are readable */
+    k.m.on_subscription(kMapScene, false, false, kRenderer, k.now);
+    k.m.want(0, true, false);
+    k.m.tick(k.now);
+    k.run(100);
+    k.m.on_subscription(kMapScene, true, false, kRenderer, k.now);   /* the console shows subscriptions: then the renderer goes */
+    k.m.on_renderer_gone(kRenderer, k.now);
+    for (int n = 0; n < SlotManager::kReconnectAfter; n++) {
+        k.m.on_shown(kMapScene, k.now);
+        k.run(1510);
+        for (int w = 0; w < 600 && k.state(0) != TargetState::Acquiring; w++)
+            k.run(100);
+        k.run(100);
+    }
+    ok("not subscribed through kReconnectAfter recoveries: one reconnect asked", stuck == 1);
+    calls.clear();
 
     Rig u;
     u.m.on_subscription(0x01000300, true, false, kRenderer, u.now);   /* no target of ours publishes it */
@@ -1685,6 +1840,35 @@ static void guide_yields()
     o.pass(5000);
     ok("parked behind HMI content off the list: yields, no take-over", calls_are("release guide") &&
                                                                         o.state(GuideRig::kGuide) == TargetState::Idle);
+}
+
+/* The guide hold parked behind the box, then a lock that unmaps it with no
+ * map status: released 3 s later, not a loss, and asked for again once the
+ * slot is free. */
+static void guide_not_mapped()
+{
+    GuideRig h;
+    h.rows(kGuideSlot, 2, {{kBox, 1}});
+    h.show_map();
+    h.pass();
+    h.rows(kGuideSlot, 2, {{kBox, 1}, {kGuideScene, 3}});
+    h.m.on_parked(kGuideScene, h.now);
+    h.pass();
+    ok("guide: parked behind the box: a take-over", joined().find("take over guide 0x1000310") != std::string::npos);
+    h.rows(kGuideSlot, 0, {{kBox, 1}, {kGuideScene, 0}});
+    h.pass(3000);
+    ok("guide: unmapped in its locked slot 3 s: released, waiting",
+       joined().find("release guide") != std::string::npos && h.state(GuideRig::kGuide) == TargetState::Waiting);
+    h.pass(5000);
+    ok("guide: not asked for while the slot is locked", requested_none(joined()));
+    h.rows(kGuideSlot, 2, {{kBox, 1}});
+    h.pass();
+    ok("guide: the slot free: asked for again at once", calls_are("request guide"));
+    h.rows(kGuideSlot, 2, {{kGuideScene, 1}, {kBox, 3}});
+    h.m.on_shown(kGuideScene, h.now);
+    h.pass(5000);
+    ok("guide: shown, not given up", h.state(GuideRig::kGuide) == TargetState::Shown &&
+                                         logged().find("given up") == std::string::npos);
 }
 
 /* A door opened: the KOMBI locks 0x105 and unmaps everything in it, then
@@ -2029,12 +2213,22 @@ struct HudRig {
     SlotManager m{&port, &scenes};
     int64_t now = 100000;
     int map = 0, panel = 1, hud = 2;
-    HudRig()
+    /* own_panel: the panel on its own scene id, falling back to the HUD's,
+     * as cluster-render's main sets it (holds.h fallback_rules). */
+    explicit HudRig(bool own_panel = false)
     {
         TargetSpec mp, pn, h;
         mp.name = "map"; mp.slot = kMapSlot; mp.scene_id = kMapScene; mp.width = 1088; mp.height = 480; mp.linger_ms = 0;
         pn.name = "panel"; pn.slot = kPanelSlot; pn.scene_id = kPanelScene; pn.width = 1920; pn.height = 720;
+        if (own_panel) {
+            pn.scene_id = 0x010004f8;
+            pn.linger_ms = 3000;
+            pn.fallback_scene_id = kPanelScene;
+            pn.strike_limit = 2;
+        }
         h.name = "hud"; h.slot = kHudSlot; h.scene_id = kPanelScene; h.width = 800; h.height = 480;
+        if (own_panel)
+            h.linger_ms = 3000;
         h.share = true; h.strike_limit = 2;   /* as cluster-render's main sets the iDrive 7 HUD */
         m.add(mp);
         m.add(pn);
@@ -2118,6 +2312,169 @@ static void hud_guard()
     }
     ok("panel and hud wanted at once: never both asked for, the second waits for the scene id",
        !both && r.m.status(r.hud).reason == "scene id in use by another target");
+}
+
+/* The targets as cluster-render's main sets them on iDrive 7: the panel on
+ * its own scene id, falling back to the HUD's (holds.h fallback_rules). */
+static const uint64_t kOwnPanelScene = 0x010004f8;
+
+struct OwnRig : HudRig {
+    OwnRig() : HudRig(true) {}
+    uint64_t panel_scene() const { return m.targets()[panel].scene_id; }
+};
+
+static void panel_hud_map_together()
+{
+    OwnRig r;
+    calls.clear();
+    r.m.want(r.map, true, true);
+    r.m.want(r.panel, true, false);
+    r.m.want(r.hud, true, true);
+    r.m.tick(r.now);
+    ok("own ids: map, panel and hud published and asked for in one tick",
+       calls_are("publish map; request map; publish panel; request panel; publish hud; request hud"));
+    r.m.on_shown(kMapScene, r.now);
+    r.m.on_shown(kOwnPanelScene, r.now);
+    r.m.on_shown(kPanelScene, r.now);
+    r.pass(5000);
+    ok("own ids: all three shown at once, each with its own scene id",
+       r.m.status(r.map).state == TargetState::Shown && r.m.status(r.panel).state == TargetState::Shown &&
+           r.m.status(r.hud).state == TargetState::Shown && r.panel_scene() == kOwnPanelScene && calls_are(""));
+    r.m.want(r.panel, false, false);
+    r.pass(3100);
+    ok("own ids: the panel released after its linger, its scene kept, the HUD and the map untouched",
+       calls_are("release panel") && r.m.published(r.panel) && r.m.status(r.hud).state == TargetState::Shown &&
+           r.m.status(r.map).state == TargetState::Shown && r.m.published(r.hud));
+    r.m.want(r.panel, true, false);
+    r.pass(1200);
+    ok("own ids: the panel asked for again in its warm scene, nothing unpublished",
+       calls_are("request panel") && r.m.requested(r.hud));
+    r.m.on_shown(kOwnPanelScene, r.now);
+    r.m.want(r.hud, false, false);
+    r.pass(3100);
+    ok("own ids: the HUD released, the panel kept", calls_are("release hud") && r.m.status(r.panel).state == TargetState::Shown);
+    r.m.want(r.hud, true, true);
+    r.pass(1200);
+    ok("own ids: the HUD asked for again while the panel is shown, in its own warm scene",
+       calls_are("request hud") && r.m.requested(r.panel));
+    r.m.unpublish_all();
+    ok("own ids: every scene unpublished at exit", calls_are("unpublish map; unpublish panel; unpublish hud"));
+}
+
+static void panel_falls_back_on_refusal()
+{
+    {
+        OwnRig r;
+        r.show(r.hud, kPanelScene);
+        calls.clear();
+        r.m.want(r.panel, true, false);
+        r.m.tick(r.now);
+        joined();
+        r.pass(10);
+        r.m.on_refused(kOwnPanelScene, Refusal::UnknownContent, "E_DCSM_CONTENTID_UNKNOWN", r.now);
+        ok("fallback: the scene unknown to the display: released, unpublished, on the HUD's id",
+           calls_are("release panel; unpublish panel") && r.panel_scene() == kPanelScene &&
+               r.m.status(r.panel).state == TargetState::Waiting && !r.m.disabled(r.panel));
+        r.pass(3000);
+        ok("fallback: on the HUD's id, the panel waits while the HUD is asked for, the HUD untouched",
+           calls_are("") && r.m.status(r.panel).state == TargetState::Waiting && !r.m.requested(r.panel) &&
+               r.m.status(r.hud).state == TargetState::Shown && r.m.published(r.hud));
+        r.m.want(r.hud, false, true);
+        r.pass(3100);
+        ok("fallback: the HUD released, the panel takes the id",
+           calls_are("release hud; unpublish hud; publish panel; request panel"));
+        r.m.on_refused(kPanelScene, Refusal::UnknownContent, "E_DCSM_CONTENTID_UNKNOWN", r.now);
+        ok("fallback: the fallback refused waits on the ladder, no further fallback",
+           calls_are("release panel") && r.panel_scene() == kPanelScene &&
+               r.m.status(r.panel).state == TargetState::Waiting);
+    }
+    {
+        OwnRig r;
+        r.m.want(r.panel, true, false);
+        /* Each refusal answers a request: it comes while the panel is
+         * acquiring, and the panel then waits. */
+        const auto refuse = [&](Refusal kind, const char *why) {
+            for (int k = 0; k < 6000 && r.m.status(r.panel).state != TargetState::Acquiring; k++)
+                r.pass(10);
+            const bool acquiring = r.m.status(r.panel).state == TargetState::Acquiring;
+            r.pass(10);
+            r.m.on_refused(kOwnPanelScene, kind, why, r.now);
+            return acquiring && r.m.status(r.panel).state == TargetState::Waiting;
+        };
+        bool answered = true;
+        for (int k = 0; k <= SlotManager::kFreshRetries; k++)
+            answered = refuse(Refusal::FetchFailed, "E_FETCH_STATUS_FAILED") && answered;
+        answered = refuse(Refusal::Config, "E_DCSM_HANDLE_UNKNOWN") && answered;
+        answered = refuse(Refusal::Transient, "fetch removed") && answered;
+        answered = refuse(Refusal::Busy, "E_DCSM_PRIOTOOLOW") && answered;
+        ok("fallback: failed fetches, an unknown client, a removed fetch, a busy slot, each answering a request: "
+           "no fallback",
+           answered && r.panel_scene() == kOwnPanelScene && joined().find("unpublish") == std::string::npos);
+        r.pass(20000);
+        r.m.on_shown(kOwnPanelScene, r.now);
+        r.pass(3000);
+        r.m.on_lost(kOwnPanelScene, "fetch removed", r.now);
+        ok("fallback: removed right after its mapping: an ordinary loss", r.panel_scene() == kOwnPanelScene);
+    }
+}
+
+static void panel_falls_back_on_strikes()
+{
+    const std::string path = "/tmp/crs-slots-panel-guard-" + std::to_string(getpid()) + ".txt";
+    unlink(path.c_str());
+    {
+        Guard g;
+        g.load(path, "t", "boot-1");
+        OwnRig r;
+        r.m.set_guard(&g);
+        r.show(r.map, kMapScene);
+        r.show(r.panel, kOwnPanelScene);
+        r.pass(2000);
+        r.drop();
+        ok("strikes: a cluster restart right after the panel's mapping strikes its own id, the panel kept on it",
+           g.status_text() == "guard: panel 0x203 0x10004f8 0: 1 strike\n" && r.panel_scene() == kOwnPanelScene);
+        r.pass(1500);
+        r.m.on_shown(kOwnPanelScene, r.now);
+        r.pass(2000);
+        calls.clear();
+        r.drop();
+        ok("strikes: the second disables its own id: the panel falls back to the HUD's id, not disabled",
+           g.status_text() == "guard: panel 0x203 0x10004f8 0: disabled, 2 strikes\n" &&
+               r.panel_scene() == kPanelScene && !r.m.disabled(r.panel) && joined().find("unpublish panel") != std::string::npos);
+        r.pass(1500);
+        ok("strikes: the panel asked for again on the fallback", r.m.requested(r.panel));
+    }
+    {
+        Guard g;
+        g.load(path, "t", "boot-2");
+        OwnRig r;
+        r.m.set_guard(&g);
+        ok("strikes: the next start begins on the fallback, the map and the HUD as they were",
+           r.panel_scene() == kPanelScene && !r.m.disabled(r.panel) && !r.m.disabled(r.map) && !r.m.disabled(r.hud) &&
+               r.m.targets()[r.hud].scene_id == kPanelScene);
+    }
+    unlink(path.c_str());
+}
+
+/* The HMI's speech dialog (0x01000400) in the panel's slot while the HUD
+ * has that id: the stock HMI's, and the panel gives way to it. */
+static void panel_yields_to_speech_dialog()
+{
+    OwnRig r;
+    r.show(r.hud, kPanelScene);
+    SlotInfo dialog;
+    dialog.slot = kPanelSlot; dialog.status = 2; dialog.content = kPanelScene; dialog.map_status = 1;
+    r.m.on_slots({dialog}, r.now);
+    calls.clear();
+    r.m.want(r.panel, true, false);
+    r.pass(3000);
+    ok("speech dialog: with the HUD on 0x1000400, the dialog in 0x203 is the stock HMI's and the panel waits",
+       !r.m.requested(r.panel) && r.m.status(r.panel).state == TargetState::Waiting &&
+           r.m.status(r.panel).holder == Holder::Stock && joined().find("request panel") == std::string::npos);
+    dialog.status = 1; dialog.content = 0; dialog.map_status = 0;
+    r.m.on_slots({dialog}, r.now);
+    r.pass(1200);
+    ok("speech dialog: gone, the panel asked for", r.m.requested(r.panel) && r.m.status(r.hud).state == TargetState::Shown);
 }
 
 /* The mapping guard (guard.h) in the slot manager: one strike per mapping
@@ -2604,6 +2961,8 @@ int main()
     lock_then_take_overs();
     brief_shows_back_off();
     take_overs_restart_when_shown();
+    not_mapped_map_after_lock();
+    not_mapped_panel_and_hud();
     no_request_while_locked();
     fallback_and_lock();
     wake();
@@ -2620,6 +2979,7 @@ int main()
     guide_never_verified_out();
     guide_live_route();
     guide_yields();
+    guide_not_mapped();
     guide_door_lock();
     guide_take_over_settle();
     guide_gives_up();
@@ -2629,6 +2989,10 @@ int main()
     guide_no_flapping();
     guide_auto_slot();
     hud_guard();
+    panel_hud_map_together();
+    panel_falls_back_on_refusal();
+    panel_falls_back_on_strikes();
+    panel_yields_to_speech_dialog();
     {
         /* The HUD's media pop-up (0x322): the HUD map gives way while it shows */
         TargetSpec hud2;
@@ -2667,6 +3031,118 @@ int main()
         ok("popup: still waiting within yield_ms after it closed", joined().find("request hud") == std::string::npos);
         run(1500);
         ok("popup: asked for again once yield_ms has passed", joined().find("request hud") != std::string::npos);
+    }
+    {
+        /* The HUD's yield slots as shipped (0x322, the lists): it gives way to a list in 0x322 and comes back
+         * yield_ms after, and a call's pop-up in 0x321 leaves it shown; never to route guidance, BMW's
+         * (0x01000210, in its own slot or one it gives way to) or the turn box (0x01000310); and not at all while a
+         * layer has yield false */
+        TargetSpec hud5;
+        FakePort port5;
+        FakeScenes scenes5;
+        SlotManager m5{&port5, &scenes5};
+        hud5.name = "hud"; hud5.slot = kHudSlot; hud5.scene_id = kPanelScene; hud5.width = 800; hud5.height = 480;
+        hud5.linger_ms = 3000;
+        hud5.yield_slots = {0x322};
+        hud5.yield_ms = 1500;
+        m5.add(hud5);
+        int64_t now = 400000;
+        bool yield = true;
+        const auto run = [&](int64_t ms) {
+            for (int64_t x = 0; x < ms; x += 10) { now += 10; m5.want(0, true, true, true, yield); m5.tick(now); }
+        };
+        const auto row = [&](uint64_t slot, uint32_t status, uint64_t content, uint32_t map) {
+            SlotInfo si; si.slot = slot; si.status = status; si.content = content; si.map_status = map;
+            m5.on_slots({si}, now);
+        };
+        const auto shown_again = [&]() {
+            run(1200);
+            m5.on_shown(kPanelScene, now);
+            row(kHudSlot, 2, kPanelScene, 1);
+            run(20);
+            return m5.status(0).state == TargetState::Shown;
+        };
+        calls.clear();
+        ok("yield: the HUD map asked for and shown", shown_again());
+        calls.clear();
+        row(0x321, 2, 0x01000600, 1);          /* an active call's pop-up */
+        run(3000);
+        ok("yield: a call's pop-up in 0x321 (not shipped) leaves the HUD map shown",
+           m5.status(0).state == TargetState::Shown && joined().find("release hud") == std::string::npos);
+        row(0x321, 1, 0x01000600, 0);
+        row(0x322, 2, 0x01000251, 1);          /* the media source list */
+        run(50);
+        ok("yield: a list in 0x322 releases the HUD map",
+           m5.status(0).state == TargetState::Waiting && joined().find("release hud") != std::string::npos);
+        row(kHudSlot, 1, 0, 0);
+        row(0x322, 1, 0x01000251, 0);          /* the list closes */
+        calls.clear();
+        run(1400);
+        ok("yield: still waiting within yield_ms after the list", joined().find("request hud") == std::string::npos);
+        ok("yield: asked for again once yield_ms has passed", shown_again() && joined().find("request hud") != std::string::npos);
+
+        calls.clear();
+        row(0x330, 2, 0x01000210, 1);          /* a route: BMW's HUD guidance in its own slot (a G05's) */
+        row(0x300, 2, 0x01000210, 1);          /* or an X3's */
+        row(0x105, 2, 0x01000310, 1);          /* the turn box on the cluster */
+        run(3000);
+        ok("never: BMW's guidance and the turn box leave the HUD map shown",
+           m5.status(0).state == TargetState::Shown && joined().find("release hud") == std::string::npos);
+        row(0x322, 2, 0x01000211, 1);          /* guidance in a slot it gives way to */
+        run(3000);
+        ok("never: guidance in a yield slot does not count either",
+           m5.status(0).state == TargetState::Shown && joined().find("release hud") == std::string::npos);
+        row(0x322, 1, 0x01000211, 0);
+
+        yield = false;                          /* a layer keeps it shown */
+        run(20);
+        row(0x322, 2, 0x01000251, 1);
+        run(3000);
+        ok("keep shown: a list leaves the HUD map shown",
+           m5.status(0).state == TargetState::Shown && joined().find("release hud") == std::string::npos);
+        yield = true;
+        run(50);
+        ok("keep shown off: the list showing releases it", m5.status(0).state == TargetState::Waiting &&
+                                                                 joined().find("release hud") != std::string::npos);
+        row(kHudSlot, 1, 0, 0);
+        calls.clear();
+        yield = false;
+        run(50);
+        ok("keep shown on while it waits: asked for again at once, the list still showing",
+           joined().find("request hud") != std::string::npos);
+    }
+    {
+        /* hud_yield_slots = 0x321,0x322 in the conf: a call's pop-up in 0x321 is given way to too */
+        TargetSpec hud6;
+        FakePort port6;
+        FakeScenes scenes6;
+        SlotManager m6{&port6, &scenes6};
+        hud6.name = "hud"; hud6.slot = kHudSlot; hud6.scene_id = kPanelScene; hud6.width = 800; hud6.height = 480;
+        hud6.linger_ms = 3000;
+        hud6.yield_slots = {0x321, 0x322};
+        hud6.yield_ms = 1500;
+        m6.add(hud6);
+        int64_t now = 500000;
+        const auto run = [&](int64_t ms) { for (int64_t x = 0; x < ms; x += 10) { now += 10; m6.tick(now); } };
+        const auto row = [&](uint64_t slot, uint32_t status, uint64_t content, uint32_t map) {
+            SlotInfo si; si.slot = slot; si.status = status; si.content = content; si.map_status = map;
+            m6.on_slots({si}, now);
+        };
+        m6.want(0, true, true);
+        run(1200);
+        m6.on_shown(kPanelScene, now);
+        row(kHudSlot, 2, kPanelScene, 1);
+        run(20);
+        calls.clear();
+        row(0x321, 2, 0x01000600, 1);          /* an incoming call's pop-up */
+        run(50);
+        ok("0x321 configured: a call's pop-up releases the HUD map",
+           m6.status(0).state == TargetState::Waiting && joined().find("release hud") != std::string::npos);
+        row(kHudSlot, 1, 0, 0);
+        row(0x321, 1, 0x01000600, 0);
+        calls.clear();
+        run(1600);
+        ok("0x321 configured: asked for again once yield_ms has passed", joined().find("request hud") != std::string::npos);
     }
     {
         /* Lost while the table names our id, the media pop-up showing before

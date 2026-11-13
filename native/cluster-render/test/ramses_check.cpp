@@ -7,17 +7,18 @@
  * again must be accepted, with nothing logged as an error by this service
  * or the library. Then the 3D and asset side: the backend's own answers for
  * every new call (uniform arrays, turned quads, views split into passes,
- * parts and their geometry, every kind of animation), and through the
- * compositor a lit rotating cube, an effect sampling an R8 glyph atlas and
- * an RGBA8 sprite with a vec4 array, a turned needle and an effect on the
- * renderer's clock, published again. On RAMSES 19, a scene file the library
- * saves from a synthetic gauge (a needle on a pivot, a bar on a data
- * object, a plain quad, a camera and two passes): loaded as the panel's
- * scene through the compositor, every edit kind read back from the
- * library, the needle turned at 30 edits a second, unpublished for the
- * HUD's shared scene id, loaded again with every kept edit, replaced in
- * place by a second file, dropped with the resources its loads made; a
- * file of another scene id refused.
+ * parts and their geometry, every kind of animation, and on RAMSES 19 the
+ * scene described whole, as to a renderer that subscribes, once animations
+ * have stopped), and through the compositor a lit rotating cube, an effect
+ * sampling an R8 glyph atlas and an RGBA8 sprite with a vec4 array, a turned
+ * needle and an effect on the renderer's clock, published again. On RAMSES
+ * 19, a scene file the library saves from a synthetic gauge (a needle on a
+ * pivot, a bar on a data object, a plain quad, a camera and two passes):
+ * loaded as the panel's scene through the compositor, every edit kind read
+ * back from the library, the needle turned at 30 edits a second,
+ * unpublished for the HUD's shared scene id, loaded again with every kept
+ * edit, replaced in place by a second file, dropped with the resources its
+ * loads made; a file of another scene id refused.
  * Run by `make test-ramses ROOTFS=<dir>`;
  * built with CRS_RAMSES27 against iDrive 8's RAMSES 27 (graph_ramses27.h),
  * by `make test-ramses27 ROOTFS=<dir>`. */
@@ -275,6 +276,19 @@ static size_t resource_count(ramses::RamsesClient &client, uint32_t type)
         n++;
     return n;
 }
+
+/* The scene called name described whole, as the library describes it to a
+ * renderer that subscribes: saved to a file, which is then removed. */
+static ramses::RamsesClient *describing;
+static bool described(const char *name)
+{
+    ramses::Scene *s = static_cast<ramses::Scene *>(describing->findObjectByName(name));
+    const std::string file = "/tmp/crs-ramses-check-" + std::to_string(getpid()) + "-described.ramses";
+    ramses::ResourceFileDescriptionSet none;
+    const bool saved = s && ok_status(describing->saveSceneToFile(*s, file.c_str(), none, false));
+    unlink(file.c_str());
+    return saved;
+}
 #endif
 
 /* A cube: 6 faces x 4 vertices with their normals. */
@@ -407,11 +421,23 @@ static void backend(Gpu &gpu)
     const int a11 = g->animate(p1, keyed(Animated::Uniform, 4, {0, 1000}, {1, 0, 0, 1, 0, 0, 1, 1}, true, "u_color"));
     ok("animations of every property, linear and step, on quads, parts and cameras",
        a1 && a2 && a3 && a4 && a5 && a6 && a7 && a8 && a9 && a10 && a11 && g->flush(4));
+    const int errors = cld::log_errors;
+    ok("refused: a uniform the shader lacks, and one of another width",
+       !g->animate(p2, keyed(Animated::Uniform, 1, {0, 1000}, {0, 1}, false, "u_none")) &&
+           !g->animate(p2, keyed(Animated::Uniform, 3, {0, 1000}, {0, 0, 0, 1, 1, 1}, false, "u_fade")) &&
+           cld::log_errors == errors + 2 && g->flush(4));
+    cld::log_errors = errors;
+#ifndef CRS_RAMSES27
+    ok("and the scene described whole", described("check"));
+#endif
     g->stop(a1);
     g->stop(a11);
     g->order(v1, 20);   /* the views together at the top: three passes, a segment fewer */
     g->order(v2, 24);
     ok("stopped, reordered", g->flush(5));
+#ifndef CRS_RAMSES27
+    ok("with animations stopped, the scene described whole to a renderer that subscribes", described("check"));
+#endif
     Projection near = persp;
     near.fov = 50;
     vr.x = 2000;   /* past the right edge: nothing to draw */
@@ -420,6 +446,9 @@ static void backend(Gpu &gpu)
     g->drop_view(v2);
     g->drop_quad(q3);
     ok("parts, views and quads dropped with their animations", g->flush(7));
+#ifndef CRS_RAMSES27
+    ok("and the scene described whole again", described("check"));
+#endif
     g.reset();
     gpu.drop_effect(glyph_fx);
     gpu.drop_effect(all_fx);
@@ -449,6 +478,7 @@ int main()
         return 1;
     }
     Ramses19Gpu gpu(client);
+    describing = &client;
     /* Saved before any target has the panel's scene id. */
     const std::string dir = "/tmp/crs-ramses-check-" + std::to_string(getpid());
     mkdir(dir.c_str(), 0755);

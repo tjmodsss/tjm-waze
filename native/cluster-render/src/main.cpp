@@ -49,7 +49,7 @@ void define_keys(cld::Config *cfg)
     cfg->define("generation", "auto");
     cfg->define("vsomeip_app", "cluster-demo");
     cfg->define("targets", "map,panel,hud");
-    cfg->define("scene_ids_allowed", "0x010004f0,0x01000400,0x010004f1");
+    cfg->define("scene_ids_allowed", "0x010004f0,0x01000400,0x010004f1,0x010004f8");
     cfg->define("map_slot", "0x100");
     cfg->define("map_content_class", "0");
     cfg->define("map_scene_id", "0x010004f0");
@@ -58,7 +58,8 @@ void define_keys(cld::Config *cfg)
     cfg->define("map_take_over_stock", "1");
     cfg->define("panel_slot", "0x203");
     cfg->define("panel_content_class", "0");
-    cfg->define("panel_scene_id", "0x01000400");
+    cfg->define("panel_scene_id", "0x010004f8");
+    cfg->define("panel_fallback_scene_id", "0x01000400");
     cfg->define("panel_size", "1920x720");
     cfg->define("panel_linger_ms", "3000");
     cfg->define("panel_take_over_stock", "0");
@@ -209,6 +210,10 @@ bool load_targets(const cld::Config &cfg, int generation, std::vector<TargetSpec
         if (std::find(allowed.begin(), allowed.end(), t.scene_id) == allowed.end()) {
             *err = "target " + name + ": scene id " + cfg.str((p + "scene_id").c_str()) + " is not in " + g +
                    "scene_ids_allowed";
+            return false;
+        }
+        if (generation == 7 && name == "panel" && !fallback_rules(&t, cfg.str("panel_fallback_scene_id"), allowed, &why)) {
+            *err = "target panel: " + why;
             return false;
         }
         out->push_back(t);

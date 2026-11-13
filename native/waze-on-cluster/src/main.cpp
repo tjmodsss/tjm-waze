@@ -87,7 +87,8 @@ std::string status_line(const FeedStatus &s)
            ",\"cluster\":" + (s.cluster ? "1" : "0") +
            ",\"hud\":" + (s.hud ? "1" : "0") + ",\"hud_state\":" + json_escape(s.hud_state) +
            ",\"hud_width_pct\":" + std::to_string(s.hud_width_pct) +
-           ",\"hud_x\":" + std::to_string(s.hud_offset_x) + ",\"hud_y\":" + std::to_string(s.hud_offset_y) + "}";
+           ",\"hud_x\":" + std::to_string(s.hud_offset_x) + ",\"hud_y\":" + std::to_string(s.hud_offset_y) +
+           ",\"hud_keep_shown\":" + (s.hud_keep_shown ? "1" : "0") + "}";
 }
 
 class Server : public Control::Handler {
@@ -107,6 +108,7 @@ public:
         auto hide = msg.find("hide");
         auto pct = msg.find("hud_width_pct");
         auto hx = msg.find("hud_x"), hy = msg.find("hud_y"), on = msg.find("on");
+        auto keep = msg.find("hud_keep_shown");
         if (cmd == "start" && it != msg.end()) {
             log_info("start %s", it->second.c_str());
             if (!feeds_->set_target(it->second))
@@ -116,7 +118,8 @@ public:
             feeds_->set_guide_hold(guide_->hide());
         } else if (cmd == "cluster" && on != msg.end() && (on->second == "0" || on->second == "1")) {
             feeds_->set_cluster(on->second == "1");
-        } else if (cmd == "hud" && (on != msg.end() || pct != msg.end() || hx != msg.end() || hy != msg.end())) {
+        } else if (cmd == "hud" && (on != msg.end() || pct != msg.end() || hx != msg.end() || hy != msg.end() ||
+                                    keep != msg.end())) {
             if (on != msg.end()) {
                 if (on->second == "0" || on->second == "1")
                     feeds_->set_hud(on->second == "1");
@@ -142,6 +145,13 @@ public:
                 } else {
                     log_warn("hud: offset %ld,%ld out of range (-800..800)", x, y);
                 }
+            }
+            /* and whether it stays shown over BMW's pop-ups */
+            if (keep != msg.end()) {
+                if (keep->second == "0" || keep->second == "1")
+                    feeds_->set_hud_keep_shown(keep->second == "1");
+                else
+                    log_warn("hud: hud_keep_shown must be 0 or 1, not %s", keep->second.c_str());
             }
         } else {
             log_warn("control: unknown or malformed command %s", cmd.c_str());
@@ -205,10 +215,12 @@ int serve(Config cfg)
                      "(upload_kb_per_s in /var/opt/cluster-render/cluster-render.local.conf)", key, cfg.str(key).c_str());
     struct Range { const char *key; long lo, hi; } ranges[] = {
         {"dirty_threshold", 0, 64}, {"dirty_settle_ms", 0, 3600000}, {"tex_level_bits", 0, 3},
-        {"target_fps", 0, 60},      {"pan_blocks", 0, 1},            {"stall_ms", 1000, 600000},
+        {"target_fps", 0, 60},      {"picture_fps", 0, 60},          {"pan_blocks", 0, 1},
+        {"stall_ms", 1000, 600000},
         {"cluster", 0, 1},          {"hud", 0, 1},                   {"hud_fps", 1, 30},
         {"hud_width_pct", 0, 100},  {"hud_offset_x", -800, 800},     {"hud_offset_y", -800, 800},
         {"hud_scale_down", 0, 1},   {"hud_round_corners", 0, 1},     {"hud_black_background", 0, 1},
+        {"hud_keep_shown", 0, 1},
         {"freeze_ms", 0, 600000},   {"freeze_min_fps", 1, 60},       {"alt_screen_port", 0, 65535},
         {"idle_ms", 1000, 600000},  {"blank_ms", 1000, 600000},
         {"alt_screen_uid", 0, 4294967294L}, {"gpu_copy", 0, 1}};
@@ -220,6 +232,21 @@ int serve(Config cfg)
     vc.tex_level_bits = (uint32_t)cfg.num("tex_level_bits");
     vc.gpu_copy = cfg.num("gpu_copy") == 1;
     vc.stall_ms = (int)cfg.num("stall_ms");
+    vc.picture_fps = (unsigned)cfg.num("picture_fps");
+    if (vc.picture_fps) {
+        /* At least as many pictures as the cluster, the HUD (the app turns it
+         * on at run time) and the freeze watch take. */
+        const struct { const char *key; unsigned fps; } floors[] = {
+            {"target_fps", (unsigned)cfg.num("target_fps")},
+            {"hud_fps", (unsigned)cfg.num("hud_fps")},
+            {"freeze_min_fps", cfg.num("freeze_ms") ? (unsigned)cfg.num("freeze_min_fps") : 0u}};
+        for (const auto &f : floors)
+            if (vc.picture_fps < f.fps) {
+                log_warn("picture_fps %u is below %s %u: %u instead", vc.picture_fps, f.key, f.fps, f.fps);
+                vc.picture_fps = f.fps;
+            }
+        log_info("waze: pictures at most %u a second (picture_fps); the frames between are decoded without one", vc.picture_fps);
+    }
     vc.freeze.ms = (unsigned)cfg.num("freeze_ms");
     vc.freeze.min_fps = (unsigned)cfg.num("freeze_min_fps");
     vc.freeze.blank_ms = (unsigned)cfg.num("blank_ms");
@@ -236,6 +263,7 @@ int serve(Config cfg)
     }
     fc.hud_offset_x = (int)cfg.num("hud_offset_x");
     fc.hud_offset_y = (int)cfg.num("hud_offset_y");
+    fc.hud_keep_shown = cfg.num("hud_keep_shown") != 0;
     fc.scale_down = cfg.num("hud_scale_down") != 0;
     fc.hud_round_corners = cfg.num("hud_round_corners") != 0;
     fc.hud_black_background = cfg.num("hud_black_background") != 0;
@@ -340,10 +368,15 @@ int serve(Config cfg)
             FrameTiming::Minute tm;
             uint64_t overflows = 0;
             if (producer.minute(now, &m, &sm, &bm, &tm, &overflows)) {
-                log_info("waze: %u frames decoded in the last minute, %u without a picture to catch up, %u changed, "
+                const unsigned paced = (unsigned)producer.take_paced();
+                char paced_text[48] = "";
+                if (vc.picture_fps)
+                    std::snprintf(paced_text, sizeof paced_text, ", %u without one for picture_fps", paced);
+                log_info("waze: %u frames decoded in the last minute, %u without a picture to catch up%s, %u changed, "
                          "%u corrupted; the last picture is %s; %u losses (%u packets), %llu dropped by the receive "
                          "queue; packets waited %.1f ms on average, %lld ms at most",
-                         m.frames + bm.skipped, bm.skipped, m.changed, sm.corrupted, m.blank ? "blank" : "not blank",
+                         m.frames + bm.skipped + paced, bm.skipped, paced_text, m.changed, sm.corrupted,
+                         m.blank ? "blank" : "not blank",
                          sm.losses, sm.lost, (unsigned long long)overflows, bm.wait_us.mean() / 1000.0,
                          (long long)(bm.wait_us.max / 1000));
                 log_info("waze: %s", FrameTiming::describe(tm).c_str());
@@ -490,6 +523,7 @@ void define_keys(Config *cfg)
     cfg->define("alt_screen_port", "6031");
     cfg->define("alt_screen_uid", "13002");
     cfg->define("target_fps", "30");
+    cfg->define("picture_fps", "0");
     cfg->define("pan_blocks", "1");
     cfg->define("tex_level_bits", "2");
     cfg->define("gpu_copy", "1");
@@ -503,6 +537,7 @@ void define_keys(Config *cfg)
     cfg->define("hud_width_pct", "0");
     cfg->define("hud_offset_x", "0");
     cfg->define("hud_offset_y", "0");
+    cfg->define("hud_keep_shown", "0");
     cfg->define("hud_scale_down", "1");
     cfg->define("hud_round_corners", "1");
     cfg->define("hud_black_background", "1");

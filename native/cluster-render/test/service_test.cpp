@@ -42,7 +42,8 @@
  * file of another scene id in error, the layers back; edit lines refused or
  * changing nothing reported; another file in place, the slot neither
  * released nor asked for again; its client gone, kept through the linger
- * and then released. */
+ * and then released. The HUD's layers choose whether it gives way to the
+ * stock pop-ups (yield), a client without the field getting it. */
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -984,6 +985,65 @@ static bool gauge_edited(const FakeFileScene *s, float turn)
            s->shown.visible.count("quad") && !s->shown.visible.at("quad");
 }
 
+/* The HUD's layers decide whether it gives way: by default it does, to a
+ * pop-up in a yield slot, and is asked for again yield_ms after it goes;
+ * yield 0 keeps it shown over pop-ups, 1 gives way again; a client that
+ * never sends the field gets the default. */
+static void hud_yield_choice()
+{
+    Rig r;
+    TargetSpec h;
+    h.name = "hud"; h.slot = 0x323; h.scene_id = 0x01000400; h.width = 800; h.height = 480; h.linger_ms = 3000;
+    h.yield_slots = {0x322};   /* as cluster-render.conf ships it */
+    h.yield_ms = 1500;
+    r.sc.targets.push_back(h);
+    r.start();
+    cr::Client a("waze", r.path);
+    Events ea;
+    ea.wire(a);
+    r.clients = {&a};
+    r.pump(50);
+    const cr::EffectOptions white{"#version 100\nvoid main(){gl_FragColor=vec4(1.0);}", "", 0};
+    cr::LayerOptions lo;
+    lo.target = "hud";
+    lo.contend = true;
+    const uint32_t hud = a.effect(lo, white);
+    r.pump(1500);
+    ok("hud: shown", ea.target["hud"] == "shown");
+    r.port.stock_map(0x322, 0x01000251);   /* the media source list */
+    r.pump(100);
+    ok("hud: gives way to the list", ea.target["hud"] == "waiting" && !r.port.row(0x323, 0x01000400));
+    r.port.stock_unmap(0x322, 0x01000251);
+    r.pump(3000);
+    ok("hud: shown again after it", ea.target["hud"] == "shown");
+
+    lo.yield = false;
+    a.set(hud, lo);
+    r.pump(20);
+    r.port.stock_map(0x322, 0x01000251);   /* the media source list */
+    r.pump(3000);
+    ok("yield 0: kept shown over the list", ea.target["hud"] == "shown" && r.port.row(0x323, 0x01000400));
+    ok("the status names the layer's yield 0",
+       has(r.svc->server().status_text(r.now), "effect of waze on hud, content z 0, yield 0: shown"));
+    lo.yield = true;
+    a.set(hud, lo);
+    r.pump(100);
+    ok("yield 1: gives way to the list", ea.target["hud"] == "waiting");
+    r.port.stock_unmap(0x322, 0x01000251);
+    a.drop(hud);
+    r.pump(5000);
+
+    Raw old(r.path);
+    old.send("{\"op\":\"hello\",\"app\":\"old\",\"proto\":1}");
+    old.send("{\"op\":\"layer\",\"ref\":1,\"target\":\"hud\",\"kind\":\"effect\",\"fs\":\"x\",\"contend\":1}");
+    r.pump(1500);
+    const int k = r.svc->slots().index("hud");
+    ok("a client that never sends yield: shown", r.svc->slots().status(k).state == TargetState::Shown);
+    r.port.stock_map(0x322, 0x01000251);
+    r.pump(100);
+    ok("and gives way", r.svc->slots().status(k).state == TargetState::Waiting);
+}
+
 static void scene_files()
 {
     char tmpl[] = "/tmp/crs-service-scenes-XXXXXX";
@@ -1594,6 +1654,7 @@ int main()
     take_over_and_fall_back();
     guide_hold();
     guide_hold_choice();
+    hud_yield_choice();
     mapping_guard();
     repeats();
     framing();

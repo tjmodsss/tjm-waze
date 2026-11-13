@@ -39,7 +39,7 @@ async function until(cond, ms) {
 
 /* Scene files come from here; a synthetic gauge (fake_graph.h FakeFileScene). */
 const scenes = fs.mkdtempSync('/tmp/crs-js-scenes-');
-const GAUGE = 'scene 0x01000400\nnode gauge -\nnode needle_pivot gauge\nmesh needle needle_pivot u_color\n' +
+const GAUGE = 'scene 0x010004f8\nnode gauge -\nnode needle_pivot gauge\nmesh needle needle_pivot u_color\n' +
     'mesh quad - u_color\n';
 
 function startService() {

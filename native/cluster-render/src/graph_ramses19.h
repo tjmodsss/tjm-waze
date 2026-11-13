@@ -12,8 +12,9 @@
  * resources; the passes' render order follows the draw order (plan_passes).
  * Buffers are Texture2DBuffers with one sampler each. Animations are one
  * real-time animation system per scene, made at the first one, played by the
- * renderer. A scene file is the client library's own scene and resources,
- * as the file has them. */
+ * renderer; an animation that stops takes the system with it, and the others
+ * are made again in a new one. A scene file is the client library's own
+ * scene and resources, as the file has them. */
 #ifndef CRS_GRAPH_RAMSES19_H
 #define CRS_GRAPH_RAMSES19_H
 

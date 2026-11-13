@@ -45,7 +45,12 @@ entry's `artifact.url` is the asset's release download
 this repository is public, which a car without a GitHub sign-in downloads
 without GitHub's API and its rate limit, and the asset's API URL while it
 is private. `publish` lists the entries it carries over the same way, and
-publishes the catalog when only that changed.
+publishes the catalog when only that changed. An app's `icon` is
+`<id>.png`, an asset of the release `catalog` beside `catalog.json`, with
+its `iconSha256`: the PNG its staged tree's `rhmiData/application.json`
+names on its first entry point (what the car's app list shows), uploaded
+by the publish of that version. The Store shows it while the app is not
+installed.
 
 **Languages.** An entry's `texts` is its title and description in other
 languages, from `release/texts/<code>.json`, one file per language of the

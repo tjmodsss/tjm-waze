@@ -29,6 +29,8 @@ struct Rect {
     int32_t x = 0, y = 0;
     uint32_t w = 0, h = 0;
 };
+inline bool operator==(const Rect &a, const Rect &b) { return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h; }
+inline bool operator!=(const Rect &a, const Rect &b) { return !(a == b); }
 
 enum class TexFormat { R8, RGBA8 };
 enum class Sampling { Nearest, Bilinear };
@@ -162,7 +164,7 @@ public:
      * - the uniform of a quad or a part: 1, 3 or 4 values (float, vec3,
      *   vec4).
      * Returns the animation's handle, 0 when refused. A stopped animation
-     * leaves its property at its last value. */
+     * leaves its property at its last value; dropping its node stops it. */
     virtual int animate(int node, const Animation &a) = 0;
     virtual void stop(int anim) = 0;
 

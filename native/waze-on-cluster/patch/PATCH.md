@@ -268,8 +268,8 @@ change:
 |---|---|---|---|
 | mm (→ `+0x10`) | `0x20ca32` | `ea000000 6e000000` (234x110) | `8a000000 3d000000` (138x61) |
 | px (→ `+0x08`, `+0x18`) | `0x20ca54` | `80070000 84030000` (1920x900) | `40040000 e0010000` (1088x480) |
-| view x,y (u16) + safe width | `0x20ca66` | `00000000 64020000` | `00000000 dc010000` |
-| safe height + safe x,y (u16) | `0x20ca74` | `0e020000 0202c000` | `32010000 32014800` |
+| view x,y (u16) + safe width | `0x20ca66` | `00000000 64020000` | `00000000 f8010000` |
+| safe height + safe x,y (u16) | `0x20ca74` | `0e020000 0202c000` | `70010000 1e014800` |
 
 The getters at `0x20ce00`–`0x20cf40` read these fields; the config built from
 them (`0x2078f1`) is what `SetVideoParams` and the view-area report carry.
@@ -296,9 +296,9 @@ through one-field getters: `+0x18` (pixel size), `+0x20`, `+0x22` (view x,
 y), `+0x24` (safe width and height), `+0x2c`, `+0x2e` (safe x, y).
 
 This tool's geometry has its 138x61 mm physical size, the view area at (0,0)
-and a safe area inside the frame, so the safe area 0.5.0–0.10.5 wrote
-(504x368 at (286, 72): `f8010000` and `70010000 1e014800`) reads as patched
-and an apply rewrites it. A stock geometry has another physical size and a
+and a safe area inside the frame, so the safe area 0.10.6 wrote (476x306
+at (306, 72): `dc010000` and `32010000 32014800`) reads as patched and an
+apply rewrites it. A stock geometry has another physical size and a
 safe area inside the frame; any other geometry is not recognised.
 `--res stock` and `--panel mid` write the backup's stock immediates back.
 
@@ -309,18 +309,17 @@ and keeps its UI, such as the manoeuvre banner, inside the safe area; a car
 capture of the stock geometry shows exactly that. With a full-frame safe area
 the banner lands in the top-left corner, under the cluster's gauge mask.
 
-The default safe area is **476x306 at (306, 72)** (x 306–782, y 72–378),
-the part of the map slot the driver sees in full:
+The default safe area is **504x368 at (286, 72)** (x 286–790, y 72–440):
 
-- The cluster draws a mask over the slot that fades the map out towards
-  the gauges and the bottom frame. The safe area lies where the mask shows
-  at least 90% of the map (its bottom corners, rounded as the phone rounds
-  its cards, 91%), centred on the mask. Below y ≈ 400 the mask fades the map
-  quickly: at y 440 it shows 72% of the middle and half at x 300 and 789.
-- y 72 is below the native model badge, which covers the top of the slot to
+- x: BMW's own IC_MID safe area (504x456 at (708, 153) on the panel) lies
+  inside the map area at (422, 134); in map-area coordinates it spans
+  x 286–790, between the native speed readout (to x ≈ 170) and consumption
+  readout (from x ≈ 800).
+- y: below the native model badge, which covers the top of the area to
   y ≈ 64.
-- Google Maps draws its arrival-time card only in a safe area at least
-  about 296 rows high (none at 290); 306 keeps a margin.
+
+A smaller safe area, such as 476x306 at (306, 72), makes Apple Maps show a
+black cluster map or its turn card alone.
 
 `--safe WxH+X+Y` writes another (at least 16x16, inside the frame), `--safe
 full` the whole frame; `--res` scales the default. `patchd` reports `res` and
@@ -744,6 +743,7 @@ version patched (`rollback_test.js` runs each one from its release tag):
 | 0.9.11 (E) | stock | Edits 1–5 restored, Edit 6 left | Edits 1–5 written, Edit 6 kept |
 | 0.9.12–0.10.1 (F) | stock | as E | as E |
 | 0.10.2–0.10.3 (G) | stock | as E | Edits 1–4 and Edit 5 with the URL with ETA written, Edit 6 kept |
+| 0.10.4–0.10.6 (H) | stock | stock | 0.10.4–0.10.5: nothing to write; 0.10.6: its safe area 476x306 written |
 
 Every release reads this version's Edit 4 as patched (138x61 mm, a safe
 area inside the frame), and its activate writes its own safe area. A and B
@@ -948,9 +948,9 @@ unknown. The edit:
 
 - a 1280x720 stream with the UI in its top 1280x564 (margins 0x156 at
   0,0), the map slot's 2.27:1;
-- the safe area 592x432 at (336, 84): 504x368 at (286, 72) of the map
-  slot at the stream's scale, between the gauges and below the model
-  badge, where Maps pins its turn card;
+- the safe area 592x432 at (336, 84): the CarPlay safe area of the map
+  slot, 504x368 at (286, 72), at the stream's scale, so the turn card stays
+  where the gauges leave the slot clear;
 - the density chosen (150–400 dpi in steps of 10, 180 by default; kept in
   `/var/opt/waze-on-cluster/aa-density`). A lower one makes the phone take
   the screen for a larger one: more map, smaller text.
@@ -1148,8 +1148,8 @@ follows aapd only on a unit that has it.
   URL; earlier releases wrote `mapurl: true` for Edit 5's URL, the URL
   with ETA as a string, and no `showui`), and in `res` the geometry Edit 4
   advertised (pixel size, size in mm and safe area, as
-  `1088x480/138x61/476x306+306+72`; `false` for the stock one; earlier
-  releases wrote none).
+  `1088x480/138x61/504x368+286+72`; `false` for the stock one; releases
+  before 0.10.6 wrote none).
 - `/var/opt/waze-on-cluster/boot-recovery.json`, written whole: a
   temporary file, fsync'd, renamed over it, the folder fsync'd. A write
   that fails leaves the previous state as it was. It holds:
@@ -1290,8 +1290,8 @@ writes a geometry of its own other than the one that ran, to a patch that ran he
 without them as this version writes them, or after the revert of such a
 patch (a revert record whose `mapurl`, `showui` or `res` is not what this
 version writes, as every earlier release wrote), is on trial, since no
-healthy run with them was seen. An update from 0.10.5 or earlier, which
-wrote another safe area, is therefore on trial. A
+healthy run with them was seen. An update from 0.10.6, which wrote another
+safe area, is therefore on trial. A
 revert of a proven patch records
 `healthy: true`, so the next apply of that build there is proven at once;
 a revert of one on trial, a restore by boot recovery, a removal (which

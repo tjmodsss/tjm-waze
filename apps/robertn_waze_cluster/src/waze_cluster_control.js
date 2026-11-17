@@ -100,8 +100,8 @@ const RESTART_FAILED = { refused: 'not accepted', stayed: 'the head unit stayed 
 /* The native central-map slot's size, which the patch advertises to the phone. */
 const SIZE = '1088x480';
 /* The safe area CarPlay's Patch button writes: where the phone keeps its guidance UI,
- * inside the part of the map the cluster shows in full. */
-const SAFE = '476x306+306+72';
+ * inside the part of the map the gauges leave visible. */
+const SAFE = '504x368+286+72';
 /* The HUD map's size: HUD_STEP_PCT steps from HUD_MIN_PCT to HUD_MAX_PCT (85 %, the widest the HUD shows
  * whole), HUD_SIZE_STEPS of them. Standard (0) counts as HUD_STANDARD_PCT, about what the fitted box is. */
 const HUD_MIN_PCT = 30, HUD_MAX_PCT = 85, HUD_STEP_PCT = 5, HUD_STANDARD_PCT = 57;

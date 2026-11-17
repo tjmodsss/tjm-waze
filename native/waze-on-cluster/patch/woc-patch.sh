@@ -15,7 +15,7 @@
 #   woc-patch.sh apply  high --res <WxH|stock>  # the display size advertised to the phone
 #                                               # (default 1088x480; goes with any sink form)
 #   woc-patch.sh apply  high --safe <WxH+X+Y|full>  # the safe area the phone keeps its
-#                                               # guidance UI in (default 476x306+306+72)
+#                                               # guidance UI in (default 504x368+286+72)
 #   woc-patch.sh apply  high|mid --unproven     # also the first patch of a build outside
 #                                               # the proven list, and a patch on a car
 #                                               # not coded KI_KOMBI_VARIANT 7 (PATCH.md)

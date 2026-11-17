@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "robertn_waze_cluster",
-  "version": "0.6.11",
+  "version": "0.6.12",
   "tree": "package",
   "modules": [
     "src/robertn_waze_cluster.js",

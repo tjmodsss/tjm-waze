@@ -692,7 +692,6 @@ async function main() {
         b.writeUInt32LE(0xfff7f2bc >>> 0, SLOT);
         Buffer.from('e89f000000', 'hex').copy(b, 0x18176c);
         edits.forEach(function (e) { current.copy(b, e[0], e[0], e[0] + e[1]); });
-        if (edits.indexOf(RES[3]) >= 0) releasedSafe(b);
         fs.writeFileSync(TGT + '.older', b, { mode: 0o755 });
         fs.renameSync(TGT + '.older', TGT);
         record.write(TGT, { patched: true, proven: true });
@@ -700,42 +699,42 @@ async function main() {
         return hook('activate');
     }
     var RES = [[0x20ca32, 8], [0x20ca54, 8], [0x20ca66, 8], [0x20ca74, 8]], URLS = [[0x257838, 55], [0x7b533, 7], [0x2908a0, 64], [0x18188a, 11]];
-    /* The safe area 0.5.0-0.10.5 wrote (504x368 at 286,72), in place of this version's. */
-    function releasedSafe(b) { Buffer.from('00000000f8010000', 'hex').copy(b, 0x20ca66); Buffer.from('700100001e014800', 'hex').copy(b, 0x20ca74); return b; }
+    /* The safe area 0.10.6 wrote (476x306 at 306,72), in place of this version's. */
+    function safe0106(b) { Buffer.from('00000000dc010000', 'hex').copy(b, 0x20ca66); Buffer.from('3201000032014800', 'hex').copy(b, 0x20ca74); return b; }
     r = olderRelease(URLS);
     ok('migration: an older patch with the URL edits and the stock geometry recorded proven, brought up to date, is on trial', r.code === 0 && marker() && marker().action === 'apply' &&
         /resolution -> 1088x480/.test(r.out) && !/URL ->/.test(r.out) && disk() === sha(current) &&
         JSON.stringify(rec()) === JSON.stringify({ patched: true, proven: false, trial: true }), JSON.stringify([r.result, rec()]));
-    /* 0.10.4-0.10.5's patch: this version's but for the safe area 504x368. */
+    /* 0.10.6's patch: this version's but for the safe area 476x306. */
     var released = Buffer.from(current);
-    releasedSafe(released);
+    safe0106(released);
     fs.writeFileSync(TGT + '.older', released, { mode: 0o755 });
     fs.renameSync(TGT + '.older', TGT);
     record.write(TGT, { patched: true, proven: true });
     headUnitStart();
     r = hook('activate');
-    ok('migration: 0.10.5\'s patch recorded proven, its safe area brought up to date, is on trial', r.code === 0 && marker() && marker().action === 'apply' &&
-        /resolution -> 1088x480 at 138x61mm, safe 476x306 at 306,72/.test(r.out) && !/URL ->|variant ->/.test(r.out) && disk() === sha(current) &&
+    ok('migration: 0.10.6\'s patch recorded proven, its safe area brought up to date, is on trial', r.code === 0 && marker() && marker().action === 'apply' &&
+        /resolution -> 1088x480 at 138x61mm, safe 504x368 at 286,72/.test(r.out) && !/URL ->|variant ->/.test(r.out) && disk() === sha(current) &&
         JSON.stringify(rec()) === JSON.stringify({ patched: true, proven: false, trial: true }), JSON.stringify([r.result, rec()]));
     r = olderRelease(RES);
     ok('migration: a patch without the URL edits recorded proven, brought up to date, is on trial', r.code === 0 && marker() && marker().action === 'apply' &&
-        /map URL -> maps:\/car\/instrumentcluster\/map$/m.test(r.out) && /ShowUI URL -> /.test(r.out) && /resolution -> /.test(r.out) && disk() === sha(current) &&
+        /map URL -> maps:\/car\/instrumentcluster\/map$/m.test(r.out) && /ShowUI URL -> /.test(r.out) && !/resolution ->/.test(r.out) && disk() === sha(current) &&
         JSON.stringify(rec()) === JSON.stringify({ patched: true, proven: false, trial: true }), JSON.stringify([r.result, rec()]));
     r = olderRelease(RES.concat(URLS.slice(0, 2)));
     ok('migration: 0.9.11\'s patch recorded proven, the ShowUI URL edit added, is on trial', r.code === 0 && marker() && marker().action === 'apply' &&
-        /ShowUI URL -> /.test(r.out) && /resolution -> /.test(r.out) && !/map URL ->|variant ->/.test(r.out) && disk() === sha(current) &&
+        /ShowUI URL -> /.test(r.out) && !/map URL ->|resolution ->|variant ->/.test(r.out) && disk() === sha(current) &&
         JSON.stringify(rec()) === JSON.stringify({ patched: true, proven: false, trial: true }), JSON.stringify([r.result, rec()]));
     var olderMu = require('../carplay_locate.js').locate(current).mapurl, etaForm = olderMu.forms.filter(function (f) { return f.name === 'eta'; })[0];
     var withEta = Buffer.from(current);
     Buffer.from(etaForm.slotBytes, 'hex').copy(withEta, olderMu.slot); Buffer.from(etaForm.leaBytes, 'hex').copy(withEta, olderMu.lea);
-    SRCBUF.copy(withEta, 0x2908a0, 0x2908a0, 0x2908a0 + 64); SRCBUF.copy(withEta, 0x18188a, 0x18188a, 0x18188a + 11); releasedSafe(withEta);
+    SRCBUF.copy(withEta, 0x2908a0, 0x2908a0, 0x2908a0 + 64); SRCBUF.copy(withEta, 0x18188a, 0x18188a, 0x18188a + 11);
     fs.writeFileSync(TGT + '.older', withEta, { mode: 0o755 });
     fs.renameSync(TGT + '.older', TGT);
     record.write(TGT, { patched: true, proven: true });
     headUnitStart();
     r = hook('activate');
     ok('migration: 0.10.2\'s patch recorded proven, the URL edits written, is on trial', r.code === 0 && marker() && marker().action === 'apply' &&
-        /map URL -> maps:\/car\/instrumentcluster\/map$/m.test(r.out) && /ShowUI URL -> /.test(r.out) && /resolution -> /.test(r.out) && !/variant ->/.test(r.out) && disk() === sha(current) &&
+        /map URL -> maps:\/car\/instrumentcluster\/map$/m.test(r.out) && /ShowUI URL -> /.test(r.out) && !/resolution ->|variant ->/.test(r.out) && disk() === sha(current) &&
         JSON.stringify(rec()) === JSON.stringify({ patched: true, proven: false, trial: true }), JSON.stringify([r.result, rec()]));
 
     var CODINGS = [['coding 9', 9, undefined, 'not supported on this car (KI_KOMBI_VARIANT 9)'],

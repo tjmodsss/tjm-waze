@@ -40,12 +40,12 @@ function callBytes(buf) { return buf.slice(CALL, CALL + CALL_LEN).toString('hex'
 var RES_OFFS = [0x20ca30, 0x20ca52, 0x20ca64, 0x20ca72];
 function resImmediates(buf) { return RES_OFFS.map(function (o) { return buf.slice(o, o + 10).toString('hex'); }); }
 var RES_STOCK = ['48baea0000006e000000', '48b88007000084030000', '48b80000000064020000', '48b80e0200000202c000'];
-/* 1088x480 at 138x61 mm, view offset (0,0), safe 476x306 at (306,72). */
-var RES_DEFAULT = ['48ba8a0000003d000000', '48b840040000e0010000', '48b800000000dc010000', '48b83201000032014800'];
-/* The geometry releases 0.5.0-0.10.5 wrote: the same with safe 504x368 at (286,72). */
-var RES_RELEASED = ['48ba8a0000003d000000', '48b840040000e0010000', '48b800000000f8010000', '48b8700100001e014800'];
+/* 1088x480 at 138x61 mm, view offset (0,0), safe 504x368 at (286,72). */
+var RES_DEFAULT = ['48ba8a0000003d000000', '48b840040000e0010000', '48b800000000f8010000', '48b8700100001e014800'];
+/* The geometry 0.10.6 wrote: the same with safe 476x306 at (306,72). */
+var RES_0106 = ['48ba8a0000003d000000', '48b840040000e0010000', '48b800000000dc010000', '48b83201000032014800'];
 /* The patch record's key of each (carplay_patch.js resKey). */
-var GEOM_KEY = '1088x480/138x61/476x306+306+72', GEOM_KEY_RELEASED = '1088x480/138x61/504x368+286+72';
+var GEOM_KEY = '1088x480/138x61/504x368+286+72', GEOM_KEY_0106 = '1088x480/138x61/476x306+306+72';
 /* The same size with the safe area the whole frame (--safe full). */
 var RES_FULLSAFE = ['48ba8a0000003d000000', '48b840040000e0010000', '48b80000000040040000', '48b8e001000000000000'];
 function inResRegion(x) { return RES_OFFS.some(function (o) { return x >= o + 2 && x < o + 10; }); }
@@ -88,8 +88,8 @@ function withShowUi(buf, i) { return withRanges(SHOWUI, buf, i); }
  * (0.10.2-0.10.3). */
 function asRelease(buf, rel) { return withMapUrl(withShowUi(buf, 1), rel === 'none' ? 1 : rel === 'map' ? 2 : 3); }
 function withoutMapUrl(buf) { return asRelease(buf, 'none'); }
-/* The geometry releases 0.5.0-0.10.5 wrote, in place of this version's. */
-function releasedSafe(b) { RES_OFFS.forEach(function (o, i) { Buffer.from(RES_RELEASED[i], 'hex').copy(b, o); }); return b; }
+/* The geometry 0.10.6 wrote, in place of this version's. */
+function safe0106(b) { RES_OFFS.forEach(function (o, i) { Buffer.from(RES_0106[i], 'hex').copy(b, o); }); return b; }
 /* Build an "older patch" binary: variant + sink applied, self-start still stock
  * (what the car runs today). Patches the bytes directly, bypassing the patcher. */
 function makeEdit12Only(panel, sinkUrl) {
@@ -143,19 +143,19 @@ try {
     r = run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
     ok('apply high (avb mode) succeeds', r.code === 0 && /patched OK/.test(r.out) && /self-start -> requestStream/.test(r.out) && /resolution -> 1088x480 at 138x61mm/.test(r.out) &&
         /map URL -> maps:\/car\/instrumentcluster\/map$/m.test(r.out) && /ShowUI URL -> maps:\/car\/instrumentcluster\?showETA=yes$/m.test(r.out), r.out);
-    /* The app's patch (high, stock AVB sink, default geometry). With the
-     * safe area 504x368 it is byte for byte the patch 0.10.4-0.10.5 wrote, as
-     * run on the car; that without the ShowUI URL edit, the patch
-     * 0.9.11-0.10.1 wrote, and with the URL with ETA in place of the map URL,
-     * the one 0.10.2-0.10.3 wrote. */
+    /* The app's patch (high, stock AVB sink, default geometry): byte for
+     * byte the patch 0.10.4-0.10.5 wrote, as run on the car; that without the
+     * ShowUI URL edit, the patch 0.9.11-0.10.1 wrote, with the URL with ETA in
+     * place of the map URL, the one 0.10.2-0.10.3 wrote, and with the safe
+     * area 476x306, the one 0.10.6 wrote. */
     function shaOf(b) { return crypto.createHash('sha256').update(b).digest('hex'); }
-    ok('apply high (avb mode): the patched carplay 22.28.3', sha256(tgt) === 'dcc5f89c3d8b27ae0a8873f08b2d40dafe57a19018c9f3450b396629a25d5356', sha256(tgt));
-    ok('apply high (avb mode): with the safe area 504x368, the patch 0.10.4-0.10.5 wrote', shaOf(releasedSafe(fs.readFileSync(tgt))) ===
-        'a241b0e9af9ac1eada5c5ebcf9fab06669a155376b0a5c70cd85f3c1459a88b5');
-    ok('apply high (avb mode): and without the ShowUI URL edit, the patch 0.9.11-0.10.1 wrote', shaOf(asRelease(releasedSafe(fs.readFileSync(tgt)), 'map')) ===
+    ok('apply high (avb mode): the patched carplay 22.28.3, the patch 0.10.4-0.10.5 wrote', sha256(tgt) === 'a241b0e9af9ac1eada5c5ebcf9fab06669a155376b0a5c70cd85f3c1459a88b5', sha256(tgt));
+    ok('apply high (avb mode): without the ShowUI URL edit, the patch 0.9.11-0.10.1 wrote', shaOf(asRelease(fs.readFileSync(tgt), 'map')) ===
         '035c35a40fae0af00ef4bd5ff69d3ce7ff00202d6ad99d770d8b6f1fdc8bed05');
-    ok('apply high (avb mode): and with the URL with ETA, the patch 0.10.2-0.10.3 wrote', shaOf(asRelease(releasedSafe(fs.readFileSync(tgt)), 'eta')) ===
+    ok('apply high (avb mode): with the URL with ETA, the patch 0.10.2-0.10.3 wrote', shaOf(asRelease(fs.readFileSync(tgt), 'eta')) ===
         '99aefe0b40be8c607f077d643086ac52e7d35d99b33fcdbcc757706cf228ba91');
+    ok('apply high (avb mode): with the safe area 476x306, the patch 0.10.6 wrote', shaOf(safe0106(fs.readFileSync(tgt))) ===
+        'dcc5f89c3d8b27ae0a8873f08b2d40dafe57a19018c9f3450b396629a25d5356');
     ok('backup is pristine', sha256(tgt + '.woc-orig') === ORIG_SHA);
     var d = diffs(SRCBUF, fs.readFileSync(tgt));
     ok('avb-mode diff stays in the slot, the call rel32, the res immediates and the URL edits\' ranges', d.length >= 2 &&
@@ -165,10 +165,10 @@ try {
     ok('call retargeted to requestStream', callBytes(fs.readFileSync(tgt)) === CALL_SELF, callBytes(fs.readFileSync(tgt)));
     ok('map URL ranges patched', mapUrlIs(fs.readFileSync(tgt), 2), JSON.stringify(mapUrlBytes(fs.readFileSync(tgt))));
     ok('ShowUI URL ranges patched', showUiIs(fs.readFileSync(tgt), 2), JSON.stringify(rangeBytes(SHOWUI, fs.readFileSync(tgt))));
-    ok('res immediates advertise 1088x480 at 138x61mm, safe 476x306 at 306,72',
+    ok('res immediates advertise 1088x480 at 138x61mm, safe 504x368 at 286,72',
         JSON.stringify(resImmediates(fs.readFileSync(tgt))) === JSON.stringify(RES_DEFAULT), JSON.stringify(resImmediates(fs.readFileSync(tgt))));
     r = run(['status', '--target', tgt]);
-    ok('status: avb mode is SELF-START + sink ORIGINAL + res PATCHED + mapurl PATCHED + showui PATCHED', /selfstart:\s+SELF-START/.test(r.out) && /sink:\s+ORIGINAL/.test(r.out) && /res:\s+PATCHED \(IC_HIGH advertises 1088x480 at 138x61mm, safe 476x306 at 306,72\)/.test(r.out) &&
+    ok('status: avb mode is SELF-START + sink ORIGINAL + res PATCHED + mapurl PATCHED + showui PATCHED', /selfstart:\s+SELF-START/.test(r.out) && /sink:\s+ORIGINAL/.test(r.out) && /res:\s+PATCHED \(IC_HIGH advertises 1088x480 at 138x61mm, safe 504x368 at 286,72\)/.test(r.out) &&
         /^mapurl:\s+PATCHED \(the phone streams the cluster map from connect: maps:\/car\/instrumentcluster\/map\)$/m.test(r.out) &&
         /^showui:\s+PATCHED \(ShowUI asks the phone for maps:\/car\/instrumentcluster\?showETA=yes, with the arrival-time card\)$/m.test(r.out), r.out);
     r = run(['verify', '--target', tgt]);
@@ -506,7 +506,7 @@ try {
     r = run(['apply', '--target', e123, '--panel', 'high', '--res', '800x360', '--yes']);
     ok('custom --res 800x360 applies at 138x61mm', r.code === 0 && /resolution -> 800x360 at 138x61mm/.test(r.out), r.out);
     r = run(['status', '--target', e123]);
-    ok('custom --res reads back as PATCHED 800x360 with the safe area scaled', /res:\s+PATCHED \(IC_HIGH advertises 800x360 at 138x61mm, safe 350x230 at 225,54\)/.test(r.out), r.out);
+    ok('custom --res reads back as PATCHED 800x360 with the safe area scaled', /res:\s+PATCHED \(IC_HIGH advertises 800x360 at 138x61mm, safe 371x276 at 210,54\)/.test(r.out), r.out);
     r = run(['apply', '--target', e123, '--panel', 'high', '--res', '1920x1080', '--yes']);
     ok('a 1920-wide custom res is labelled by its size, not stock', r.code === 0 && /resolution -> 1920x1080 at 138x61mm/.test(r.out) && !/resolution -> stock/.test(r.out), r.out);
     /* A unit patched at an earlier default size: the Patch button (no --res) rewrites
@@ -546,7 +546,7 @@ try {
     ok('full-frame safe: verify passes', r.code === 0 && /res 1088x480/.test(r.out), r.out);
     r = run(['apply', '--target', fs1, '--panel', 'high', '--yes']);
     ok('full-frame safe: the Patch button writes the default safe area', r.code === 0 &&
-        /resolution -> 1088x480 at 138x61mm, safe 476x306 at 306,72/.test(r.out) && !/variant ->|self-start ->|sink ->/.test(r.out), r.out);
+        /resolution -> 1088x480 at 138x61mm, safe 504x368 at 286,72/.test(r.out) && !/variant ->|self-start ->|sink ->/.test(r.out), r.out);
     var d5 = diffs(bfs, fs.readFileSync(fs1));
     var SAFE_OFFS = [0x20ca64, 0x20ca72];
     ok('full-frame safe: the Patch button changed only the safe-area immediates', d5.length >= 1 &&
@@ -568,28 +568,30 @@ try {
     r = run(['apply', '--target', fs1, '--panel', 'high', '--safe', '600x400', '--yes']);
     ok('malformed --safe refused, no change', r.code !== 0 && /--safe needs/.test(r.out) && sha256(fs1) === fsSha2, r.out);
 
-    /* The safe area every earlier release wrote (504x368 at 286,72) reads as
-     * patched; the Patch button rewrites only the two safe-area immediates, and revert
-     * restores stock from it. */
-    var rel = path.join(dir, 'carplay_released_safe');
+    /* The safe area 0.10.6 wrote (476x306 at 306,72) reads as patched; the
+     * Patch button rewrites only the two safe-area immediates, which leaves
+     * the patch 0.10.4-0.10.5 wrote byte for byte, and revert restores stock
+     * from it. */
+    var rel = path.join(dir, 'carplay_0106_safe');
     fs.writeFileSync(rel, SRCBUF);
     run(['apply', '--target', rel, '--panel', 'high', '--yes']);
-    var brel = releasedSafe(Buffer.from(fs.readFileSync(rel)));
+    var brel = safe0106(Buffer.from(fs.readFileSync(rel)));
     fs.writeFileSync(rel, brel);
     r = run(['status', '--target', rel]);
-    ok('released safe: status PATCHED 1088x480 with safe 504x368 at 286,72, known',
-        /res:\s+PATCHED \(IC_HIGH advertises 1088x480 at 138x61mm, safe 504x368 at 286,72\)/.test(r.out) && /known:\s+yes/.test(r.out), r.out);
+    ok('0.10.6 safe: status PATCHED 1088x480 with safe 476x306 at 306,72, known',
+        /res:\s+PATCHED \(IC_HIGH advertises 1088x480 at 138x61mm, safe 476x306 at 306,72\)/.test(r.out) && /known:\s+yes/.test(r.out), r.out);
     r = run(['verify', '--target', rel]);
-    ok('released safe: verify passes', r.code === 0 && /res 1088x480/.test(r.out), r.out);
+    ok('0.10.6 safe: verify passes', r.code === 0 && /res 1088x480/.test(r.out), r.out);
     r = run(['apply', '--target', rel, '--panel', 'high', '--yes']);
     var drel = diffs(brel, fs.readFileSync(rel));
-    ok('released safe: the Patch button writes the default safe area, nothing else', r.code === 0 &&
-        /resolution -> 1088x480 at 138x61mm, safe 476x306 at 306,72/.test(r.out) && !/variant ->|self-start ->|sink ->|map URL ->|ShowUI URL ->/.test(r.out) &&
+    ok('0.10.6 safe: the Patch button writes the default safe area, nothing else', r.code === 0 &&
+        /resolution -> 1088x480 at 138x61mm, safe 504x368 at 286,72/.test(r.out) && !/variant ->|self-start ->|sink ->|map URL ->|ShowUI URL ->/.test(r.out) &&
         drel.length >= 1 && drel.every(function (x) { return [0x20ca64, 0x20ca72].some(function (o) { return x >= o + 2 && x < o + 10; }); }) &&
         JSON.stringify(resImmediates(fs.readFileSync(rel))) === JSON.stringify(RES_DEFAULT), r.out + JSON.stringify(drel));
+    ok('0.10.6 safe: the result is the patch 0.10.4-0.10.5 wrote, byte for byte', sha256(rel) === 'a241b0e9af9ac1eada5c5ebcf9fab06669a155376b0a5c70cd85f3c1459a88b5', sha256(rel));
     fs.writeFileSync(rel, brel);
     r = run(['revert', '--target', rel, '--yes']);
-    ok('released safe: revert restores byte-exact stock', r.code === 0 && sha256(rel) === ORIG_SHA, r.out);
+    ok('0.10.6 safe: revert restores byte-exact stock', r.code === 0 && sha256(rel) === ORIG_SHA, r.out);
     r = run(['apply', '--target', fs1, '--panel', 'mid', '--safe', 'full', '--yes']);
     ok('--safe with --panel mid refused, no change', r.code !== 0 && /--panel high/.test(r.out) && sha256(fs1) === fsSha2, r.out);
     /* A safe area that overruns the frame is not this tool's geometry. */
@@ -714,7 +716,7 @@ function codingAndRecord() {
     function earlierHealthy(rel) {
         fresh();
         run(['apply', '--target', ct, '--panel', 'high', '--yes']);
-        fs.writeFileSync(ct + '.tmp', asRelease(releasedSafe(fs.readFileSync(ct)), rel || 'none'), { mode: 0o755 });
+        fs.writeFileSync(ct + '.tmp', asRelease(fs.readFileSync(ct), rel || 'none'), { mode: 0o755 });
         fs.renameSync(ct + '.tmp', ct);
         record.write(ct, { patched: true, proven: true });
     }
@@ -799,22 +801,22 @@ function codingAndRecord() {
             earlierHealthy(t[1]);
             r = run(['apply', '--target', ct, '--panel', 'high', '--yes']);
             ok('record: bringing a patch ' + t[0] + ' that ran healthy up to date puts it on trial', r.code === 0 && /ShowUI URL -> /.test(r.out) &&
-                /resolution -> /.test(r.out) && !/variant ->/.test(r.out) && rec() === want({ patched: true, proven: false, trial: true }), r.out + rec());
+                !/variant ->|resolution ->/.test(r.out) && rec() === want({ patched: true, proven: false, trial: true }), r.out + rec());
             earlierHealthy(t[1]);
             r = run(['revert', '--target', ct, '--yes']);
             ok('record: the revert of a healthy patch ' + t[0] + ' records the URLs it held as this version writes them', r.code === 0 && sha256(ct) === ORIG_SHA &&
-                rec() === want({ patched: false, healthy: true, mapurl: t[2].mapurl, showui: t[2].showui, res: GEOM_KEY_RELEASED }), r.out + rec());
+                rec() === want({ patched: false, healthy: true, mapurl: t[2].mapurl, showui: t[2].showui, res: GEOM_KEY }), r.out + rec());
             r = run(['apply', '--target', ct, '--panel', 'high', '--yes']);
             ok('record: patched again after it, on trial', r.code === 0 && rec() === want({ patched: true, proven: false, trial: true }), r.out + rec());
         });
-        /* The patch of 0.10.4-0.10.5 (both URL edits as this version writes
-         * them, the safe area 504x368) that ran healthy: the apply that
-         * brings its safe area up to date puts it on trial, and so does an
-         * apply after its revert, whose record keeps the geometry it held. */
+        /* The patch of 0.10.6 (both URL edits as this version writes them,
+         * the safe area 476x306) that ran healthy: the apply that brings its
+         * safe area up to date puts it on trial, and so does an apply after
+         * its revert, whose record keeps the geometry it held. */
         function releasedGeometry() {
             fresh();
             run(['apply', '--target', ct, '--panel', 'high', '--yes']);
-            fs.writeFileSync(ct + '.tmp', releasedSafe(fs.readFileSync(ct)), { mode: 0o755 });
+            fs.writeFileSync(ct + '.tmp', safe0106(fs.readFileSync(ct)), { mode: 0o755 });
             fs.renameSync(ct + '.tmp', ct);
             record.write(ct, { patched: true, proven: true });
         }
@@ -824,8 +826,8 @@ function codingAndRecord() {
             !/variant ->|map URL ->|ShowUI URL ->/.test(r.out) && rec() === want({ patched: true, proven: false, trial: true }), r.out + rec());
         releasedGeometry();
         r = run(['revert', '--target', ct, '--yes']);
-        ok('record: the revert of a healthy patch with the earlier safe area records that geometry', r.code === 0 && sha256(ct) === ORIG_SHA &&
-            rec() === want({ patched: false, healthy: true, mapurl: 'maps:/car/instrumentcluster/map', showui: 'maps:/car/instrumentcluster?showETA=yes', res: GEOM_KEY_RELEASED }), r.out + rec());
+        ok('record: the revert of a healthy patch with 0.10.6\'s safe area records that geometry', r.code === 0 && sha256(ct) === ORIG_SHA &&
+            rec() === want({ patched: false, healthy: true, mapurl: 'maps:/car/instrumentcluster/map', showui: 'maps:/car/instrumentcluster?showETA=yes', res: GEOM_KEY_0106 }), r.out + rec());
         r = run(['apply', '--target', ct, '--panel', 'high', '--yes']);
         ok('record: patched again after it, on trial', r.code === 0 && rec() === want({ patched: true, proven: false, trial: true }), r.out + rec());
         record.write(ct, { patched: true, proven: true });

@@ -294,7 +294,7 @@ async function main() {
     ok('apply: / is read-only again', /\bro\b/.test(fs.readFileSync(MOUNTS, 'utf8')));
     r = await status();
     ok('status: fully patched binary is patched, res 1088x480', r.state === 'patched' && r.mode === 'udp' && r.res === '1088x480' && !r.reason, JSON.stringify(r));
-    ok('status: fully patched binary carries the default safe area', r.safe === '476x306+306+72', JSON.stringify(r));
+    ok('status: fully patched binary carries the default safe area', r.safe === '504x368+286+72', JSON.stringify(r));
     /* The full-frame safe area (the geometry before the safe-area default):
      * still patched at 1088x480, with its safe area reported for the app. */
     var patchedBuf = fs.readFileSync(TGT);

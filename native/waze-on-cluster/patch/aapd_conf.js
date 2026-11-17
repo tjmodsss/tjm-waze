@@ -20,9 +20,9 @@
  * map slot's 2.27:1 (as proven on a car), at the owner's density
  * (DENSITIES; a lower one shows more map with smaller text). The decoder
  * crops the picture to that UI and scales it 0.85x into the 1088x480 slot
- * (srcCrop). The safe area, 592x432 at 336,84, is 504x368 at 286,72 of the
- * slot at that scale, between the gauges and below the model badge, where
- * Maps pins its turn card. With the turn card hidden the
+ * (srcCrop). The safe area is the CarPlay patch's for the slot (504x368 at
+ * 286,72) at that scale, 592x432 at 336,84, so the phone keeps its turn
+ * card where the gauges leave the slot clear. With the turn card hidden the
  * UI is the whole picture and the safe area starts at its top, where Maps
  * pins the card, and the crop cuts the card's rows off (cardCut). The
  * numbers are replaced in place; the rest of the file stays byte for

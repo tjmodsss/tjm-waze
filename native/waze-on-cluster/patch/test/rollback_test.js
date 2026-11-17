@@ -23,7 +23,9 @@
  *                  found
  *   G 0.10.2-0.10.3 F, with the URL with `?showETA=yes` as the initial URL;
  *                  knows F's URL too
- *   H 0.10.4-      G, writing F's URL again, and the ShowUI URL edit
+ *   H 0.10.4-      G, writing F's URL again, and the ShowUI URL edit;
+ *                  0.10.6 writes the safe area 476x306 at 306,72, every
+ *                  other release and this version 504x368 at 286,72
  * Groups A-D know four edits, E-G five, H and this version six. E and F write
  * and know the map URL (`maps:/car/instrumentcluster/map`) only, G writes the
  * URL with `?showETA=yes` and restores either, H and this version write the
@@ -173,6 +175,15 @@ clear(); fs.writeFileSync(TGT, STOCK, { mode: 0o755 });
 var r = apply(NEW);
 ok('this version patches the build, the map URL and ShowUI URL edits included', r.code === 0 && mapUrlIn() && showUiIn(), r.out);
 var NEW_PATCH = snapshot();
+/* The patch 0.10.4-0.10.5 wrote, as run on the car (carplay 22.28.3). */
+var CAR_PATCH_SHA = 'a241b0e9af9ac1eada5c5ebcf9fab06669a155376b0a5c70cd85f3c1459a88b5';
+if (BIN) ok('this version\'s patch is byte for byte the one 0.10.4-0.10.5 wrote', require('crypto').createHash('sha256').update(NEW_PATCH['']).digest('hex') === CAR_PATCH_SHA);
+ok('every release from ' + (BIN ? '0.5.0' : '0.7.0') + ' to 0.10.6 is tested', RELEASES.indexOf(BIN ? '0.5.0' : '0.7.0') >= 0 && RELEASES.indexOf('0.10.6') >= 0, RELEASES.join(' '));
+var R = LOC.res, SAFE_OFFS = [R.safe1, R.safe2];
+function imm(buf, o) { return buf.slice(o, o + 8); }
+/* The safe area 0.10.6 wrote (476x306 at 306,72): the view x,y and safe
+ * width, then the safe height and x,y. */
+var SAFE_0106 = [Buffer.from('00000000dc010000', 'hex'), Buffer.from('3201000032014800', 'hex')];
 
 function relGroup(v) { return v === 'this' ? 'N' : group(v); }
 /* Whether a version writes the map URL edit on the build the test runs on:
@@ -227,6 +238,16 @@ RELEASES.forEach(function (v) {
     r = removePatch(NEW); var newUpRm = r.code === 0 && holds() === 'stock';
     ok(v + ' (' + g + ')\'s patch under this version: a crash loop ends stock, Remove patch and removal stock, an update writes this version\'s patch and reverts whole',
         newRec && newRm && newUn && newUp && newUpRm, [rec, newRec, newRm, newUn, newUp, newUpRm].join(' '));
+    if (g === 'H') {
+        /* 0.10.6's patch is this version's with its own safe area, which the
+         * update rewrites, and nothing else; 0.10.4-0.10.5's is this version's. */
+        var is0106 = v === '0.10.6', relB = relPatch[''], diffOk = relB.length === NEW_PATCH[''].length;
+        for (var i = 0; diffOk && i < relB.length; i++)
+            if (relB[i] !== NEW_PATCH[''][i] && !(is0106 && SAFE_OFFS.some(function (o) { return i >= o && i < o + 8; }))) diffOk = false;
+        var safeOk = is0106 ? imm(relB, R.safe1).equals(SAFE_0106[0]) && imm(relB, R.safe2).equals(SAFE_0106[1]) : relB.equals(NEW_PATCH['']);
+        ok(v + ' (' + g + ')\'s patch is this version\'s' + (is0106 ? ' but for the safe area 476x306, which an update rewrites' : ', byte for byte'),
+            diffOk && safeOk, 'diff ' + diffOk + ' safe ' + safeOk);
+    }
 
     /* 3. The release over this version's patch with no deactivate in
      * between (the open paths PATCH.md "Rollback" lists): what it does. */
@@ -318,19 +339,18 @@ REPS.forEach(function (p) {
 })();
 
 /* 6. A write of the geometry edit cut short, or one an earlier release
- * left: the safe area every release before this one wrote (504x368) under
- * this version's other edits, the size and physical size written with the
- * safe area stock, the safe area written with the size stock, and the safe
- * height or the safe x,y alone written. This version's crash loop, Remove
+ * left: the safe area 0.10.6 wrote (476x306) under this version's other
+ * edits, an update from it cut short between or inside the two safe-area
+ * immediates, the size and physical size written with the safe area stock,
+ * the safe area written with the size stock, and the safe height or the
+ * safe x,y alone written. This version's crash loop, Remove
  * patch and removal end stock; its activate writes its patch where the
  * geometry reads as patched or stock (PATCH.md, Edit 4: a physical size,
  * the view area at 0,0 for ours, a safe area inside the frame), and leaves
  * one it does not recognise; under every release from D on a crash loop
  * ends stock. */
 (function () {
-    var R = LOC.res;
-    function imm(buf, o) { return buf.slice(o, o + 8); }
-    var NEWB = NEW_PATCH[''], REL_SAFE1 = Buffer.from('00000000f8010000', 'hex'), REL_SAFE2 = Buffer.from('700100001e014800', 'hex');
+    var NEWB = NEW_PATCH[''], REL_SAFE1 = SAFE_0106[0], REL_SAFE2 = SAFE_0106[1];
     function mix(over) { return function (b) { Object.keys(over).forEach(function (k) { over[k].copy(b, R[k]); }); }; }
     /* 'patch' when the geometry in b reads as this tool's or as stock, else 'left' */
     function outcome(b) {
@@ -341,8 +361,13 @@ REPS.forEach(function (p) {
         return inside && (ours ? vx === 0 && vy === 0 : mmw > 0 && mmh > 0) ? 'patch' : 'left';
     }
     var CUT = [
-        ['the safe area 504x368 of the releases before this one', mix({ safe1: REL_SAFE1, safe2: REL_SAFE2 })],
-        ['geometry cut short (this version\'s safe width, the earlier releases\' safe height and x,y)', mix({ safe2: REL_SAFE2 })],
+        ['the safe area 476x306 of 0.10.6', mix({ safe1: REL_SAFE1, safe2: REL_SAFE2 })],
+        ['geometry cut short (this version\'s safe width, 0.10.6\'s safe height and x,y)', mix({ safe2: REL_SAFE2 })],
+        ['geometry cut short (0.10.6\'s safe width, this version\'s safe height and x,y)', mix({ safe1: REL_SAFE1 })],
+        ['geometry cut short (0.10.6\'s safe width, 0.10.6\'s safe height with this version\'s first 2 bytes)', function (b) {
+            REL_SAFE1.copy(b, R.safe1); REL_SAFE2.copy(b, R.safe2); imm(NEWB, R.safe2).copy(b, R.safe2, 0, 2); }],
+        ['geometry cut short (this version\'s safe width, 0.10.6\'s safe height with this version\'s first 2 bytes)', function (b) {
+            REL_SAFE2.copy(b, R.safe2); imm(NEWB, R.safe2).copy(b, R.safe2, 0, 2); }],
         ['geometry cut short (size written, safe area stock)', mix({ safe1: imm(STOCK, R.safe1), safe2: imm(STOCK, R.safe2) })],
         ['geometry cut short (safe area written, size stock)', mix({ mm: imm(STOCK, R.mm), px: imm(STOCK, R.px) })],
         ['geometry cut short (the safe height\'s first 2 bytes written, the rest stock)', function (b) {

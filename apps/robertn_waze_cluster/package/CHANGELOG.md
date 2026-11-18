@@ -5,6 +5,12 @@
 The cluster's safe area is back to 504x368 at (286, 72); a smaller area made
 Apple Maps show a black or card-only cluster.
 
+The cluster map recovers by itself when the instrument cluster accepts a map
+frame and never finishes it, instead of staying stuck (cluster-render 0.6.9).
+Maps on cluster gets two opt-in settings in features.conf, hosted_vpp_scale
+and always_packed, and warns about unknown keys in the local conf
+(waze-on-cluster 0.10.9).
+
 ## 0.6.11
 
 Apple Maps and Google Maps keep their arrival time, road names and turn

@@ -45,6 +45,12 @@
  * for that slot, and a frame decoded on the FIFO reader wakes it. Each
  * frame is counted once, a late picture's when it was decoded.
  *
+ * Parts (hosted_vpp_scale, set_part). The frames are the part of the frame
+ * a host shows, at its size, as the decoder's VPP makes them, for as long
+ * as it can; take() says which. A part's pictures count for the freeze
+ * watch and the minute's tally as the whole frame's do, sampled at their
+ * size. Without set_part nothing of it runs.
+ *
  * Losses (stream_health.h). A lost packet costs only the NAL unit it was in
  * (rtp_h264.h); the decoder decodes through it and the frames it flags
  * corrupted are shown all the same. A gap is a new stream or a loss
@@ -55,6 +61,7 @@
 #define WOC_VIDEO_PRODUCER_H
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -114,8 +121,13 @@ public:
 
     /* The newest decoded frame not yet taken, swapped into *frame (its
      * buffer comes back for the next one), or with *same the picture last
-     * taken again (*frame untouched); false when there is none. */
-    bool take(std::vector<uint8_t> *frame, uint64_t *id, bool *same);
+     * taken again (*frame untouched); false when there is none. With part,
+     * the part of the frame it is (set_part; unset: the whole frame). */
+    bool take(std::vector<uint8_t> *frame, uint64_t *id, bool *same, OutputPart *part = nullptr);
+    /* hosted_vpp_scale: the frames from the next picture on are this part
+     * of the frame, at its size, made by VPP (Decoder::set_part), as far as
+     * VPP can; unset: the whole frame. Main thread. */
+    void set_part(const OutputPart &p);
     /* Every decoded frame the same blank picture while they keep coming,
      * after the stream showed a picture (freeze_watch.h). */
     bool frozen(int64_t now_ms) const;
@@ -214,6 +226,8 @@ private:
      * late picture's frame was counted when it was decoded. Under
      * decode_mutex_. */
     void on_frame(const VideoFrame &f, bool late);
+    /* The part set_part asked for, to the decoder. Under decode_mutex_. */
+    void pass_part();
 
     VideoConfig cfg_;
     size_t atlas_bytes_;
@@ -247,9 +261,17 @@ private:
     bool repeat_ = false;            /* the picture last taken is due again (back_dirty_ false) */
     int ready_[2] = {-1, -1};        /* a byte written when a frame waits to be taken */
     uint32_t back_w_ = 0, back_h_ = 0;
+    OutputPart back_part_;           /* the part of the frame it is */
     uint64_t back_id_ = 0;           /* its number in the decoder's lifetime */
     uint64_t same_total_ = 0;        /* pictures the same as the last (frame_mutex_) */
     ChangeSampler change_;           /* source thread */
+    /* A part's pictures (hosted_vpp_scale): its own sampler, for its size
+     * (source thread). */
+    std::unique_ptr<ChangeSampler> part_change_;
+    uint32_t part_change_w_ = 0, part_change_h_ = 0;
+    OutputPart part_asked_;          /* main thread */
+    OutputPart part_wanted_;         /* frame_mutex_ */
+    std::atomic<bool> part_due_{false};   /* part_wanted_ is not the decoder's yet */
     FreezeWatch freeze_;             /* frame_mutex_ */
     FrameTally tally_;               /* frame_mutex_ */
     std::string last_err_;           /* last decode error, for the status line and the log (frame_mutex_) */

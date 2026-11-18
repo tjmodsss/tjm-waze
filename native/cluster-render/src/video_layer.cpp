@@ -5,6 +5,7 @@
 #include <algorithm>
 
 #include <cstdio>
+#include <cstring>
 
 #include "block_pack.h"
 #include "yuv_atlas.h"
@@ -23,6 +24,8 @@ VideoLayer::VideoLayer(uint32_t id, int target, uint64_t seq, crk::UploadPacer &
 {
     if (p_.h % 4)
         p_.pan_blocks = false;
+    if (!p_.pan_blocks)
+        p_.always_packed = false;
     if (p_.pan_blocks)
         packed_.resize(crk::block_bytes(p_.w, p_.h));
     clock_.configure(p_.fps);
@@ -126,7 +129,7 @@ void VideoLayer::hide(const uint8_t *tiles)
 {
     hiding_ = false;
     shown_drawn_ = g_ && drawn_;
-    if (!tiles || no_hide_)
+    if (!tiles || no_hide_ || p_.always_packed)   /* the packed quad hides nothing */
         return;
     hidden_.assign(tiles, tiles + planner_.tiles());
     hiding_ = std::find(hidden_.begin(), hidden_.end(), 1) != hidden_.end();
@@ -135,7 +138,7 @@ void VideoLayer::hide(const uint8_t *tiles)
 void VideoLayer::occluded(const Coverage &cov, const Shown &s)
 {
     shown_drawn_ = g_ && s.drawn;
-    if (!shown_drawn_ || cov.empty() || s.turned || no_hide_) {
+    if (!shown_drawn_ || cov.empty() || s.turned || no_hide_ || p_.always_packed) {
         hiding_ = false;
         return;
     }
@@ -288,8 +291,9 @@ void VideoLayer::detach(bool drop)
     if (drop)
         drop_objects();
     /* A frame the packed quad showed never reached the atlas: the next scene
-     * starts from it. */
-    if (blocks_shown_)
+     * starts from it. With always_packed shown_ is what the packed quad
+     * shows, taken as the atlas's would be (attach, to_source). */
+    if (blocks_shown_ && !p_.always_packed)
         front_pending_ = true;
     g_ = nullptr;
     hiding_ = shown_drawn_ = forced_write_ = false;
@@ -364,7 +368,7 @@ Stage VideoLayer::stage(int64_t now_ms)
      * atlas when no newer frame needed it for kRefineMs. */
     const int64_t settle_ms = planner_.settle_due_ms();
     const bool settle = !front_pending_ && settle_ms >= 0 && now_ms >= settle_ms;
-    const bool refine = blocks_shown_ && !front_pending_ && now_ms >= refine_due_ms_;
+    const bool refine = !p_.always_packed && blocks_shown_ && !front_pending_ && now_ms >= refine_due_ms_;
     /* Held tiles no longer hidden go now, whatever the frame clock. */
     const bool uncover = uncovering();
     if (!(front_pending_ || settle || refine || uncover) || (!clock_.due(now_ms) && !parked_ && !uncover))
@@ -387,10 +391,128 @@ Stage VideoLayer::stage(int64_t now_ms)
             return Stage::Idle;
         }
         hiding_ = false;
-        if (p_.pan_blocks && !first_)
+        if (p_.pan_blocks && !first_ && !p_.always_packed)
             return stage_blocks(now_ms, front_pending_);
     }
     return stage_exact(now_ms, front_pending_);
+}
+
+/* always_packed: the blocks of the picture the plan's atlas rects touch (one
+ * block more on every side, which their colours reach) that pack otherwise
+ * from front_ than from shown_, packed into the packed buffer in place, in
+ * as few rects as their rows give and at most kPackedRects; fill: every
+ * block. They are packed from shown_ with the rects copied in (whole: from
+ * front_), so the packed buffer stays shown_'s packing. The bytes written;
+ * *written false on a refusal. */
+size_t VideoLayer::write_packed(const std::vector<PixelRect> &rects, bool whole, bool fill, bool *written)
+{
+    const uint32_t bw = p_.w / 4, bh = p_.h / 4, cw = p_.w / 2;
+    block_mask_.assign((size_t)bw * bh, fill ? 1 : 0);
+    auto mark = [&](uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {   /* a picture rect */
+        const uint32_t bx0 = x0 / 4 ? x0 / 4 - 1 : 0, by0 = y0 / 4 ? y0 / 4 - 1 : 0;
+        const uint32_t bx1 = std::min(bw, (x1 + 3) / 4 + 1), by1 = std::min(bh, (y1 + 3) / 4 + 1);
+        for (uint32_t by = by0; by < by1; by++)
+            for (uint32_t bx = bx0; bx < bx1; bx++) {
+                uint8_t &m = block_mask_[(size_t)by * bw + bx];
+                m = m || crk::block_differs(front_.data(), shown_.data(), p_.w, p_.h, bx, by);
+            }
+    };
+    for (const PixelRect &r : rects) {
+        if (fill)
+            break;
+        if (r.y < p_.h)
+            mark(r.x, r.y, r.x + r.w, std::min(r.y + r.h, p_.h));
+        if (r.y + r.h > p_.h) {   /* chroma rows, U then V side by side: 2 pixels a sample */
+            const uint32_t y0 = 2 * (std::max(r.y, p_.h) - p_.h), y1 = 2 * (r.y + r.h - p_.h);
+            if (r.x < cw)
+                mark(2 * r.x, y0, 2 * std::min(r.x + r.w, cw), y1);
+            if (r.x + r.w > cw)
+                mark(2 * (std::max(r.x, cw) - cw), y0, 2 * (r.x + r.w - cw), y1);
+        }
+    }
+    if (!whole)
+        crk::copy_rects(shown_.data(), front_.data(), p_.w, 1, rects);
+    const uint8_t *src = whole ? front_.data() : shown_.data();
+    /* Each row's runs of marked blocks, a run under one of the same columns
+     * in the row above extending its rect; past kPackedRects every cell of
+     * 2, then 4, 8 ... blocks a side with a mark is marked whole. */
+    std::vector<PixelRect> out;
+    std::vector<size_t> open, next;
+    for (uint32_t s = 2;; s *= 2) {
+        out.clear();
+        open.clear();
+        for (uint32_t by = 0; by < bh; by++) {
+            next.clear();
+            for (uint32_t bx = 0; bx < bw;) {
+                if (!block_mask_[(size_t)by * bw + bx]) {
+                    bx++;
+                    continue;
+                }
+                const uint32_t x0 = bx;
+                while (bx < bw && block_mask_[(size_t)by * bw + bx])
+                    bx++;
+                size_t i = 0;
+                while (i < open.size() && !(out[open[i]].x == x0 && out[open[i]].w == bx - x0))
+                    i++;
+                if (i < open.size()) {
+                    out[open[i]].h++;
+                    next.push_back(open[i]);
+                } else {
+                    out.push_back(PixelRect{x0, by, bx - x0, 1});
+                    next.push_back(out.size() - 1);
+                }
+            }
+            open.swap(next);
+        }
+        if (out.size() <= kPackedRects)
+            break;
+        for (uint32_t cy = 0; cy < bh; cy += s)
+            for (uint32_t cx = 0; cx < bw; cx += s) {
+                const uint32_t x1 = std::min(bw, cx + s), y1 = std::min(bh, cy + s);
+                bool any = false;
+                for (uint32_t by = cy; by < y1 && !any; by++) {
+                    const uint8_t *row = block_mask_.data() + (size_t)by * bw;
+                    any = std::find(row + cx, row + x1, 1) != row + x1;
+                }
+                for (uint32_t by = cy; by < y1 && any; by++)
+                    std::fill(block_mask_.data() + (size_t)by * bw + cx, block_mask_.data() + (size_t)by * bw + x1, 1);
+            }
+    }
+    /* Into packed_: all of it on the packing threads, else each row's
+     * marked blocks from the first to the last, its rows converted once. */
+    if (out.size() == 1 && out[0].w == bw && out[0].h == bh) {
+        crk::pack_blocks(src, p_.w, p_.h, packed_.data(), kPackThreads);
+    } else {
+        for (uint32_t by = 0; by < bh; by++) {
+            const uint8_t *row = block_mask_.data() + (size_t)by * bw;
+            uint32_t x0 = 0, x1 = bw;
+            while (x0 < bw && !row[x0])
+                x0++;
+            while (x1 > x0 && !row[x1 - 1])
+                x1--;
+            if (x0 < x1)
+                crk::pack_block_rect(src, p_.w, p_.h, x0, by, x1, by + 1, packed_.data() + ((size_t)by * bw + x0) * 8);
+        }
+    }
+    size_t bytes = 0;
+    *written = true;
+    for (const PixelRect &b : out) {
+        const size_t n = (size_t)b.w * b.h * 8;
+        const uint8_t *px = packed_.data() + (size_t)b.y * bw * 8;   /* whole rows: in place */
+        if (b.w < bw) {
+            block_scratch_.resize(n);
+            for (uint32_t y = 0; y < b.h; y++)
+                std::memcpy(block_scratch_.data() + (size_t)y * b.w * 8,
+                            packed_.data() + ((size_t)(b.y + y) * bw + b.x) * 8, (size_t)b.w * 8);
+            px = block_scratch_.data();
+        }
+        if (!g_->write(block_buf_[block_bank_], 2 * b.x, b.y, 2 * b.w, b.h, px)) {
+            *written = false;
+            return bytes;
+        }
+        bytes += n;
+    }
+    return bytes;
 }
 
 /* The plan's rectangles go into the one buffer in place; the compositor's
@@ -403,20 +525,23 @@ Stage VideoLayer::stage(int64_t now_ms)
 Stage VideoLayer::stage_exact(int64_t now_ms, bool fresh)
 {
     /* A repeat of the picture last staged: its plan would find what that
-     * picture's found, nothing to write, unless tiles are due to settle. */
+     * picture's found, nothing to write, unless tiles are due to settle.
+     * transient: pan_blocks' packed quad shows (with always_packed the
+     * packed quad is the only one, written as the atlas would be). */
+    const bool transient = blocks_shown_ && !p_.always_packed;
     const int64_t settle_ms = planner_.settle_due_ms();
     const bool uncover = uncovering();
     if (fresh && repeated_ && !uncover &&
-        (blocks_shown_ || (opaque_ && !buffer_stale_ && (settle_ms < 0 || now_ms < settle_ms)))) {
+        (transient || (opaque_ && !buffer_stale_ && (settle_ms < 0 || now_ms < settle_ms)))) {
         repeated_ = false;
-        ((blocks_shown_ ? motion_.quiet() : planner_.quiet()) ? quiet_ : same_)++;
-        if (!blocks_shown_)
+        ((transient ? motion_.quiet() : planner_.quiet()) ? quiet_ : same_)++;
+        if (!transient)
             shown_ms_ = front_ms_;
         front_pending_ = false;
         return Stage::Idle;
     }
     repeated_ = false;
-    if (blocks_shown_ && fresh) {
+    if (transient && fresh) {
         const UploadPlan m = motion_.plan(block_src_.data(), front_.data(), now_ms);
         if (m.rects.empty()) {
             (m.quiet_tiles ? quiet_ : same_)++;
@@ -424,7 +549,7 @@ Stage VideoLayer::stage_exact(int64_t now_ms, bool fresh)
             return Stage::Idle;
         }
     }
-    const bool refine = blocks_shown_;
+    const bool refine = transient;
     const uint8_t *hidden = hiding_ ? hidden_.data() : nullptr;
     if (hidden)
         held_plan_.assign(planner_.tiles(), 0);
@@ -444,7 +569,8 @@ Stage VideoLayer::stage_exact(int64_t now_ms, bool fresh)
      * scene) left unlike shown_. */
     const bool whole = p.whole || buffer_stale_;
     const size_t raw = whole ? front_.size() : p.bytes;
-    if (fresh && !first_ && p_.pan_blocks && raw > packed_.size() && pacer_.allowance() < (int64_t)raw) {
+    if (fresh && !first_ && p_.pan_blocks && !p_.always_packed && raw > packed_.size() &&
+        pacer_.allowance() < (int64_t)raw) {
         planner_.reset();   /* the atlas is not written: no tile of it is left quiet */
         /* Nor are the held ones written: they stay held, with the hidden
          * tiles this plan found changed. */
@@ -465,10 +591,16 @@ Stage VideoLayer::stage_exact(int64_t now_ms, bool fresh)
     staged_.raw = raw;
     staged_.rects = whole ? all : p.rects;
     bool written = true;
-    staged_.accepted = crk::write_rects(
-        front_.data(), p_.w, 1, staged_.rects, &rect_scratch_,
-        [this](const uint8_t *px, const PixelRect &r) { return g_->write(atlas_buf_, r.x, r.y, r.w, r.h, px); },
-        &written);
+    if (p_.always_packed) {
+        /* the blocks that changed, the buffer whole when stale */
+        staged_.packed = true;
+        staged_.raw = staged_.accepted = write_packed(staged_.rects, whole, buffer_stale_, &written);
+    } else {
+        staged_.accepted = crk::write_rects(
+            front_.data(), p_.w, 1, staged_.rects, &rect_scratch_,
+            [this](const uint8_t *px, const PixelRect &r) { return g_->write(atlas_buf_, r.x, r.y, r.w, r.h, px); },
+            &written);
+    }
     if (!written) {
         refused_++;
         return Stage::Failed;
@@ -484,7 +616,7 @@ Stage VideoLayer::stage_exact(int64_t now_ms, bool fresh)
         set_opacity();
     }
     parked_ = false;
-    show_blocks(refine ? false : blocks_shown_);
+    show_blocks(p_.always_packed || (refine ? false : blocks_shown_));
     return Stage::Wrote;
 }
 
@@ -591,16 +723,19 @@ void VideoLayer::committed(bool ok, int64_t now_ms)
         shown_.swap(front_);
         front_stale_ = true;
         planner_.reset();
-        whole_writes_++;
-    } else {
+    } else if (!s.packed) {   /* a packed write copied its rects into shown_ (write_packed) */
         crk::copy_rects(shown_.data(), front_.data(), p_.w, 1, s.rects);
-        partial_writes_++;
     }
     if (s.refine) {
         refine_due_ms_ = -1;
         refines_++;
     }
-    rects_ += s.rects.size();
+    if (s.packed) {   /* always_packed: shown_ is what the packed buffer holds */
+        packed_writes_++;
+    } else {
+        (s.whole ? whole_writes_ : partial_writes_)++;
+        rects_ += s.rects.size();
+    }
     shown_ms_ = front_ms_;
     front_pending_ = false;
 }

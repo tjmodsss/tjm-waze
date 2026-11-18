@@ -232,6 +232,7 @@ void VideoProducer::picture_paced()
     std::lock_guard<std::mutex> lock(decode_mutex_);
     if (!paced_ || pace_.late_in_ms(cld::now_ms()) > 0)
         return;
+    pass_part();
     paced_ = false;
     bool given = false;
     if (pictures_.load()) {
@@ -358,6 +359,7 @@ bool VideoProducer::start_decoder(std::string *err)
 void VideoProducer::decode(const uint8_t *data, size_t len, bool end_of_au)
 {
     std::string derr;
+    pass_part();
     catching_up_ = packet_ && packet_->later_frame;
     bool picture = !catching_up_ && pictures_.load();
     if (picture && resumed_.load()) {
@@ -403,8 +405,32 @@ void VideoProducer::on_decoded(const VideoFrame &f)
     on_frame(f, false);
 }
 
+void VideoProducer::pass_part()
+{
+    if (!part_due_.exchange(false))
+        return;
+    OutputPart p;
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        p = part_wanted_;
+    }
+    decoder_.set_part(p);
+}
+
+void VideoProducer::set_part(const OutputPart &p)
+{
+    if (p == part_asked_)
+        return;
+    part_asked_ = p;
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    part_wanted_ = p;
+    part_due_ = true;
+}
+
 void VideoProducer::on_frame(const VideoFrame &f, bool late)
 {
+    /* a part (hosted_vpp_scale) is the frame's picture as much as the whole */
+    const bool sized = f.part.set() || (f.w == cfg_.tex_width && f.h == cfg_.tex_height);
     if (!f.atlas && !f.same) {
         std::lock_guard<std::mutex> lock(frame_mutex_);
         timing_.frame(f.held);
@@ -413,15 +439,23 @@ void VideoProducer::on_frame(const VideoFrame &f, bool late)
             log_info("%s", line.c_str());
         if (catching_up_)
             backlog_.skipped();
-        if (f.w == cfg_.tex_width && f.h == cfg_.tex_height)
+        if (sized)
             last_frame_ms_ = now_us() / 1000;
         decoded_total_++;
         return;
     }
+    ChangeSampler *change = &change_;
+    if (f.part.set()) {
+        if (!part_change_ || part_change_w_ != f.w || part_change_h_ != f.h) {
+            part_change_.reset(new ChangeSampler(f.w, f.h));
+            part_change_w_ = f.w;
+            part_change_h_ = f.h;
+        }
+        change = part_change_.get();
+    }
     /* the atlas starts with the luma plane; the same picture again has not
      * changed and is as blank as it was */
-    const bool sized = f.w == cfg_.tex_width && f.h == cfg_.tex_height;
-    const bool sampled = sized && f.atlas && change_.changed(f.atlas->data());
+    const bool sampled = sized && f.atlas && change->changed(f.atlas->data());
     const bool changed = sized && f.atlas && (resumed_.exchange(false) || sampled);
     std::lock_guard<std::mutex> lock(frame_mutex_);
     if (!late) {   /* a late picture's frame was counted when it was decoded */
@@ -432,8 +466,8 @@ void VideoProducer::on_frame(const VideoFrame &f, bool late)
     }
     if (sized) {
         const int64_t now = now_us() / 1000;
-        freeze_.frame(now, changed, change_.blank());
-        tally_.frame(now, changed, change_.blank());
+        freeze_.frame(now, changed, change->blank());
+        tally_.frame(now, changed, change->blank());
         if (!late)
             last_frame_ms_ = now;
     }
@@ -448,6 +482,7 @@ void VideoProducer::on_frame(const VideoFrame &f, bool late)
         back_.swap(*f.atlas);
         back_w_ = f.w;
         back_h_ = f.h;
+        back_part_ = f.part;
         back_dirty_ = true;
         repeat_ = false;
     } else {
@@ -457,14 +492,16 @@ void VideoProducer::on_frame(const VideoFrame &f, bool late)
     back_id_ = late ? decoded_total_.load() : decoded_total_.fetch_add(1) + 1;
 }
 
-bool VideoProducer::take(std::vector<uint8_t> *frame, uint64_t *id, bool *same)
+bool VideoProducer::take(std::vector<uint8_t> *frame, uint64_t *id, bool *same, OutputPart *part)
 {
     std::lock_guard<std::mutex> lock(frame_mutex_);
     *same = !back_dirty_;
-    if (back_dirty_ && back_w_ == cfg_.tex_width && back_h_ == cfg_.tex_height)
+    if (back_dirty_ && (back_part_.set() || (back_w_ == cfg_.tex_width && back_h_ == cfg_.tex_height)))
         frame->swap(back_);
     else if (!repeat_)
         return false;
+    if (part)
+        *part = back_part_;
     *id = back_id_;
     back_dirty_ = repeat_ = false;
     char drain[8];

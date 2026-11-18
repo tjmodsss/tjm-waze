@@ -116,7 +116,7 @@ void Client::disconnect(int64_t now_ms)
         keep_last(f.first, &f.second.px);
     for (auto &kv : layers_)
         kv.second.sent = false;
-    repeats_ = false;
+    repeats_ = always_packed_ = false;
     cur_.clear();
     cur_px_.clear();
     cur_off_ = 0;
@@ -189,6 +189,7 @@ void Client::read_events()
             backend = j["backend"];
             targets = j["targets"];
             repeats_ = j["repeat"] == "1";
+            always_packed_ = j["always_packed"] == "1";
             ready_ = true;
             backoff_ = 0;
             if (on_ready)
@@ -412,6 +413,8 @@ std::string Client::layer_json(uint32_t ref, const Layer &l) const
         kv.push_back({"settle_ms", num(l.vo.settle_ms)});
         kv.push_back({"pan_blocks", flag(l.vo.pan_blocks)});
         kv.push_back({"stall_ms", num(l.vo.stall_ms)});
+        if (l.vo.always_packed)   /* only when set: a layer without it is written exact */
+            kv.push_back({"always_packed", "1"});
     } else if (l.kind == "image") {
         kv.push_back({"iw", num(l.io.w)});
         kv.push_back({"ih", num(l.io.h)});

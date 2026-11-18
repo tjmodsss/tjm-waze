@@ -92,7 +92,15 @@
  * that yields is released, not kept; a hold whose slot the lock left alone
  * is released as the map goes; a lock over 3 min, the heartbeat
  * replies stopping, nothing wanting it or the display service going
- * release it; a kept scene id is never taken by another target. */
+ * release it; a kept scene id is never taken by another target. Stalled
+ * fetches, subscriptions not observable: a fetch accepted and never
+ * completed is taken down at 5 s, its scene republished from the second in
+ * a row (a no answer after one counting, no answers alone not), the framework reconnected once at the third and again at the
+ * sixth, two targets stalling together reconnecting once; the count starts
+ * over after a fetch completes, a showing, or while not wanted. The boot
+ * hold: nothing asked for before the stock HMI's content is mapped (our own
+ * scene ids not counting) or 10 s; at once when it is, at 1 s when the
+ * first table has it, and no hold without a slot table. */
 #include <cstdio>
 #include <map>
 #include <sstream>
@@ -167,6 +175,17 @@ struct FakePort : Port {
         calls.push_back("take over " + t.name + " " + b);
     }
     void refresh_slots() override { calls.push_back("slots?"); }
+    /* By target name: the display accepted its fetch and never completed
+     * it (Port::fetch_accepted). */
+    std::map<std::string, bool> fetching;
+    bool fetch_accepted(const TargetSpec &t) const override
+    {
+        auto f = fetching.find(t.name);
+        return f != fetching.end() && f->second;
+    }
+    /* The boot hold applies (Port::slot_table). */
+    bool table = false;
+    bool slot_table() const override { return table; }
 };
 
 struct FakeScenes : Scenes {
@@ -3768,6 +3787,205 @@ static void keep_guide()
        has(joined(), "release guide") && !s.m.kept(GuideRig::kGuide));
 }
 
+/* Runs until target i is asked for again, at most max_ms. */
+static void until_acquiring(Rig &r, int i, int64_t max_ms = 60000)
+{
+    for (int64_t t = 0; t < max_ms && r.state(i) != TargetState::Acquiring; t += 10)
+        r.run(10);
+}
+
+/* Every fetch accepted and never completed, subscriptions not observable:
+ * the 2nd stall in a row republishes the scene, every 3rd reconnects. */
+static void stalled_fetches()
+{
+    Rig r;
+    int stuck = 0;
+    r.m.on_renderer_stuck = [&stuck](int64_t) { stuck++; };
+    r.port.fetching["map"] = true;
+    r.m.want(0, true, true);
+    r.m.tick(r.now);
+    ok("stall: published and requested", calls_are("publish map; request map"));
+    logged();
+    r.run(4990);
+    ok("stall: nothing before 5 s", calls_are("") && r.state(0) == TargetState::Acquiring);
+    r.run(10);
+    std::string l = logged();
+    ok("1st stall: taken down at 5 s, its scene kept, the ladder's 2 s, no reconnect",
+       calls_are("release map") && r.m.published(0) && r.state(0) == TargetState::Waiting &&
+           r.m.status(0).retry_ms == r.now + 2000 && stuck == 0 &&
+           has(l, "INCIDENT target map stalled: fetch accepted but never completed in 5000 ms, 1 in a row; its scene "
+                  "kept; asking again on the ladder"));
+    until_acquiring(r, 0);
+    ok("asked again with its warm scene", calls_are("request map"));
+    r.run(5000);
+    l = logged();
+    ok("2nd stall in a row: its scene republished, no reconnect",
+       calls_are("release map; unpublish map") && !r.m.published(0) && stuck == 0 &&
+           has(l, "INCIDENT target map stalled: fetch accepted but never completed in 5000 ms, 2 in a row; "
+                  "republishing its scene"));
+    until_acquiring(r, 0);
+    ok("the next request publishes it fresh", calls_are("publish map; request map"));
+    r.run(5000);
+    l = logged();
+    ok("3rd stall in a row: republished, exactly one reconnect",
+       calls_are("release map; unpublish map") && stuck == 1 &&
+           has(l, "INCIDENT target map reconnecting the RAMSES framework: 3 stalled fetches in a row"));
+    for (int n = 4; n <= 5; n++) {
+        until_acquiring(r, 0);
+        r.run(5000);
+    }
+    ok("4th and 5th: no reconnect", stuck == 1);
+    until_acquiring(r, 0);
+    r.run(5000);
+    ok("6th, over 60 s after the reconnect: the next one", stuck == 2);
+
+    /* A showing starts the count over. */
+    r.port.fetching["map"] = false;
+    until_acquiring(r, 0);
+    r.m.on_shown(kMapScene, r.now);
+    r.m.on_lost(kMapScene, "fetch removed", r.now);
+    r.port.fetching["map"] = true;
+    joined();
+    until_acquiring(r, 0);
+    r.run(5000);
+    l = logged();
+    ok("after a showing: 1 in a row again, its scene kept",
+       calls_are("request map; release map") && r.m.published(0) && stuck == 2 && has(l, "1 in a row; its scene kept"));
+
+    Rig f;
+    f.port.fetching["map"] = true;
+    f.m.want(0, true, true);
+    f.m.tick(f.now);
+    f.run(5000);
+    until_acquiring(f, 0);
+    f.run(5000);
+    until_acquiring(f, 0);
+    joined();
+    f.m.on_fetched(kMapScene, f.now);   /* fetch status 2; the map then unanswered */
+    f.port.fetching["map"] = false;
+    f.run(5000);
+    ok("fetched, then no answer: not a stall, nothing republished", calls_are("release map") && f.m.published(0));
+    f.port.fetching["map"] = true;
+    until_acquiring(f, 0);
+    logged();
+    f.run(5000);
+    ok("a fetch completed starts the count over: 1 in a row",
+       calls_are("request map; release map") && has(logged(), "1 in a row; its scene kept"));
+
+    Rig n;   /* the display answering nothing after a stall: still counted */
+    n.port.fetching["map"] = true;
+    n.m.want(0, true, true);
+    n.m.tick(n.now);
+    n.run(5000);
+    n.port.fetching["map"] = false;
+    until_acquiring(n, 0);
+    joined();
+    logged();
+    n.run(5000);
+    ok("no answer after a stall: 2 in a row, republished",
+       calls_are("release map; unpublish map") &&
+           has(logged(), "INCIDENT target map stalled: no answer after a fetch accepted and never completed in 5000 "
+                         "ms, 2 in a row; republishing its scene"));
+
+    n.port.up = false;   /* the display service gone and back: the count starts over */
+    n.m.on_availability(false, n.now);
+    n.port.up = true;
+    n.m.on_availability(true, n.now);
+    n.port.fetching["map"] = true;
+    until_acquiring(n, 0);
+    logged();
+    n.run(5000);
+    ok("the display service back: 1 in a row", has(logged(), "1 in a row; its scene kept"));
+
+    Rig p;   /* no answers alone are no stall */
+    p.m.want(0, true, true);
+    p.m.tick(p.now);
+    p.run(5000);
+    until_acquiring(p, 0);
+    p.run(5000);
+    ok("no answer twice, no fetch accepted: nothing republished", p.m.published(0) &&
+                                                                     !has(logged(), "stalled"));
+
+    Rig w;
+    w.port.fetching["map"] = true;
+    w.m.want(0, true, true);
+    w.m.tick(w.now);
+    w.run(5000);
+    until_acquiring(w, 0);
+    w.run(5000);
+    w.m.want(0, false, false);
+    w.run(100);
+    w.m.want(0, true, true);
+    until_acquiring(w, 0);
+    logged();
+    w.run(5000);
+    ok("not wanted for a while starts the count over: 1 in a row", has(logged(), "1 in a row"));
+
+    /* Two targets stalling together: one reconnect, the second refused. */
+    Rig b;
+    stuck = 0;
+    b.m.on_renderer_stuck = [&stuck](int64_t) { stuck++; };
+    b.port.fetching["map"] = b.port.fetching["panel"] = true;
+    b.m.want(0, true, true);
+    b.m.want(1, true, false);
+    b.m.tick(b.now);
+    logged();
+    for (int n = 0; n < SlotManager::kReconnectAfter; n++) {
+        until_acquiring(b, 0);
+        ok("two targets: requested together", b.state(1) == TargetState::Acquiring);
+        b.run(5000);
+    }
+    ok("two targets stalling three times together: one reconnect",
+       stuck == 1 && has(logged(), "target panel: 3 stalled fetches in a row; the RAMSES framework "
+                                   "was reconnected 0 s ago: not again before 60 s"));
+    calls.clear();
+}
+
+/* The first request after the display service comes up waits for the stock
+ * HMI's content in the slot table, 10 s at most; at once when it is there. */
+static void boot_hold()
+{
+    Rig r;
+    r.port.table = true;
+    r.m.on_availability(true, r.now);
+    r.m.want(0, true, true);
+    r.run(5000);
+    r.slot(0x101, 2, kMapScene);   /* our own scene id, left from before a restart: not the HMI's */
+    r.run(4990);
+    std::string c = joined();
+    ok("boot hold: nothing asked for in 10 s without the stock HMI's content, the table polled",
+       requested_none(c) && has(c, "slots?"));
+    r.run(10);
+    ok("boot hold: asked for at 10 s", calls_are("publish map; request map"));
+
+    Rig s;
+    s.port.table = true;
+    s.m.on_availability(true, s.now);
+    s.m.want(0, true, true);
+    s.run(3000);
+    ok("boot hold: nothing at 3 s", requested_none(joined()));
+    s.slot(0x101, 2, kStockMap);
+    s.m.tick(s.now);
+    ok("boot hold: the stock HMI's content mapped: asked for at once", calls_are("publish map; request map"));
+
+    Rig q;   /* cluster-render restarted while the car runs */
+    q.port.table = true;
+    const int64_t up = q.now;
+    q.m.on_availability(true, q.now);
+    q.rows(0x101, 2, {{kStockMap, 1}});
+    q.m.want(0, true, true);
+    q.run(990);
+    ok("restart: the first table has the HMI's content: nothing before the settle time", requested_none(joined()));
+    q.run(10);
+    ok("restart: asked for at 1 s, as with no hold", calls_are("publish map; request map") && q.now - up == 1000);
+
+    Rig e;   /* a port with no slot table (iDrive 8): no hold */
+    e.m.on_availability(true, e.now);
+    e.m.want(0, true, true);
+    e.run(1000);
+    ok("no slot table: asked for at 1 s", calls_are("publish map; request map"));
+}
+
 int main()
 {
     incident_lines();
@@ -3834,6 +4052,8 @@ int main()
     keep_flapping();
     keep_panel_and_hud();
     keep_guide();
+    stalled_fetches();
+    boot_hold();
     {
         /* The HUD's media pop-up (0x322): the HUD map gives way while it shows */
         TargetSpec hud2;

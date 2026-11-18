@@ -78,6 +78,8 @@ struct Picture {
     int content = -1;
     bool same = false;
     int64_t at = 0;
+    size_t bytes = 0;        /* its atlas's */
+    woc::OutputPart part;    /* the part of the frame it is */
 };
 
 static Picture next_picture(VideoProducer &p, int timeout_ms)
@@ -89,9 +91,10 @@ static Picture next_picture(VideoProducer &p, int timeout_ms)
         struct pollfd pfd = {p.ready_fd(), POLLIN, 0};
         poll(&pfd, 1, (int)(end - now));
         uint64_t id = 0;
-        if (p.take(&frame, &id, &r.same)) {
+        if (p.take(&frame, &id, &r.same, &r.part)) {
             r.got = true;
             r.at = now_ms();
+            r.bytes = frame.size();
             r.content = r.same || frame.empty() ? -1 : frame[0];
             return r;
         }
@@ -253,9 +256,38 @@ static void off()
     ok("off: none counted for picture_fps", p.take_paced() == 0);
 }
 
+/* hosted_vpp_scale: without set_part every frame whole; with it, from the
+ * next frame, the part at its size, said so by take(), keeping the stream
+ * live; unset, whole again. */
+static void parts()
+{
+    VideoConfig c = config(0);
+    c.udp_port = free_udp_port();
+    VideoProducer p(c);
+    Rtp rtp(c.udp_port);
+    rtp.send("1088x480", true, 30);
+    const Picture whole = next_picture(p, 2000);
+    ok("parts: none asked for, the whole frame", whole.got && !whole.part.set() && whole.bytes == 1088 * 720 &&
+                                                     whole.content == 30);
+    const woc::OutputPart want{24, 0, 1040, 480, 936, 432};
+    p.set_part(want);
+    const int64_t sent = now_ms();
+    rtp.send(nullptr, false, 31);
+    const Picture part = next_picture(p, 2000);
+    ok("parts: the next frame the part, at its size", part.got && part.part == want && part.bytes == 936 * 648 &&
+                                                          part.content == 31);
+    ok("parts: its frames keep the stream live", p.last_frame_ms() >= sent);
+    p.set_part(woc::OutputPart());
+    rtp.send(nullptr, false, 32);
+    const Picture again = next_picture(p, 2000);
+    ok("parts: unset, the whole frame again", again.got && !again.part.set() && again.bytes == 1088 * 720 &&
+                                                  again.content == 32);
+}
+
 int main()
 {
     off();
+    parts();
     over_udp();
     over_fifo();
     return failures ? 1 : 0;

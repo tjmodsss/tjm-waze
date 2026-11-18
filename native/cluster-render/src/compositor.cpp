@@ -1992,6 +1992,7 @@ Compositor::VideoPlan Compositor::compose_plan(int ti, const std::vector<VideoSp
     vp.dirty_settle_ms = 0;
     vp.fps = 0;
     vp.pan_blocks = true;
+    vp.always_packed = true;   /* only if every video it draws is */
     vp.stall_ms = 0;
     bool unclocked = false;
     for (const VideoSpec *s : group) {
@@ -2012,11 +2013,13 @@ Compositor::VideoPlan Compositor::compose_plan(int ti, const std::vector<VideoSp
         unclocked = unclocked || s->vp.fps == 0;
         vp.fps = std::max(vp.fps, s->vp.fps);
         vp.pan_blocks = vp.pan_blocks && s->vp.pan_blocks;
+        vp.always_packed = vp.always_packed && s->vp.always_packed;
         vp.stall_ms = std::max(vp.stall_ms, s->vp.stall_ms);
         pl.composited.push_back(s->id);
     }
     if (unclocked)
         vp.fps = 0;
+    vp.always_packed = vp.always_packed && vp.pan_blocks;   /* as the composite takes it */
     if (with && with->w && with->h) {
         x0 = std::min<int64_t>(x0, with->x);
         y0 = std::min<int64_t>(y0, with->y);
@@ -2253,7 +2256,7 @@ bool Compositor::keep_composite(int ti, VideoPlan *pl)
     const VideoParams &cv = c->video();
     const bool settings = cv.fps == pl->vp.fps && cv.dirty_threshold == pl->vp.dirty_threshold &&
                           cv.dirty_settle_ms == pl->vp.dirty_settle_ms && cv.pan_blocks == pl->vp.pan_blocks &&
-                          cv.stall_ms == pl->vp.stall_ms;
+                          cv.always_packed == pl->vp.always_packed && cv.stall_ms == pl->vp.stall_ms;
     if (settings && c->x() == pl->x && c->y() == pl->y && c->clip() == pl->clip && cv.w == pl->vp.w &&
         cv.h == pl->vp.h) {
         t.smaller_since_ms = -1;

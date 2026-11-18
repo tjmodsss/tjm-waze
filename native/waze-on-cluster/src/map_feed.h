@@ -48,7 +48,15 @@
  * only. Hidden by the host, there is no layer at all and nothing goes to the
  * renderer; the newest picture is held, and goes first when shown again.
  * The host ending, or the renderer going away, puts the layer back on the
- * feed's own target. */
+ * feed's own target.
+ *
+ * With hosted_vpp_scale (FeedConfig::vpp_scale), the part and its size go
+ * to the decoder instead (part()), whose VPP makes them on the GPU: such a
+ * frame goes as it is (offer_part), after any the worker has, and one of a
+ * part the layer no longer shows (the host moved or went) is dropped. Only
+ * a whole frame (before VPP has the part, or when it cannot make it) goes
+ * through the worker. A layer made for another part, or for none, starts
+ * from the next frame, not a part of the old one. */
 #ifndef WOC_MAP_FEED_H
 #define WOC_MAP_FEED_H
 
@@ -94,6 +102,15 @@ struct FeedConfig {
     bool hud_round_corners = true;
     /* the HUD map's dark background made black (see-through on a HUD) */
     bool hud_black_background = true;
+    /* hosted_vpp_scale: hosted, the host's part is made by the decoder's VPP
+     * (MapFeed::part) rather than scaled by the worker */
+    bool vpp_scale = false;
+    /* always_packed: every update of the layer as packed 4x4 blocks, the
+     * changed ones only (cluster-render's always_packed), where the
+     * renderer's hello (each connection's) takes it and the frame's width
+     * and height are multiples of 4; else as pan_blocks decides, with one
+     * log line */
+    bool always_packed = false;
 };
 
 /* The status the app shows (its render socket's "status" event), with
@@ -185,6 +202,13 @@ public:
     /* The newest decoded frame, whose picture is the last one offered
      * again. */
     void repeat(uint64_t id, int64_t now_ms);
+    /* hosted_vpp_scale: the part of the decoded frame the layer shows, at
+     * the size it is sent at, for the decoder to make; unset unless hosted,
+     * shown and vpp_scale. */
+    const OutputPart &part() const { return part_; }
+    /* The newest decoded frame as that part (part's size), taken as offer()
+     * takes it; dropped unless it is part(). */
+    void offer_part(std::vector<uint8_t> *atlas, uint64_t id, const OutputPart &part, int64_t now_ms);
     /* The newest decoded frame, held for the layer to take when it can
      * (swapped, as offer does): a feed made after it starts from it. */
     void hold(std::vector<uint8_t> *atlas, uint64_t id);
@@ -274,6 +298,11 @@ private:
     bool scaling_ = false;
     std::vector<uint8_t> scaled_;
     int64_t next_send_ms_ = 0;
+    OutputPart part_;
+    /* Set: the newest picture is a VPP-made frame of this part, held_ while
+     * held_new_ (else the layer's last), never a whole picture. */
+    OutputPart held_part_;
+    const char *unpacked_why_ = nullptr;   /* why always_packed did not apply, as last logged */
 };
 
 }  // namespace woc

@@ -12,7 +12,13 @@
  * - fast motion whose exact write the byte budget cannot cover at once goes
  *   as 4x4 colour blocks into one of two persistent RGBA8 buffers drawn by a
  *   second quad (block_pack.h), and the exact atlas comes back with the next
- *   update the budget covers, or kRefineMs after the last packed one;
+ *   update the budget covers, or kRefineMs after the last packed one; with
+ *   always_packed the atlas is never written or shown: each update is
+ *   planned as an exact one would be (the noise filter, settle time and
+ *   tiles), and only the 4x4 blocks in its tiles that pack otherwise than
+ *   what the packed buffer holds are packed and written, in place in one
+ *   buffer (the whole buffer for a scene's first write, or after a failed
+ *   one), so a still map writes nothing;
  * - updates go on the frame clock's grid (frame_clock.h) and within the
  *   service's one byte budget (upload_pacer.h), shared by every layer;
  * - only the newest frame waits: a frame not yet written is replaced by each
@@ -65,6 +71,9 @@ struct VideoParams {
     uint32_t fps = 30;               /* updates a second at most; 0: no clock */
     bool pan_blocks = true;          /* packed fast motion; needs h a multiple of 4 */
     int stall_ms = 6000;             /* no frame for this long: not ready */
+    /* Every write packed, the first and a still picture's too, never the
+     * exact atlas; needs pan_blocks (without, off). */
+    bool always_packed = false;
 };
 
 class VideoLayer : public Layer {
@@ -74,6 +83,9 @@ public:
      * caller's and two more; MGU has four cores). */
     static const int64_t kRefineMs = 250;
     static const unsigned kPackThreads = 3;
+    /* always_packed: rects a write at most, fewer than an exact write can
+     * take (1088x480: 204 tiles, up to 152 before it goes whole). */
+    static const size_t kPackedRects = 64;
 
     VideoLayer(uint32_t id, int target, uint64_t seq, crk::UploadPacer &pacer, int atlas_effect, int block_effect,
                const VideoParams &p, int64_t now_ms);
@@ -195,6 +207,7 @@ private:
     struct Staged {
         Kind kind = Kind::None;
         bool fresh = false, whole = false, refine = false, was_shown = false, was_parked = false;
+        bool packed = false;   /* an exact plan written as packed blocks (always_packed) */
         int next_bank = 0;
         size_t raw = 0, accepted = 0;
         int64_t offered_ms = 0;   /* when its frame was offered */
@@ -203,6 +216,7 @@ private:
 
     Stage stage_exact(int64_t now_ms, bool fresh);
     Stage stage_blocks(int64_t now_ms, bool fresh);
+    size_t write_packed(const std::vector<crk::PixelRect> &rects, bool whole, bool fill, bool *written);
     void show_blocks(bool on);
     void drop_objects();
     /* Whether a held tile no longer hidden differs from the newest frame past
@@ -234,6 +248,7 @@ private:
      * scene's first write is still to go. source_: drawn by the composite. */
     bool buffer_stale_ = false, parked_ = false, first_ = false, source_ = false;
     std::vector<uint8_t> block_src_, packed_;
+    std::vector<uint8_t> block_mask_, block_scratch_;   /* always_packed's blocks to write, packed */
     /* hidden_: the tiles hidden this tick (hiding_: any is). held_: tiles a
      * plan left unwritten under cover that differ from the frame past the
      * threshold (held_n_ of them); held_plan_ the last plan's. */

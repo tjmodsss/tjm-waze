@@ -83,7 +83,23 @@
  * crop, the restart when a picture's rect after the crop differs from the
  * one VPP was set up for, and DecodeHeader reading a later SPS while the
  * decoder runs (Intel's reference allows it at any time). Nor is GPU copy:
- * the CM runtime starting on the unit, its copy's result and cost. */
+ * the CM runtime starting on the unit, its copy's result and cost.
+ *
+ * A part (set_part, hosted_vpp_scale; nothing of it runs without): VPP makes
+ * only that part of the output, at its size, so the CPU neither scales it
+ * nor copies and packs the rest. Asked for at any time, it is taken at the
+ * next picture: VPP reset (MFXVideoVPP_Reset) to the part's rect of its
+ * input and the part's size, the sequence's decode untouched, and each
+ * picture's input rect set to the part's, after waiting for its decode (as
+ * src_crop's are). A new sequence sets VPP up for the whole output as
+ * always, then resets it for the part. A part VPP cannot make (an odd edge,
+ * outside the output, larger than its rect, more than kMaxPartScale times
+ * smaller, a reset or a VPP run with it failing) is logged once and not
+ * asked of VPP again until the next sequence: its pictures come whole, VPP
+ * set up for the whole output again (a reset, else closed and set up
+ * again). Unset, VPP is reset for the whole output.
+ * UNVERIFIED (CAR-ONLY): the unit's VPP resetting to a smaller output with
+ * opaque input, taking each picture's input rect, its picture and cost. */
 #ifndef WOC_DECODER_MSDK_H
 #define WOC_DECODER_MSDK_H
 
@@ -95,6 +111,7 @@
 #include <vector>
 
 #include "frame_clock.h"
+#include "map_rect.h"
 #include "source_crop.h"
 
 namespace woc {
@@ -115,6 +132,9 @@ struct VideoFrame {
      * output this one: 0 when each comes out as it is decoded; -1 unknown
      * (MSDK did not carry the frame's number to it). */
     int32_t held;
+    /* The part of the output it is (Decoder::set_part), w x h its size;
+     * unset: the whole output. */
+    OutputPart part;
 };
 
 class Decoder {
@@ -123,6 +143,9 @@ public:
     /* An SPS NAL unit from its header byte, without a start code. */
     using SpsSink = std::function<void(const uint8_t *nal, size_t len)>;
     static const int kFailLimit = 30;
+    /* A part's rect of VPP's input (part_rect, after src_crop) at most this
+     * many times its size in each direction. */
+    static const uint32_t kMaxPartScale = 8;
 
     Decoder();
     ~Decoder();
@@ -154,6 +177,11 @@ public:
     /* The next picture comes with its atlas even when it is the last one
      * again. */
     void forget_last();
+
+    /* From the next picture on, only part p of the output, at its size
+     * (unset: the whole output); kept across init(). The header's "A
+     * part". */
+    void set_part(const OutputPart &p);
 
     /* Gives the newest frame that came out, when it came out without a
      * picture (feed's picture false), its picture now, through cb as feed()
@@ -192,6 +220,7 @@ private:
     struct State;
     std::unique_ptr<State> s_;
     SpsSink sps_sink_;
+    OutputPart part_;
 };
 
 }  // namespace woc

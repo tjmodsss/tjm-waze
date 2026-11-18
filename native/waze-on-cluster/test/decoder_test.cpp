@@ -33,11 +33,13 @@
 
 #include "decoder_msdk.h"
 #include "fake_msdk.h"
+#include "log.h"
 
 using fake_msdk::access_unit;
 using fake_msdk::calls;
 using fake_msdk::count;
 using woc::Decoder;
+using woc::OutputPart;
 using woc::SourceCrop;
 using woc::VideoFrame;
 
@@ -70,6 +72,15 @@ static void fault(const char *call, int status, int after = 0, int times = 0)
     fake_msdk::gpu_fault.times = times;
 }
 
+/* How many entries of calls start with p. */
+static int count_prefix(const std::string &p)
+{
+    int n = 0;
+    for (const std::string &c : calls)
+        n += c.compare(0, p.size(), p) == 0;
+    return n;
+}
+
 static void expect(bool ok, const char *what)
 {
     if (!ok) {
@@ -92,6 +103,8 @@ struct Run {
     std::vector<uint8_t> pictures;   /* the atlases' first bytes */
     bool whole = true;               /* every atlas one level throughout */
     std::vector<int> held;           /* each frame's VideoFrame::held */
+    uint32_t ow = 1088, oh = 480;    /* the size every frame comes at */
+    OutputPart part;                 /* and the part it is (set_part) */
 
     explicit Run(const char *crop, unsigned level_bits = 0, bool gpu_copy = false)
     {
@@ -105,12 +118,13 @@ struct Run {
     Decoder::FrameSink sink()
     {
         return [this](const VideoFrame &f) {
-            expect(f.w == 1088 && f.h == 480, "every frame of the output size");
+            expect(f.w == ow && f.h == oh && f.part == part, "every frame of the output size, the part it is");
             expect(!(f.same && f.atlas), "the same picture has no atlas");
             held.push_back(f.held);
             frames.push_back(f.atlas ? (*f.atlas)[0] : f.same ? 0 : -1);
             if (!f.atlas)
                 return;
+            expect(f.atlas->size() == (size_t)f.w * (f.h + f.h / 2), "the atlas of the frame's size");
             pictures.push_back((*f.atlas)[0]);
             for (uint8_t b : *f.atlas)
                 whole = whole && b == (*f.atlas)[0];
@@ -413,7 +427,151 @@ int main()
         r.sequence(kCarPlay, 3, 95);
         expect(count("decode-sync") == 0, "no crop: no wait for the decode task");
         expect(count("header 1280x720") == 1 && count("header 1088x480") == 0, "no crop: no header read while running");
+        expect(count_prefix("vpp-reset") == 0, "no part (hosted_vpp_scale off): VPP never reset");
     }
+    const OutputPart host{24, 0, 1040, 480, 936, 432};   /* a host's 1040x480 of the map, shown at 936x432 */
+    {
+        /* A part asked for before the stream: VPP set up whole for the
+         * sequence, then reset for the part; each picture waited for and
+         * given the part's rect, out at the part's size. Unset at a
+         * picture: VPP reset whole, no wait. Another mid-sequence: at the
+         * next picture, the first never the same as one before; a late
+         * picture as any other. */
+        Run r("");
+        r.dec.set_part(host);
+        r.part = host;
+        r.ow = 936;
+        r.oh = 432;
+        r.sequence(kCarPlay, 3, 1);
+        expect(count("vpp-init 0,0,1088,480") == 1 && count("vpp-reset 24,0,1040,480 936x432") == 1,
+               "part: VPP set up whole for the sequence, then reset for the part");
+        expect(count("vpp 24,0,1040,480") == 3 && count("decode-sync") == 3, "part: each picture waited for, in its rect");
+        expect(r.pictures == std::vector<uint8_t>({1, 2, 3}) && r.whole, "part: every picture");
+        r.dec.set_part(OutputPart());
+        r.part = OutputPart();
+        r.ow = 1088;
+        r.oh = 480;
+        r.feed(nullptr, false, 3);
+        expect(count("vpp-reset 0,0,1088,480 1088x480") == 1 && count("vpp 0,0,1088,480") == 1 && count("decode-sync") == 3,
+               "part unset: VPP reset whole, the picture whole without the wait");
+        expect(r.frames.back() == 3, "part unset: the first picture packed, not the same as the part's");
+        const OutputPart q{100, 40, 600, 400, 300, 200};
+        r.dec.set_part(q);
+        r.part = q;
+        r.ow = 300;
+        r.oh = 200;
+        r.feed(nullptr, false, 5);
+        r.feed(nullptr, false, 5);
+        expect(count("vpp-reset 100,40,600,400 300x200") == 1 && count("vpp 100,40,600,400") == 2,
+               "a part mid-sequence: from the next picture");
+        expect(r.frames.size() == 6 && r.frames[4] == 5 && r.frames[5] == 0, "a part's pictures compared as any");
+        r.feed(nullptr, false, 6, false);
+        expect(r.late() && r.pictures.back() == 6 && count("vpp 100,40,600,400") == 3, "a part's late picture");
+    }
+    {
+        /* With src_crop: the part of the crop of each picture. 24..1064 of
+         * 1088 is 28.2..1251.8 of 1280: 28..1252, all of its 564 rows. */
+        Run r(kAndroidAutoCrop);
+        r.dec.set_part(host);
+        r.part = host;
+        r.ow = 936;
+        r.oh = 432;
+        r.sequence(kAndroidAuto, 2, 10);
+        expect(count("vpp-init 0,0,1280,564") == 1 && count("vpp-reset 28,0,1224,564 936x432") == 1,
+               "part with src_crop: VPP set up for the crop, then reset for its part");
+        expect(count("vpp 28,0,1224,564") == 2 && r.pictures == std::vector<uint8_t>({10, 11}),
+               "part with src_crop: each picture in the part's rect of its crop");
+    }
+    {
+        /* A part VPP's reset refuses: logged, VPP reset whole, the pictures
+         * whole, not asked again in the sequence; asked again in the next
+         * (a larger stream). */
+        Run r("");
+        fake_msdk::reset_status = -15;
+        fake_msdk::reset_faults = 1;
+        r.dec.set_part(host);
+        r.sequence(kCarPlay, 3, 1);
+        expect(count("vpp-reset 24,0,1040,480 936x432") == 1 && count("vpp-reset 0,0,1088,480 1088x480") == 1,
+               "reset refused: asked once in the sequence, VPP reset whole");
+        expect(count("vpp 0,0,1088,480") == 3 && r.pictures == std::vector<uint8_t>({1, 2, 3}),
+               "reset refused: every picture whole");
+        r.part = host;
+        r.ow = 936;
+        r.oh = 432;
+        r.sequence(kAndroidAuto, 1, 4);
+        expect(count("vpp-reset 28,0,1224,720 936x432") == 1 && r.pictures.back() == 4,
+               "reset refused: asked again in the next sequence");
+    }
+    {
+        /* The whole output's reset failing too: VPP closed and set up again. */
+        Run r("");
+        fake_msdk::reset_status = -15;
+        fake_msdk::reset_faults = 2;
+        r.dec.set_part(host);
+        r.sequence(kCarPlay, 2, 1);
+        expect(count("vpp-init 0,0,1088,480") == 2 && r.pictures == std::vector<uint8_t>({1, 2}),
+               "both resets refused: VPP set up again whole, every picture whole");
+    }
+    {
+        /* A part VPP is not used for (more than 8 times smaller): no reset,
+         * every picture whole. */
+        Run r("");
+        r.dec.set_part(OutputPart{0, 0, 1088, 480, 128, 32});
+        r.sequence(kCarPlay, 2, 1);
+        expect(count_prefix("vpp-reset") == 0 && count("vpp 0,0,1088,480") == 2, "a part too small: whole pictures");
+    }
+    {
+        /* With src_crop the limit is VPP's: 1088x480 of the output at 136x60
+         * is 8 times, but VPP would scale 1280x564 of its input, 9.4 times:
+         * refused, every picture whole (the CPU scales it). */
+        Run r(kAndroidAutoCrop);
+        r.dec.set_part(OutputPart{0, 0, 1088, 480, 136, 60});
+        r.sequence(kAndroidAuto, 2, 1);
+        expect(count_prefix("vpp-reset") == 0 && count("vpp 0,0,1280,564") == 2,
+               "a part 8 times smaller in the output, more in src_crop's input: whole pictures");
+    }
+    isolated("VPP not set up again after a failed whole set-up", [&host] {
+        /* A part made, then unset: the whole output's reset refused and its
+         * set-up after closing VPP failing too: one error, the pictures
+         * whole, not tried again at each picture of the sequence. */
+        fault("VPP_Init", -3, 1);
+        Run r("", 0, true);
+        r.dec.set_part(host);
+        r.part = host;
+        r.ow = 936;
+        r.oh = 432;
+        r.feed(kCarPlay, true, 1);
+        fake_msdk::reset_status = -15;
+        fake_msdk::reset_faults = 100;
+        r.dec.set_part(OutputPart());
+        r.part = OutputPart();
+        r.ow = 1088;
+        r.oh = 480;
+        const int errors = cld::log_errors;
+        for (uint8_t c = 2; c <= 4; c++)
+            r.feed(nullptr, false, c);
+        expect(cld::log_errors - errors == 1 && count("vpp-reset 0,0,1088,480 1088x480") == 1 &&
+                   count_prefix("vpp-init") == 2 && r.pictures == std::vector<uint8_t>({1, 2, 3, 4}),
+               "the whole output's set-up failing: one error, not one a picture");
+    });
+    isolated("a VPP run failing with a part", [&host] {
+        fault("VPP_Run", -17, 1, 1);
+        Run r("", 0, true);
+        r.dec.set_part(host);
+        r.part = host;
+        r.ow = 936;
+        r.oh = 432;
+        r.feed(kCarPlay, true, 1);
+        r.part = OutputPart();
+        r.ow = 1088;
+        r.oh = 480;
+        r.feed(nullptr, false, 2);
+        r.feed(nullptr, false, 3);
+        expect(r.pictures == std::vector<uint8_t>({1, 3}), "a VPP run failing with a part: that picture lost, then whole");
+        expect(count("vpp-reset 0,0,1088,480 1088x480") == 1 && count("vpp-reset 24,0,1040,480 936x432") == 1,
+               "a VPP run failing with a part: VPP reset whole, the part not asked again");
+        expect(count("vpp-out shifted") == 0, "a VPP run failing with a part: GPU copy kept");
+    });
     if (failures) {
         fprintf(stderr, "decoder_test: %d failures\n", failures);
         return 1;

@@ -209,8 +209,38 @@ static void bench()
     }
 }
 
+/* pack_block_rect: a rect of blocks, as pack_blocks gives them; block_differs:
+ * a block whose own luma or reached chroma changed, not its untouched
+ * neighbours. */
+static void test_rect_and_differs()
+{
+    const std::vector<uint8_t> a = busy_frame();
+    std::vector<uint8_t> whole(block_bytes(W, H));
+    pack_blocks(a.data(), W, H, whole.data(), 1);
+    const uint32_t bx0 = 13, by0 = 7, bx1 = 61, by1 = 40, bw = W / 4;
+    std::vector<uint8_t> part((size_t)(bx1 - bx0) * (by1 - by0) * 8);
+    pack_block_rect(a.data(), W, H, bx0, by0, bx1, by1, part.data());
+    bool same = true;
+    for (uint32_t by = by0; by < by1; by++)
+        same = same && std::equal(part.begin() + (size_t)(by - by0) * (bx1 - bx0) * 8,
+                                  part.begin() + (size_t)(by - by0 + 1) * (bx1 - bx0) * 8,
+                                  whole.begin() + ((size_t)by * bw + bx0) * 8);
+    ok("pack_block_rect packs a rect of blocks as pack_blocks does", same);
+    std::vector<uint8_t> b = a;
+    b[(size_t)41 * W + 101] ^= 1;   /* a luma pixel of block (25, 10) */
+    ok("block_differs: the block of a changed luma pixel, not its neighbour",
+       block_differs(a.data(), b.data(), W, H, 25, 10) && !block_differs(a.data(), b.data(), W, H, 26, 10) &&
+           !block_differs(a.data(), b.data(), W, H, 25, 11));
+    b = a;
+    b[(size_t)(H + 21) * W + 50] ^= 1;   /* U at column 50, row 21: pixels around 100,42 */
+    ok("block_differs: a changed chroma sample's blocks and the one to its left it reaches",
+       block_differs(a.data(), b.data(), W, H, 25, 10) && block_differs(a.data(), b.data(), W, H, 24, 10) &&
+           !block_differs(a.data(), b.data(), W, H, 26, 10) && !block_differs(a.data(), b.data(), W, H, 25, 12));
+}
+
 int main()
 {
+    test_rect_and_differs();
     test_rgb_matches_atlas_shader();
     test_simd_equals_scalar();
     test_layout();

@@ -41,6 +41,7 @@
 #include "control.h"
 #include "guide_setting.h"
 #include "head_unit.h"
+#include "local_conf.h"
 #include "log.h"
 #include "block_pack.h"
 #include "map_feed.h"
@@ -72,6 +73,9 @@ const char *const kIgnoredKeys[] = {"tex_format",         "upload",          "di
                                     "max_frame_textures", "resource_linger_ms", "resource_fetch_log",
                                     "texture_replay",     "texture_replay_frames", "mutable_r8",
                                     "upload_kb_per_s",    "upload_burst_ms"};
+
+/* What load_local_conf left out, logged once the log file is open. */
+std::vector<std::string> g_local_conf_warnings;
 
 volatile sig_atomic_t g_stop;
 void on_signal(int) { g_stop = 1; }
@@ -194,7 +198,10 @@ int serve(Config cfg)
 {
     if (cfg.has("log_file"))
         log_to_file(cfg.str("log_file"), log_file_cap(cfg.num("log_file_kb")), "waze-on-cluster", WOC_VERSION);
+    for (const std::string &w : g_local_conf_warnings)
+        log_warn("%s", w.c_str());
     load_map_state(&cfg, cfg.str("map_state_file"));
+    load_features(&cfg, cfg.str("features_file"));
     VideoConfig vc;
     vc.fifo_path = cfg.str("fifo_path");
     vc.carplay_group = cfg.str("carplay_group");
@@ -225,7 +232,8 @@ int serve(Config cfg)
         {"hud_keep_shown", 0, 1},
         {"freeze_ms", 0, 600000},   {"freeze_min_fps", 1, 60},       {"alt_screen_port", 0, 65535},
         {"idle_ms", 1000, 600000},  {"blank_ms", 1000, 600000},
-        {"alt_screen_uid", 0, 4294967294L}, {"gpu_copy", 0, 1}};
+        {"alt_screen_uid", 0, 4294967294L}, {"gpu_copy", 0, 1},   {"hosted_vpp_scale", 0, 1},
+        {"always_packed", 0, 1}};
     for (const Range &r : ranges)
         if (cfg.num(r.key) < r.lo || cfg.num(r.key) > r.hi) {
             log_error("%s must be from %ld to %ld", r.key, r.lo, r.hi);
@@ -269,6 +277,12 @@ int serve(Config cfg)
     fc.scale_down = cfg.num("hud_scale_down") != 0;
     fc.hud_round_corners = cfg.num("hud_round_corners") != 0;
     fc.hud_black_background = cfg.num("hud_black_background") != 0;
+    fc.vpp_scale = cfg.num("hosted_vpp_scale") == 1;
+    if (fc.vpp_scale)
+        log_info("hosted_vpp_scale: a host's part of the map is cropped and scaled by VPP, on the GPU");
+    fc.always_packed = cfg.num("always_packed") == 1;
+    if (fc.always_packed)
+        log_info("always_packed: every update of the cluster map as packed 4x4 blocks");
     fc.scaled_level_bits = vc.tex_level_bits;
     fc.video.w = vc.tex_width;
     fc.video.h = vc.tex_height;
@@ -335,9 +349,12 @@ int serve(Config cfg)
         const int64_t now = now_ms();
         uint64_t id = 0;
         bool same = false;
-        if (producer.take(&frame, &id, &same)) {
+        OutputPart part;
+        if (producer.take(&frame, &id, &same, &part)) {
             if (same)
                 feed.repeat(id, now);
+            else if (part.set())
+                feed.offer_part(&frame, id, part, now);
             else
                 feed.offer(&frame, id, now);
         }
@@ -354,6 +371,8 @@ int serve(Config cfg)
         producer.set_pictures(feed.wants_frames());
         feed.set_stream(live, producer.frozen(now), producer.picture(now));
         feed.poll(now);
+        if (fc.vpp_scale)
+            producer.set_part(feed.part());
         producer.retry_sources(now);
         const FeedStatus fs = feed.status(producer.decode_status(), producer.stream_reason());
         const std::string status = status_line(fs);
@@ -442,12 +461,6 @@ int run(const Config &cfg, const char *target)
     return 0;
 }
 
-bool load_local(Config *cfg, std::string *err)
-{
-    std::string path = cfg->str("local_conf");
-    return path.empty() || access(path.c_str(), F_OK) != 0 || cfg->load(path, err);
-}
-
 void usage()
 {
     std::fprintf(stderr,
@@ -529,10 +542,13 @@ void define_keys(Config *cfg)
     cfg->define("pan_blocks", "1");
     cfg->define("tex_level_bits", "2");
     cfg->define("gpu_copy", "1");
+    cfg->define("hosted_vpp_scale", "0");
+    cfg->define("always_packed", "0");
     cfg->define("target", "map");
     cfg->define("hide_bmw_guidance", "1");
     cfg->define("state_file", "/var/opt/waze-on-cluster/state/waze-on-cluster.state.conf");
     cfg->define("map_state_file", "/var/opt/waze-on-cluster/map.state.conf");
+    cfg->define("features_file", "/var/opt/waze-on-cluster/features.conf");
     cfg->define("cluster", "1");
     cfg->define("hud", "0");
     cfg->define("hud_fps", "10");
@@ -560,7 +576,8 @@ int main(int argc, char **argv)
     for (; i < argc && argv[i][0] == '-'; i++) {
         bool has_arg = i + 1 < argc;
         if (!std::strcmp(argv[i], "-c") && has_arg) {
-            if (!cfg.load(argv[++i], &err) || !load_local(&cfg, &err)) { std::fprintf(stderr, "waze-on-cluster: %s\n", err.c_str()); return 2; }
+            if (!cfg.load(argv[++i], &err)) { std::fprintf(stderr, "waze-on-cluster: %s\n", err.c_str()); return 2; }
+            load_local_conf(&cfg, cfg.str("local_conf"), &g_local_conf_warnings);
         } else if (!std::strcmp(argv[i], "-s") && has_arg) {
             if (!cfg.set_pair(argv[++i], &err)) { std::fprintf(stderr, "waze-on-cluster: %s\n", err.c_str()); return 2; }
         } else {
@@ -576,6 +593,8 @@ int main(int argc, char **argv)
         const std::string why = head_unit_refused();
         return why.empty() ? serve(cfg) : serve_refused(cfg, why);
     }
+    for (const std::string &w : g_local_conf_warnings)
+        std::fprintf(stderr, "waze-on-cluster: %s\n", w.c_str());
     if (i + 2 == argc && !std::strcmp(argv[i], "run"))
         return run(cfg, argv[i + 1]);
     if (i + 2 == argc && !std::strcmp(argv[i], "bench-pack"))

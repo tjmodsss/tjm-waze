@@ -242,13 +242,20 @@ var LOCAL_CONF = process.env.WOC_LOCAL_CONF || '/var/opt/waze-on-cluster/waze-on
  * start with any of MAP_KEYS in. */
 var MAP_STATE = path.join(STATE_DIR, 'map.state.conf');
 var MAP_KEYS = ['cluster', 'hud', 'hud_width_pct', 'hud_offset_x', 'hud_offset_y', 'hud_keep_shown'];
+/* The opt-in settings: the render reads this file (its features_file) over
+ * its configuration. Not in LOCAL_CONF, which every release up to 0.10.7
+ * refuses to start with any of FEATURE_KEYS in; no release before this one
+ * reads FEATURES. */
+var FEATURES = path.join(STATE_DIR, 'features.conf');
+var FEATURE_KEYS = ['hosted_vpp_scale', 'always_packed'];
 
-/* A key = value file's settings; none when it cannot be read. */
+/* A key = value file's settings (a key += value line's value as the key's);
+ * none when it cannot be read. */
 function readConf(file) {
     var conf = {};
     try {
         fs.readFileSync(file, 'utf8').split('\n').forEach(function (l) {
-            var m = /^\s*(\w+)\s*=\s*(.*?)\s*$/.exec(l);
+            var m = /^\s*(\w+)\s*\+?\s*=\s*(.*?)\s*$/.exec(l);
             if (m) conf[m[1]] = m[2];
         });
     } catch (e) {}
@@ -256,12 +263,13 @@ function readConf(file) {
 }
 
 /* Rewrites a key = value file: each key of set replaced or added, each key
- * of drop removed, the other lines kept as they are. Atomic (saveFile). */
+ * of drop removed (its key += value lines too), the other lines kept as they
+ * are. Atomic (saveFile). */
 function rewriteConf(file, set, drop) {
     var lines = [];
     try { lines = fs.readFileSync(file, 'utf8').split('\n'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     var keys = Object.keys(set).concat(drop);
-    lines = lines.filter(function (l) { return !keys.some(function (k) { return new RegExp('^\\s*' + k + '\\s*=').test(l); }); });
+    lines = lines.filter(function (l) { return !keys.some(function (k) { return new RegExp('^\\s*' + k + '\\s*\\+?\\s*=').test(l); }); });
     while (lines.length && lines[lines.length - 1] === '') lines.pop();
     Object.keys(set).forEach(function (k) { lines.push(k + ' = ' + set[k]); });
     saveFile(file, lines.length ? lines.join('\n') + '\n' : '');
@@ -292,6 +300,30 @@ function moveMapSettings() {
             return k + (k in move ? ' ' + move[k] : ' dropped');
         }).join(', '));
     } catch (e) { log('moving the map settings out of ' + LOCAL_CONF + ' failed: ' + e.message); }
+}
+
+/* Moves any of FEATURE_KEYS found in LOCAL_CONF into FEATURES, a valid
+ * value already there kept and one other than 0 or 1 dropped. LOCAL_CONF is
+ * rewritten first, its other lines kept: cut short between the two writes,
+ * the setting is lost but LOCAL_CONF is one every release starts with.
+ * True when LOCAL_CONF holds none of FEATURE_KEYS. */
+function moveFeatures() {
+    var local = readConf(LOCAL_CONF), feat = readConf(FEATURES), move = {};
+    var found = FEATURE_KEYS.filter(function (k) { return k in local; });
+    if (!found.length) return true;
+    function value(v) { return v.replace(/\s*#.*$/, ''); }
+    found.forEach(function (k) {
+        var v = value(local[k]);
+        if (!(k in feat && /^[01]$/.test(value(feat[k]))) && /^[01]$/.test(v)) move[k] = v;
+    });
+    try {
+        rewriteConf(LOCAL_CONF, {}, FEATURE_KEYS);
+        if (Object.keys(move).length) rewriteConf(FEATURES, move, []);
+        log('opt-in settings moved from ' + LOCAL_CONF + ' to ' + FEATURES + ': ' + found.map(function (k) {
+            return k + (k in move ? ' ' + move[k] : ' dropped');
+        }).join(', '));
+    } catch (e) { log('moving the opt-in settings out of ' + LOCAL_CONF + ' failed: ' + e.message); }
+    return !FEATURE_KEYS.some(function (k) { return k in readConf(LOCAL_CONF); });
 }
 
 /* A HUD offset: a whole number in -800..800. */
@@ -2087,6 +2119,15 @@ function oneShot(which) {
             process.exit(code);
         });
     }
+    /* A version this one gives way to refuses to start with an opt-in key in
+     * LOCAL_CONF: while one stays there the removal or the change is
+     * refused, nothing else done. */
+    if (!moveFeatures() && which === 'deactivate') {
+        result.status = 'the opt-in settings could not be moved out of ' + LOCAL_CONF + '; nothing changed';
+        log(which + ': ' + result.status);
+        process.stdout.write(JSON.stringify(result) + '\n');
+        process.exit(1);
+    }
     if (which === 'deactivate') markBy = 'removal';
     else moveMapSettings();
     highfInstall = which === 'activate' && headUnit.variant() === 'HIGHF';
@@ -2142,6 +2183,7 @@ function listenLogs() {
 function main() {
     var dir = path.dirname(SOCK);
     ensureDir(dir);
+    moveFeatures();
     moveMapSettings();
     loadProfiles();
     try { if (fs.lstatSync(SOCK)) fs.unlinkSync(SOCK); } catch (e) {}

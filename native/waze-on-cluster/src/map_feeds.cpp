@@ -42,6 +42,8 @@ void MapFeeds::follow()
         /* the HUD's frames go exact, into debt, and wait while the HUD's
          * share is in debt: no packing on the renderer's thread for the HUD */
         fc.video.pan_blocks = false;
+        fc.vpp_scale = false;   /* the HUD scales whole frames */
+        fc.always_packed = false;   /* and goes exact (cluster map only) */
         hud_.reset(new MapFeed(fc));
         hud_->set_stream(live_, frozen_, picture_);
         hud_->changed(id_);
@@ -175,6 +177,13 @@ void MapFeeds::offer(std::vector<uint8_t> *atlas, uint64_t id, int64_t now_ms)
     if (hud_)
         hud_->changed(id);
     feed_hud(now_ms);
+}
+
+void MapFeeds::offer_part(std::vector<uint8_t> *atlas, uint64_t id, const OutputPart &part, int64_t now_ms)
+{
+    id_ = id;
+    if (cluster_)
+        cluster_->offer_part(atlas, id, part, now_ms);
 }
 
 void MapFeeds::repeat(uint64_t id, int64_t now_ms)

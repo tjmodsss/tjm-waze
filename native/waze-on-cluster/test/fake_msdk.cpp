@@ -19,6 +19,7 @@ int delay = 0;
 uint8_t swallow = 0;
 bool timestamps = true;
 int refs = 0;
+int reset_status = 0, reset_faults = 0;
 
 namespace {
 
@@ -256,6 +257,16 @@ mfxStatus MFXVideoVPP_Init(mfxSession, mfxVideoParam *par)
 }
 
 mfxStatus MFXVideoVPP_Close(mfxSession) { return MFX_ERR_NONE; }
+
+mfxStatus MFXVideoVPP_Reset(mfxSession, mfxVideoParam *par)
+{
+    calls.push_back("vpp-reset " + rect(par->vpp.In) + " " + size(par->vpp.Out.CropW, par->vpp.Out.CropH));
+    if (reset_faults > 0) {
+        reset_faults--;
+        return (mfxStatus)reset_status;
+    }
+    return MFX_ERR_NONE;
+}
 
 mfxStatus MFXVideoVPP_RunFrameVPPAsync(mfxSession, mfxFrameSurface1 *in, mfxFrameSurface1 *out, mfxExtVppAuxData *,
                                        mfxSyncPoint *sync)

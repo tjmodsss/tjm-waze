@@ -61,10 +61,21 @@
  * - hosted by another app's scene (hosting): the map in its scene at the
  *   host's rect with the host's part of the picture, its own slot released;
  *   hidden by the host, no layer and nothing sent; shown again; the host
- *   gone, back on its own target. */
+ *   gone, back on its own target; no part asked of the decoder (by default);
+ * - hosted with hosted_vpp_scale (vpp_hosting): the host's part asked of the
+ *   decoder at the size it is shown at, a whole frame meanwhile scaled by
+ *   the worker, a VPP-made one sent as it is, one of another part dropped,
+ *   the host's move asking for its new part, the host gone, none;
+ * - always_packed (always_packed_map): 0, the layer without always_packed and a still
+ *   map exact; 1, every update packed, a still map's too, never exact; with
+ *   hosted_vpp_scale the VPP-made part packed; a host's part not a multiple
+ *   of 4 high as with 0, shown; cluster-render upgraded or downgraded under
+ *   the feed, the layer made again for it (renderer_changed). */
 #include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -76,6 +87,9 @@
 
 /* cluster-render's service and fakes, from its tree (-I$(CR)) */
 #include "src/service.h"
+#include "src/video_layer.h"
+#include "block_pack.h"
+#include "cluster_render/protocol.h"
 #include "test/fake_graph.h"
 #include "test/fake_port.h"
 #include "../src/map_feed.h"
@@ -116,6 +130,8 @@ struct Rig {
     /* frames the same as the last offered go as repeats, as the producer
      * hands them over */
     bool repeats = false;
+    /* set: the frames are this part, made by VPP (hosted_vpp_scale) */
+    OutputPart part;
     std::vector<uint8_t> offered;
     int64_t last_frame_ms = -1;
     FreezeWatch watch{FreezeConfig()};
@@ -173,7 +189,10 @@ struct Rig {
                     feed->repeat((uint64_t)now, now);
                 } else {
                     spare.assign(frame->begin(), frame->end());
-                    feed->offer(&spare, (uint64_t)now, now);
+                    if (part.set())
+                        feed->offer_part(&spare, (uint64_t)now, part, now);
+                    else
+                        feed->offer(&spare, (uint64_t)now, now);
                     offered = *frame;
                 }
                 if (watched) {
@@ -508,6 +527,8 @@ static void hosting()
        r.st().state == "showing" && r.st().target == "panel" && r.st().hosted && r.drawing("panel", crop_of(f, 264, 40, 560, 400), &with) &&
            with && r.gpu.graph("panel")->over_file && r.svc->compositor().layers().size() == 1 &&
            r.svc->slots().status(map_i).state == crs::TargetState::Idle);
+    ok("hosted, hosted_vpp_scale off (the default): no part asked of the decoder, the part scaled by the worker",
+       !r.feed->part().set() && r.feed->scaled_frames() > 0);
 
     h.shown = false;
     design.host(sc, h);
@@ -555,11 +576,400 @@ static void hosting()
     (void)removed;
 }
 
+/* hosted_vpp_scale on (FeedConfig::vpp_scale): hosted, the feed asks the
+ * decoder for the host's part at the size it is shown at; whole frames that
+ * come meanwhile go through the worker, a frame of the part goes as it is,
+ * one of another part is dropped; the host's move asks for its new part, and
+ * the host gone, for none, the whole frame on the map's own target. */
+static void vpp_hosting()
+{
+    char tmpl[] = "/tmp/woc-vpp-hosting-XXXXXX";
+    const std::string root = mkdtemp(tmpl) ? tmpl : "/nonexistent";
+    const std::string file = root + "/design.scene";
+    std::ofstream(file) << "scene 0x010004f8\nnode plate -\npass main\n";
+    chmod(file.c_str(), 0644);
+    const std::vector<uint8_t> f = atlas(5), f2 = atlas(6), f3 = atlas(7);
+    Rig r;
+    r.sc.targets[1].scene_files = true;
+    r.sc.scene_files.root = root;
+    r.sc.scene_files.owner = getuid();
+    r.start();
+    FeedConfig fc;
+    fc.socket = r.path;
+    fc.video.level_bits = 0;
+    fc.vpp_scale = true;
+    r.feed.reset(new MapFeed(fc));
+    r.feed->set_stream(true, false, Picture::Shown);
+    r.pump(2000, &f);
+    ok("vpp: on its own target, no part asked for", r.st().target == "map" && !r.feed->part().set());
+
+    cr::Client design("design", r.path);
+    r.other = &design;
+    cr::SceneOptions so;
+    so.target = "panel";
+    so.file = file;
+    so.sha256 = {crs::sha256_file(file)};
+    so.layers = true;
+    const uint32_t sc = design.scene(so);
+    r.pump(500, &f);
+    cr::Host h;
+    h.target = "map";
+    h.x = 700; h.y = 160; h.w = 560; h.h = 400;
+    h.src_x = 264; h.src_y = 40; h.src_w = 560; h.src_h = 400;
+    design.host(sc, h);
+    r.pump(2500, &f);
+    bool with = false;
+    const OutputPart want{264, 40, 560, 400, 560, 400};
+    ok("vpp: hosted, the host's part asked for at the size it is shown at", r.st().hosted && r.feed->part() == want);
+    ok("vpp: a whole frame meanwhile scaled by the worker",
+       r.drawing("panel", crop_of(f, 264, 40, 560, 400), &with) && with && r.feed->scaled_frames() > 0);
+
+    const std::vector<uint8_t> p2 = crop_of(f2, 264, 40, 560, 400), p3 = crop_of(f3, 264, 40, 560, 400);
+    r.part = want;
+    r.pump(200, &p2);
+    /* a whole frame the worker still had, done and taken (its own thread) */
+    for (int i = 0; i < 2000 && r.feed->wake_in_ms(r.now) == MapFeed::kScaleWaitMs; i++) {
+        usleep(1000);
+        r.pump(5);
+    }
+    const uint64_t scaled = r.feed->scaled_frames();
+    r.pump(1300, &p2);
+    ok("vpp: a frame of the part sent as it is, not through the worker",
+       r.st().state == "showing" && r.drawing("panel", p2, &with) && with && r.feed->scaled_frames() == scaled);
+    OutputPart other = want;
+    other.x = 200;
+    r.part = other;
+    r.pump(1000, &p3);
+    ok("vpp: a frame of another part dropped", r.drawing("panel", p2, &with) && with);
+
+    h.src_x = 200;
+    design.host(sc, h);
+    r.pump(500);
+    ok("vpp: the host moved, its new part asked for", r.feed->part() == other);
+    r.pump(1000, &p3);
+    ok("vpp: the new part's frames shown", r.drawing("panel", p3, &with) && with && r.feed->scaled_frames() == scaled);
+
+    design.drop(sc);
+    r.part = OutputPart();
+    r.pump(2000, &f2);
+    ok("vpp: the host gone, no part asked for, the whole frame on the map's own target",
+       !r.feed->part().set() && r.st().target == "map" && !r.st().hosted && r.drawing("map", f2, &with) && with);
+    r.other = nullptr;
+    const int removed = std::system(("rm -rf " + root).c_str());
+    (void)removed;
+}
+
+/* Whether the target's scene shows f (a w x h atlas) packed, and in *exact
+ * whether it shows an exact atlas. */
+static bool shows_packed(Rig &r, const char *target, const std::vector<uint8_t> &f, uint32_t w, uint32_t h, bool *exact)
+{
+    crs::FakeGraph *g = r.gpu.graph(target);
+    *exact = false;
+    if (!g || g->drawn().empty())
+        return false;
+    std::vector<uint8_t> want(crk::block_bytes(w, h));
+    crk::pack_blocks(f.data(), w, h, want.data(), 1);
+    bool with = false;
+    for (const auto &q : g->shown.quads) {
+        auto t = q.second.textures.find("u_image");
+        if (!q.second.visible || t == q.second.textures.end())
+            continue;
+        auto b = g->shown.buffers.find(t->second);
+        if (b == g->shown.buffers.end())
+            continue;
+        if (b->second.f == crs::TexFormat::R8)
+            *exact = true;
+        else if (b->second.px == want)
+            with = true;
+    }
+    return with;
+}
+
+/* The map layer's video settings as the renderer took them; null: none. */
+static const crs::VideoParams *map_video(Rig &r)
+{
+    const crs::Layer *l = r.map_layer();
+    return l && std::string(l->kind()) == "video" ? &static_cast<const crs::VideoLayer *>(l)->video() : nullptr;
+}
+
+/* always_packed: 0 (the default), the layer without always_packed, a still map
+ * exact; 1, every update packed, the still map's too, never the exact atlas
+ * or back to it; with hosted_vpp_scale, the VPP-made part packed; a host's
+ * part not a multiple of 4 high goes as with 0, and shows. */
+static void always_packed_map()
+{
+    const std::vector<uint8_t> f1 = atlas(11), f2 = atlas(12);
+    bool exact = false, with = false;
+    {
+        Rig r;
+        r.pump(2000, &f1);
+        const crs::VideoParams *vp = map_video(r);
+        ok("always_packed 0: the layer without it, pan_blocks as set, the still map exact",
+           vp && !vp->always_packed && vp->pan_blocks && r.st().state == "showing" && r.drawing("map", f1, &with) &&
+               with && !shows_packed(r, "map", f1, 1088, 480, &exact) && exact);
+    }
+    {
+        Rig r;
+        FeedConfig fc;
+        fc.socket = r.path;
+        fc.video.level_bits = 0;
+        fc.always_packed = true;
+        r.feed.reset(new MapFeed(fc));
+        r.feed->set_stream(true, false, Picture::Shown);
+        r.pump(1000, &f1);
+        r.pump(1000, &f2);   /* one change, then a still map */
+        crs::FakeGraph *g = r.gpu.graph("map");
+        const uint64_t still0 = g ? g->flushed_bytes : 0;
+        r.pump(2000, &f2);
+        const crs::VideoParams *vp = map_video(r);
+        const std::string s = r.map_layer() ? r.map_layer()->stats() : std::string();
+        ok("always_packed 1: the layer with it", vp && vp->always_packed && vp->pan_blocks);
+        ok("always_packed 1: a still map sends nothing", g && g->flushed_bytes == still0);
+        ok("always_packed 1: the still map packed, the exact atlas never shown",
+           r.st().state == "showing" && shows_packed(r, "map", f2, 1088, 480, &exact) && !exact);
+        ok("always_packed 1: every write packed, none exact or back to exact",
+           s.find(" 0 whole, 0 partial, 0 rects, ") != std::string::npos && s.find("rects, 0 packed") == std::string::npos &&
+               s.find(" 0 back to exact") != std::string::npos);
+    }
+    char tmpl[] = "/tmp/woc-packed-XXXXXX";
+    const std::string root = mkdtemp(tmpl) ? tmpl : "/nonexistent";
+    const std::string file = root + "/design.scene";
+    std::ofstream(file) << "scene 0x010004f8\nnode plate -\npass main\n";
+    chmod(file.c_str(), 0644);
+    {
+        Rig r;
+        r.sc.targets[1].scene_files = true;
+        r.sc.scene_files.root = root;
+        r.sc.scene_files.owner = getuid();
+        r.start();
+        FeedConfig fc;
+        fc.socket = r.path;
+        fc.video.level_bits = 0;
+        fc.always_packed = true;
+        fc.vpp_scale = true;
+        r.feed.reset(new MapFeed(fc));
+        r.feed->set_stream(true, false, Picture::Shown);
+        r.pump(1000, &f1);
+        cr::Client design("design", r.path);
+        r.other = &design;
+        cr::SceneOptions so;
+        so.target = "panel";
+        so.file = file;
+        so.sha256 = {crs::sha256_file(file)};
+        so.layers = true;
+        const uint32_t sc = design.scene(so);
+        r.pump(500, &f1);
+        cr::Host h;
+        h.target = "map";
+        h.x = 700; h.y = 160; h.w = 560; h.h = 400;
+        h.src_x = 264; h.src_y = 40; h.src_w = 560; h.src_h = 400;
+        design.host(sc, h);
+        r.pump(1500, &f1);
+        r.part = OutputPart{264, 40, 560, 400, 560, 400};
+        const std::vector<uint8_t> p2 = crop_of(f2, 264, 40, 560, 400);
+        r.pump(1500, &p2);
+        const crs::VideoParams *vp = map_video(r);
+        ok("always_packed with hosted_vpp_scale: the VPP-made part packed, never exact",
+           vp && vp->always_packed && r.st().hosted && shows_packed(r, "panel", p2, 560, 400, &exact) && !exact);
+
+        /* The host moves the map: a new layer, its first write the whole
+         * packed part once, then nothing while the part stands still. */
+        crs::FakeGraph *pg = r.gpu.graph("panel");
+        const uint64_t moved0 = pg ? pg->flushed_bytes : 0;
+        h.src_x = 200;
+        design.host(sc, h);
+        r.part = OutputPart{200, 40, 560, 400, 560, 400};
+        const std::vector<uint8_t> p3 = crop_of(f2, 200, 40, 560, 400);
+        r.pump(1500, &p3);
+        const uint64_t moved = pg ? pg->flushed_bytes - moved0 : 0;
+        char name[200];
+        std::snprintf(name, sizeof name, "always_packed: the host moved, the new part's whole packed frame once (%llu B), "
+                      "then nothing", (unsigned long long)moved);
+        ok(name, moved == crk::block_bytes(560, 400) && shows_packed(r, "panel", p3, 560, 400, &exact) && !exact);
+        h.src_x = 264;
+
+        h.h = 430;
+        h.src_h = 430;
+        design.host(sc, h);
+        r.part = OutputPart();
+        r.pump(2000, &f1);
+        vp = map_video(r);
+        ok("always_packed: a host's part 430 high (not a multiple of 4) as with 0, and shown",
+           vp && !vp->always_packed && r.st().state == "showing" && r.st().hosted &&
+               r.drawing("panel", crop_of(f1, 264, 40, 560, 430), &with) && with);
+        design.drop(sc);
+        r.pump(500, &f1);
+        r.other = nullptr;
+    }
+    const int removed = std::system(("rm -rf " + root).c_str());
+    (void)removed;
+}
+
+/* A cluster-render from before always_packed: its hello without it (with
+ * packed, a newer one's, with it); every JSON message a client sends on the
+ * current connection kept. */
+struct OldRenderer {
+    std::string path = "/tmp/woc-old-render-" + std::to_string(getpid()) + ".sock";
+    int lfd = -1, cfd = -1;
+    std::string in;
+    std::vector<std::string> ops;
+    bool packed = false;
+
+    OldRenderer()
+    {
+        unlink(path.c_str());
+        lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        sockaddr_un a{};
+        a.sun_family = AF_UNIX;
+        std::snprintf(a.sun_path, sizeof a.sun_path, "%s", path.c_str());
+        if (bind(lfd, (const sockaddr *)&a, sizeof a) != 0 || listen(lfd, 4) != 0)
+            std::printf("old renderer: %s not listening\n", path.c_str());
+    }
+    ~OldRenderer()
+    {
+        if (cfd >= 0)
+            close(cfd);
+        close(lfd);
+        unlink(path.c_str());
+    }
+    void poll()
+    {
+        if (cfd < 0)
+            cfd = accept4(lfd, nullptr, nullptr, SOCK_NONBLOCK);
+        if (cfd < 0)
+            return;
+        char buf[65536];
+        ssize_t n;
+        while ((n = read(cfd, buf, sizeof buf)) > 0)
+            in.append(buf, (size_t)n);
+        size_t off = 0;
+        for (;;) {
+            size_t used = 0, len = 0;
+            uint8_t type = 0;
+            const char *body = nullptr;
+            bool bad = false;
+            if (!cr::next_message(in.data() + off, in.size() - off, &used, &type, &body, &len, &bad))
+                break;
+            off += used;
+            if (type != cr::kJson)
+                continue;
+            ops.emplace_back(body, len);
+            cr::Json j;
+            if (cr::parse_json(ops.back(), &j) && j["op"] == "hello") {
+                std::vector<std::pair<std::string, std::string>> kv = {
+                    {"ev", cr::json_quote("hello")}, {"proto", "1"}, {"backend", cr::json_quote("id7")},
+                    {"targets", cr::json_quote("map:1088x480,panel:1920x720")}, {"repeat", "1"}};
+                if (packed)
+                    kv.push_back({"always_packed", "1"});
+                const std::string h = cr::encode(cr::kJson, cr::json_object(kv));
+                if (write(cfd, h.data(), h.size()) != (ssize_t)h.size())
+                    std::printf("old renderer: hello not written\n");
+            }
+        }
+        in.erase(0, off);
+    }
+    /* the last layer op */
+    std::string layer_op() const
+    {
+        for (auto o = ops.rbegin(); o != ops.rend(); ++o)
+            if (o->find("\"layer\"") != std::string::npos && o->find("\"kind\"") != std::string::npos)
+                return *o;
+        return std::string();
+    }
+    /* The connection ends (the service restarted, as an upgrade does). */
+    void hang_up()
+    {
+        close(cfd);
+        cfd = -1;
+        in.clear();
+        ops.clear();
+    }
+};
+
+/* Compatibility: the map's layer to a cluster-render whose hello does not
+ * take always_packed carries no always_packed field, set or not (with it
+ * set, logged once, the map as pan_blocks decides); and by default the
+ * field is never sent, so a cluster-render of any age gets the layer it
+ * always did. */
+static void old_renderer()
+{
+    for (int packed = 0; packed < 2; packed++) {
+        OldRenderer old;
+        FeedConfig fc;
+        fc.socket = old.path;
+        fc.always_packed = packed == 1;
+        MapFeed feed(fc);
+        feed.set_stream(true, false, Picture::Shown);
+        int64_t now = 100000;
+        for (int i = 0; i < 400 && old.layer_op().empty(); i++) {
+            now += 5;
+            old.poll();
+            feed.poll(now);
+            old.poll();
+        }
+        const std::string op = old.layer_op();
+        ok(packed ? "an older cluster-render: always_packed 1 sends the layer without always_packed"
+                  : "always_packed 0: the layer without always_packed",
+           !op.empty() && op.find("always_packed") == std::string::npos && op.find("pan_blocks") != std::string::npos);
+    }
+}
+
+/* always_packed follows each connection's hello: cluster-render upgraded
+ * (or downgraded) under a running feed gets the map's layer made again for
+ * what it takes, with the one log line when it no longer takes it. */
+static void renderer_changed()
+{
+    for (int up = 0; up < 2; up++) {
+        OldRenderer r;
+        r.packed = !up;
+        FeedConfig fc;
+        fc.socket = r.path;
+        fc.always_packed = true;
+        MapFeed feed(fc);
+        feed.set_stream(true, false, Picture::Shown);
+        int64_t now = 100000;
+        auto run = [&] {
+            for (int i = 0; i < 400; i++) {
+                now += 5;
+                r.poll();
+                feed.poll(now);
+                r.poll();
+            }
+        };
+        run();
+        const bool before = r.layer_op().find("always_packed") != std::string::npos;
+        uint64_t seq = 0;
+        std::vector<std::string> lines;
+        cld::log_lines_since(&seq, &lines);
+        lines.clear();
+        r.packed = up;
+        r.hang_up();
+        run();
+        const std::string op = r.layer_op();
+        cld::log_lines_since(&seq, &lines);
+        int logged = 0;
+        for (const std::string &line : lines)
+            logged += line.find("render: always_packed:") != std::string::npos;
+        if (up)
+            ok("always_packed: an older cluster-render upgraded under the feed: the layer with always_packed after the "
+               "reconnect",
+               !before && op.find("\"always_packed\"") != std::string::npos && logged == 0);
+        else
+            ok("always_packed: cluster-render downgraded under the feed: the layer without always_packed after the "
+               "reconnect, logged once",
+               before && !op.empty() && op.find("always_packed") == std::string::npos && logged == 1);
+    }
+}
+
 int main()
 {
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, nullptr, _IONBF, 0);
     hosting();
+    vpp_hosting();
+    always_packed_map();
+    old_renderer();
+    renderer_changed();
     Rig r;
     r.pump(100);
     const crs::Layer *l = r.map_layer();

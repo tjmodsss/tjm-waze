@@ -150,6 +150,40 @@ void wrap(mfxBitstream *bs, const AccessUnit &au)
     bs->DataFlag = MFX_BITSTREAM_COMPLETE_FRAME;
 }
 
+/* A decoded surface's input rect, put back as it was when this goes (s
+ * null: nothing to put back). */
+struct CropRestore {
+    mfxFrameSurface1 *s;
+    mfxFrameInfo own;
+    ~CropRestore()
+    {
+        if (!s)
+            return;
+        s->Info.CropX = own.CropX;
+        s->Info.CropY = own.CropY;
+        s->Info.CropW = own.CropW;
+        s->Info.CropH = own.CropH;
+    }
+};
+
+/* Why VPP is not used for part p of a fw x fh output made from VPP's input
+ * rect in; null: it is. */
+const char *part_unfit(const OutputPart &p, uint32_t fw, uint32_t fh, const mfxFrameInfo &in)
+{
+    if ((p.x | p.y | p.w | p.h | p.dw | p.dh) & 1)
+        return "an odd edge";
+    if (!p.w || !p.h || !p.dh || (uint64_t)p.x + p.w > fw || (uint64_t)p.y + p.h > fh)
+        return "not inside the output";
+    if (p.dw > p.w || p.dh > p.h)
+        return "larger than its rect";
+    /* VPP scales the part's rect of its input (src_crop's), not of the output */
+    uint32_t x, y, w, h;
+    part_rect(in.CropX, in.CropY, in.CropW, in.CropH, fw, fh, p, &x, &y, &w, &h);
+    if (w > (uint64_t)p.dw * Decoder::kMaxPartScale || h > (uint64_t)p.dh * Decoder::kMaxPartScale)
+        return "more than 8 times smaller than its rect";
+    return nullptr;
+}
+
 }  // namespace
 
 struct Decoder::State {
@@ -192,6 +226,12 @@ struct Decoder::State {
     bool cpu_layout = false;
     int vpp_fails = 0;               /* VPP runs in a row that failed */
     bool copy_logged = false;
+    /* Decoder::set_part: the part asked for; the one VPP is set up for
+     * (unset: the whole output, full_w x full_h); one VPP could not make in
+     * this sequence, not asked of it again. w x h is the part's size while
+     * there is one. */
+    OutputPart part_wanted, part, part_refused;
+    uint32_t full_w = 0, full_h = 0;
 
     /* The current sequence; valid while `running`. */
     bool running = false;
@@ -225,6 +265,9 @@ struct Decoder::State {
     bool convert(mfxFrameSurface1 *in, mfxSyncPoint decoded, const FrameSink &cb);
     bool run_vpp(mfxFrameSurface1 *in, const FrameSink &cb);
     bool skip(mfxFrameSurface1 *out, mfxSyncPoint sync, const FrameSink &cb);
+    void use_part();
+    bool reset_vpp(const OutputPart &p, std::string *why);
+    void refuse_part(const OutputPart &p, const std::string &why, bool reset);
     bool fail(const std::string &msg)
     {
         if (error.empty()) error = msg;
@@ -244,11 +287,16 @@ struct Decoder::State {
         log_warn("decoder: %s with GPU copy; VPP's output is copied on the CPU from now on", why.c_str());
         g_gpu_copy_failed = true;
     }
-    /* A failed VPP run loses its picture. In a session with GPU copy, the
-     * kVppFailLimit-th in a row moves the output for the CPU copy: that
-     * session goes on with its decoder's references. */
+    /* A failed VPP run loses its picture. With a part, the part is refused.
+     * In a session with GPU copy, the kVppFailLimit-th in a row moves the
+     * output for the CPU copy: that session goes on with its decoder's
+     * references. */
     bool vpp_failed(const std::string &msg)
     {
+        if (part.set()) {
+            refuse_part(part, msg, true);
+            return fail(msg);
+        }
         if (session_gpu_copy && !cpu_layout && ++vpp_fails >= kVppFailLimit) {
             cpu_copy(std::to_string(kVppFailLimit) + " VPP runs in a row failed (the last: " + msg + ")");
             cpu_layout = true;
@@ -452,6 +500,9 @@ bool Decoder::State::start(const AccessUnit &au)
     const bool cropped = crop_picture(crop, &vpp.vpp.In.CropX, &vpp.vpp.In.CropY, &vpp.vpp.In.CropW, &vpp.vpp.In.CropH);
     w = out_w ? out_w : cropped ? crop.w : in.CropW;
     h = out_h ? out_h : cropped ? crop.h : in.CropH;
+    full_w = w;
+    full_h = h;
+    part = part_refused = OutputPart();   /* VPP set up whole below; a part at the first picture */
     seen_w = seen_h = 0;
     rect_restart = false;
     rects.started(start_by_rect);
@@ -654,10 +705,13 @@ Decoder::State::Result Decoder::State::decode(mfxBitstream *bs, const FrameSink 
  * waits for both. */
 bool Decoder::State::convert(mfxFrameSurface1 *in, mfxSyncPoint decoded, const FrameSink &cb)
 {
+    use_part();
+    const bool check = sequence_needs_check(crop, vpp.vpp.In.CropW, vpp.vpp.In.CropH, seq_w, seq_h);
     /* A sequence src_crop cannot touch, in the rect VPP is set up for, goes
      * straight to VPP: its pictures fit that rect (which also ends a rect
-     * restart's exemption, as the check below would). */
-    if (!sequence_needs_check(crop, vpp.vpp.In.CropW, vpp.vpp.In.CropH, seq_w, seq_h)) {
+     * restart's exemption, as the check below would). With a part it is
+     * waited for, as below, for the part's rect. */
+    if (!check && !part.set()) {
         rects.restart(false);
         return run_vpp(in, cb);
     }
@@ -671,17 +725,7 @@ bool Decoder::State::convert(mfxFrameSurface1 *in, mfxSyncPoint decoded, const F
         if (sts != MFX_ERR_NONE)
             return fail(mfx_error("MFXVideoCORE_SyncOperation", sts));
     }
-    struct Restore {
-        mfxFrameSurface1 *s;
-        mfxFrameInfo own;
-        ~Restore()
-        {
-            s->Info.CropX = own.CropX;
-            s->Info.CropY = own.CropY;
-            s->Info.CropW = own.CropW;
-            s->Info.CropH = own.CropH;
-        }
-    } restore{in, in->Info};
+    CropRestore restore{in, in->Info};
     const mfxFrameInfo &own = restore.own;
     const bool cropped = crop_picture(crop, &in->Info.CropX, &in->Info.CropY, &in->Info.CropW, &in->Info.CropH);
     if (own.CropW != seen_w || own.CropH != seen_h) {
@@ -698,7 +742,7 @@ bool Decoder::State::convert(mfxFrameSurface1 *in, mfxSyncPoint decoded, const F
      * decoder restarts at this access unit, the path an incompatible
      * sequence takes, with a fresh session set up for its rect; never twice
      * in a row (RectRestarts). */
-    const bool other = rect_needs_reset(crop, vpp.vpp.In.CropW, vpp.vpp.In.CropH, own.CropW, own.CropH);
+    const bool other = check && rect_needs_reset(crop, vpp.vpp.In.CropW, vpp.vpp.In.CropH, own.CropW, own.CropH);
     if (rects.restart(other)) {
         if (!rect_restart)
             log_info("decoder: picture %ux%u needs another VPP input rect: restarting at this sequence", own.CropW, own.CropH);
@@ -715,6 +759,17 @@ bool Decoder::State::convert(mfxFrameSurface1 *in, mfxSyncPoint decoded, const F
 
 bool Decoder::State::run_vpp(mfxFrameSurface1 *in, const FrameSink &cb)
 {
+    /* A part: its rect of the picture's (convert() waited for the decode). */
+    CropRestore restore{part.set() ? in : nullptr, in->Info};
+    if (part.set()) {
+        mfxFrameInfo &i = in->Info;
+        uint32_t x, y, pw, ph;
+        part_rect(i.CropX, i.CropY, i.CropW, i.CropH, full_w, full_h, part, &x, &y, &pw, &ph);
+        i.CropX = (mfxU16)x;
+        i.CropY = (mfxU16)y;
+        i.CropW = (mfxU16)pw;
+        i.CropH = (mfxU16)ph;
+    }
     mfxFrameSurface1 &out = vout[1 - last];
     mfxSyncPoint sync = nullptr;
     mfxStatus sts;
@@ -757,9 +812,89 @@ bool Decoder::State::run_vpp(mfxFrameSurface1 *in, const FrameSink &cb)
     have_last = true;
     /* The decode task finished before the VPP task that read its surface,
      * so its flags are set. */
-    VideoFrame f = {w, h, in->Data.Corrupted, same, same ? nullptr : &pixels, held(in)};
+    VideoFrame f = {w, h, in->Data.Corrupted, same, same ? nullptr : &pixels, held(in), part};
     cb(f);
     return true;
+}
+
+/* At a picture: VPP set up for the part asked for, unless it has it or could
+ * not make it in this sequence. */
+void Decoder::State::use_part()
+{
+    const OutputPart p = part_wanted;
+    if (p == part || (p.set() && p == part_refused))
+        return;
+    std::string why;
+    const char *unfit = p.set() ? part_unfit(p, full_w, full_h, vpp.vpp.In) : nullptr;
+    if (unfit) {
+        refuse_part(p, unfit, part.set());
+    } else if (reset_vpp(p, &why)) {
+        if (p.set())
+            log_info("decoder: VPP makes the output's %ux%u at %u,%u as %ux%u (hosted_vpp_scale)", p.w, p.h, p.x, p.y,
+                     p.dw, p.dh);
+        else
+            log_info("decoder: VPP makes the whole %ux%u output again", full_w, full_h);
+    } else if (p.set()) {
+        refuse_part(p, why, true);
+    } else {
+        log_error("decoder: VPP not set up for the whole output again (%s): its pictures may fail until the next "
+                  "sequence", why.c_str());
+    }
+}
+
+/* VPP reset for part p of the output (unset: the whole output, as start()
+ * set it up, else VPP closed and set up again so), its output surfaces and
+ * the picture size with it. Set up again and failing, the whole output's
+ * all the same, not asked again until the next sequence. */
+bool Decoder::State::reset_vpp(const OutputPart &p, std::string *why)
+{
+    mfxVideoParam par = vpp;
+    if (p.set()) {
+        mfxFrameInfo &in = par.vpp.In, &out = par.vpp.Out;
+        uint32_t x, y, pw, ph;
+        part_rect(in.CropX, in.CropY, in.CropW, in.CropH, full_w, full_h, p, &x, &y, &pw, &ph);
+        in.CropX = (mfxU16)x;
+        in.CropY = (mfxU16)y;
+        in.CropW = (mfxU16)pw;
+        in.CropH = (mfxU16)ph;
+        out.Width = align16(p.dw);
+        out.Height = align16(p.dh);
+        out.CropW = (mfxU16)p.dw;
+        out.CropH = (mfxU16)p.dh;
+    }
+    mfxStatus sts = MFXVideoVPP_Reset(session, &par);
+    if (p.set() && sts != MFX_ERR_NONE) {
+        *why = mfx_error("MFXVideoVPP_Reset", sts);
+        return false;
+    }
+    if (sts < MFX_ERR_NONE) {
+        MFXVideoVPP_Close(session);
+        sts = MFXVideoVPP_Init(session, &par);
+        if (sts < MFX_ERR_NONE)
+            *why = mfx_error("MFXVideoVPP_Init", sts);
+    }
+    part = p;
+    w = p.set() ? p.dw : full_w;
+    h = p.set() ? p.dh : full_h;
+    for (int k = 0; k < 2; k++)
+        vout[k].Info = par.vpp.Out;
+    place_vout();
+    have_last = false;
+    return sts >= MFX_ERR_NONE;
+}
+
+/* VPP cannot make part p: not asked again in this sequence, its pictures
+ * whole; with reset, VPP set up for the whole output again (it may hold
+ * another part, or a failed reset). */
+void Decoder::State::refuse_part(const OutputPart &p, const std::string &why, bool reset)
+{
+    part_refused = p;
+    log_warn("decoder: VPP cannot make the output's %ux%u at %u,%u as %ux%u (%s): whole pictures for this stream, "
+             "the part scaled on the CPU", p.w, p.h, p.x, p.y, p.dw, p.dh, why.c_str());
+    std::string whole;
+    if (reset && !reset_vpp(OutputPart(), &whole))
+        log_error("decoder: VPP not set up for the whole output again (%s): its pictures may fail until the next "
+                  "sequence", whole.c_str());
 }
 
 /* A frame without a picture: no VPP. The wait costs nothing the next frame
@@ -772,7 +907,7 @@ bool Decoder::State::skip(mfxFrameSurface1 *out, mfxSyncPoint sync, const FrameS
     const mfxStatus sts = MFXVideoCORE_SyncOperation(session, sync, kSyncTimeoutMs);
     if (sts != MFX_ERR_NONE)
         return fail(mfx_error("MFXVideoCORE_SyncOperation", sts));
-    VideoFrame f = {w, h, out->Data.Corrupted, false, nullptr, held(out)};
+    VideoFrame f = {w, h, out->Data.Corrupted, false, nullptr, held(out), part};
     skipped_out = out;
     cb(f);
     return true;
@@ -800,6 +935,7 @@ bool Decoder::init(const char *dev, uint32_t out_w, uint32_t out_h, unsigned lev
     s->level_bits = level_bits;
     s->gpu_copy = gpu_copy;
     s->crop = crop;
+    s->part_wanted = part_;
     s->sps_sink = &sps_sink_;
 
     s->fd = open(dev, O_RDWR | O_CLOEXEC);
@@ -864,6 +1000,13 @@ void Decoder::forget_last()
 {
     if (s_)
         s_->have_last = false;
+}
+
+void Decoder::set_part(const OutputPart &p)
+{
+    part_ = p;
+    if (s_)
+        s_->part_wanted = p;
 }
 
 bool Decoder::picture_skipped(const FrameSink &cb, std::string *err)

@@ -49,6 +49,15 @@ void pack_blocks(const uint8_t *atlas, uint32_t w, uint32_t h, uint8_t *out, uns
 /* The same on one thread without SSE2, which pack_blocks equals byte for
  * byte. */
 void pack_blocks_scalar(const uint8_t *atlas, uint32_t w, uint32_t h, uint8_t *out);
+/* Blocks bx0 .. bx1 - 1 x by0 .. by1 - 1 alone, row by row into out
+ * ((bx1 - bx0) * (by1 - by0) * 8 bytes): the bytes pack_blocks gives them,
+ * which is texel rect (2 bx0, by0, 2 (bx1 - bx0), by1 - by0) of the buffer. */
+void pack_block_rect(const uint8_t *atlas, uint32_t w, uint32_t h, uint32_t bx0, uint32_t by0, uint32_t bx1,
+                     uint32_t by1, uint8_t *out);
+/* Whether block (bx, by) packs otherwise from atlas a than from b: a byte it
+ * is made from differs (its 4x4 luma, and the chroma around it that the
+ * atlas shader's siting reaches). */
+bool block_differs(const uint8_t *a, const uint8_t *b, uint32_t w, uint32_t h, uint32_t bx, uint32_t by);
 
 /* The RGB the atlas shader draws at every pixel, as the packer sees it:
  * w x h x 3 bytes into out. */

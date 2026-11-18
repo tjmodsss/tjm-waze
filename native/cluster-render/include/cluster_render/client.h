@@ -72,6 +72,10 @@ struct VideoOptions {
     unsigned level_bits = 2, dirty_threshold = 8, settle_ms = 1000;
     bool pan_blocks = true;
     unsigned stall_ms = 6000;
+    /* Every write as packed 4x4 blocks, never the exact atlas (PROTOCOL.md);
+     * sent only when set, to a service whose hello takes it
+     * (Client::takes_always_packed). */
+    bool always_packed = false;
 };
 
 /* RGBA, straight alpha, w x h (0: the layer's w and h, which must then be
@@ -289,6 +293,8 @@ public:
     void request_status();
     /* The service's hello: its backend ("id7", "id8") and targets ("map:1088x480,..."). */
     std::string backend, targets;
+    /* The service's hello takes a video layer's always_packed (VideoOptions). */
+    bool takes_always_packed() const { return always_packed_; }
 
 private:
     struct Part {
@@ -377,6 +383,7 @@ private:
     static const size_t kMaxSpare = 4;
     uint32_t last_frame_ref_ = 0;   /* the layer whose frame went last; cur_px_'s while it is sent */
     bool repeats_ = false;          /* the service takes repeats (its hello) */
+    bool always_packed_ = false;    /* and always_packed */
 };
 
 }  // namespace cr

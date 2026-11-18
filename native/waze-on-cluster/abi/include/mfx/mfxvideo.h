@@ -58,6 +58,7 @@ mfxStatus MFXVideoDECODE_DecodeFrameAsync(mfxSession session, mfxBitstream *bs, 
 
 mfxStatus MFXVideoVPP_QueryIOSurf(mfxSession session, mfxVideoParam *par, mfxFrameAllocRequest request[2]);
 mfxStatus MFXVideoVPP_Init(mfxSession session, mfxVideoParam *par);
+mfxStatus MFXVideoVPP_Reset(mfxSession session, mfxVideoParam *par);
 mfxStatus MFXVideoVPP_Close(mfxSession session);
 mfxStatus MFXVideoVPP_RunFrameVPPAsync(mfxSession session, mfxFrameSurface1 *in, mfxFrameSurface1 *out, mfxExtVppAuxData *aux, mfxSyncPoint *syncp);
 

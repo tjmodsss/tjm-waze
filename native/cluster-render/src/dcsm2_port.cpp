@@ -245,6 +245,8 @@ void Dcsm2Port::on_reply(uint16_t method, bool ok, uint32_t status, const std::s
         if (method == dcsm::kReqMapContent && it != contents_.end() && it->second.phase == Phase::Mapping &&
             it->second.accepted_ms < 0)
             it->second.accepted_ms = now_ms;
+        if (method == dcsm::kReqFetchContent && it != contents_.end() && it->second.phase == Phase::Fetching)
+            it->second.fetch_accepted = true;
         return;   /* the status event follows */
     }
     if (it == contents_.end())
@@ -286,9 +288,15 @@ void Dcsm2Port::on_fetch_status(uint64_t scene, uint32_t status, int64_t now_ms)
         return;
     Content &c = it->second;
     switch (status) {
+    case dcsm::E_FETCH_STATUS_FETCHING:
+        if (c.phase == Phase::Fetching)
+            c.fetch_accepted = true;
+        break;
     case dcsm::E_FETCH_STATUS_FETCHED:
         if (c.phase != Phase::Fetching)
             break;
+        if (manager_)
+            manager_->on_fetched(scene, now_ms);
         c.phase = Phase::Mapping;
         c.map_asked = true;
         c.fetched = true;

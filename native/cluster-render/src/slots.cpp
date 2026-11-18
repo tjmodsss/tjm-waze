@@ -793,9 +793,15 @@ void SlotManager::on_availability(bool up, int64_t now_ms)
     disabled_.clear();
     if (up) {
         available_since_ms_ = now_ms;
+        boot_hold_ = port_->slot_table();
+        if (boot_hold_)
+            log_info("display service up: the first request waits for the slot table to show the stock HMI's content "
+                     "mapped, %lld s at most",
+                     (long long)(kBootHoldMs / 1000));
         return;
     }
     available_since_ms_ = -1;
+    boot_hold_ = false;
     released_.clear();
     /* A cluster restart takes the display service with it: logged with the
      * target mapped last, for reading the log. */
@@ -816,6 +822,7 @@ void SlotManager::on_availability(bool up, int64_t now_ms)
     /* The display is gone, and with it every mapping: nothing to release. */
     for (size_t i = 0; i < t_.size(); i++) {
         t_[i].requested = false;
+        t_[i].no_fetch = 0;
         t_[i].kept = t_[i].remap = t_[i].lock_takeover = t_[i].lock_hold = false;
         t_[i].status.rendering = Rendering::None;
         set((int)i, t_[i].wanted ? TargetState::Unavailable : TargetState::Idle, Holder::None,
@@ -847,7 +854,15 @@ void SlotManager::on_shown(uint64_t scene_id, int64_t now_ms)
         t.mapped_seq = ++mapped_seq_;
     }
     t.removed_ms = -1;
+    t.no_fetch = 0;
     verify(i, now_ms);
+}
+
+void SlotManager::on_fetched(uint64_t scene_id, int64_t)
+{
+    const int i = by_scene(scene_id);
+    if (i >= 0)
+        t_[i].no_fetch = 0;
 }
 
 void SlotManager::on_parked(uint64_t scene_id, int64_t now_ms)
@@ -1141,6 +1156,22 @@ void SlotManager::on_slots(const std::vector<SlotInfo> &slots, int64_t now_ms)
     std::map<uint64_t, std::vector<SlotInfo>> rows;
     for (const SlotInfo &s : slots)
         rows[s.slot].push_back(s);
+    /* The boot hold ends with the stock HMI's content mapped: none of our
+     * scene ids, which share its range. */
+    for (const SlotInfo &s : slots) {
+        if (!boot_hold_ || !s.map_status || !stock_scene(s.content))
+            continue;
+        bool ours = false;
+        for (const TargetSpec &spec : specs_)
+            ours = ours || s.content == spec.scene_id || s.content == spec.fallback_scene_id;
+        if (ours)
+            continue;
+        boot_hold_ = false;
+        log_info("display: the stock HMI's 0x%llx mapped in slot 0x%llx (map status %u) %lld ms after the display "
+                 "service came up: requests may go",
+                 (unsigned long long)s.content, (unsigned long long)s.slot, s.map_status,
+                 (long long)(now_ms - available_since_ms_));
+    }
     /* A hold whose slot comes from the table goes to the slot reported_slot
      * names, once the rows are in. */
     std::map<int, std::pair<uint64_t, std::string>> moves;
@@ -1306,13 +1337,18 @@ void SlotManager::on_slots(const std::vector<SlotInfo> &slots, int64_t now_ms)
 void SlotManager::tick(int64_t now_ms)
 {
     const bool up = port_->available();
-    const bool settling = available_since_ms_ >= 0 && now_ms - available_since_ms_ < kSettleMs;
+    const bool holding = up && boot_holds(now_ms);
+    const bool settling = available_since_ms_ >= 0 && (now_ms - available_since_ms_ < kSettleMs || holding);
     bool poll_slots = false;
 
     for (size_t k = 0; k < specs_.size(); k++) {
         const int i = (int)k;
         Target &t = t_[i];
         const TargetSpec &spec = specs_[i];
+        if (!t.wanted)
+            t.no_fetch = 0;
+        if (holding && t.wanted)
+            poll_slots = true;
 
         /* A scene file came or went: published again, the stale scene
          * shown until then while nothing wants the target (its linger). */
@@ -1430,9 +1466,13 @@ void SlotManager::tick(int64_t now_ms)
             if (t.unmapped_ms >= 0 && now_ms - t.unmapped_ms >= kNotMappedMs) {
                 not_mapped(i, now_ms);
             } else if (t.unmapped_ms < 0 && now_ms - t.since_ms >= kStartTimeoutMs) {
+                const bool accepted = port_->fetch_accepted(spec), stalled = accepted || t.no_fetch > 0;
                 port_->no_answer(spec, now_ms);
                 take_down(i, now_ms);
-                wait(i, Holder::None, true, "no answer from the display", now_ms);
+                if (stalled)
+                    stalled_fetch(i, accepted, now_ms);
+                wait(i, Holder::None, true, accepted ? "fetch accepted, never completed" : "no answer from the display",
+                     now_ms);
             } else {
                 port_->remind(spec, now_ms);
             }
@@ -1532,8 +1572,11 @@ int64_t SlotManager::wake_in_ms(int64_t now_ms) const
         if (d > 0 && (best < 0 || d < best))
             best = d;
     };
-    if (available_since_ms_ >= 0)
+    if (available_since_ms_ >= 0) {
         at(available_since_ms_ + kSettleMs);
+        if (boot_hold_)
+            at(available_since_ms_ + kBootHoldMs);
+    }
     for (size_t i = 0; i < specs_.size(); i++) {
         const Target &t = t_[i];
         if (t.kept) {
@@ -1624,12 +1667,56 @@ void SlotManager::verify(int i, int64_t now_ms)
      * next acquire publishes it again (a fresh offer); then, now and again, the framework reconnected */
     if (t.recoveries >= 2)
         drop_scene(i);
-    if (on_renderer_stuck && t.recoveries % kReconnectAfter == 0)
-        on_renderer_stuck(now_ms);
+    if (t.recoveries % kReconnectAfter == 0)
+        reconnect(i, "no renderer subscription through " + std::to_string(t.recoveries) + " recoveries in a row", now_ms);
     if (t.recoveries == 1)
         set(i, TargetState::Waiting, Holder::None, reason, now_ms, now_ms);
     else
         wait(i, Holder::None, true, reason, now_ms);
+}
+
+void SlotManager::stalled_fetch(int i, bool accepted, int64_t now_ms)
+{
+    Target &t = t_[i];
+    const TargetSpec &spec = specs_[i];
+    t.no_fetch++;
+    const bool fresh = t.no_fetch >= 2 && t.scene;
+    log_warn("INCIDENT target %s stalled: %s in %lld ms, %d in a row; %s; asking again on the ladder",
+             spec.name.c_str(),
+             accepted ? "fetch accepted but never completed" : "no answer after a fetch accepted and never completed",
+             (long long)kStartTimeoutMs, t.no_fetch,
+             fresh ? "republishing its scene: unpublished, published fresh at the next request" : "its scene kept");
+    if (fresh)
+        drop_scene(i);
+    if (t.no_fetch % kReconnectAfter == 0)
+        reconnect(i, std::to_string(t.no_fetch) + " stalled fetches in a row", now_ms);
+}
+
+void SlotManager::reconnect(int i, const std::string &why, int64_t now_ms)
+{
+    if (!on_renderer_stuck)
+        return;
+    if (now_ms - reconnect_ms_ < kReconnectGapMs) {
+        log_warn("target %s: %s; the RAMSES framework was reconnected %lld s ago: not again before %lld s",
+                 specs_[i].name.c_str(), why.c_str(), (long long)((now_ms - reconnect_ms_) / 1000),
+                 (long long)(kReconnectGapMs / 1000));
+        return;
+    }
+    reconnect_ms_ = now_ms;
+    log_warn("INCIDENT target %s reconnecting the RAMSES framework: %s", specs_[i].name.c_str(), why.c_str());
+    on_renderer_stuck(now_ms);
+}
+
+bool SlotManager::boot_holds(int64_t now_ms)
+{
+    if (!boot_hold_ || available_since_ms_ < 0)
+        return false;
+    if (now_ms - available_since_ms_ < kBootHoldMs)
+        return true;
+    boot_hold_ = false;
+    log_info("display: no stock HMI content mapped %lld s after the display service came up: requests go",
+             (long long)(kBootHoldMs / 1000));
+    return false;
 }
 
 std::string SlotManager::timing(int i, int64_t now_ms) const

@@ -31,6 +31,10 @@ bool target_size(const std::string &targets, const std::string &name, uint32_t *
     return false;
 }
 
+/* Why always_packed does not apply to a layer (MapFeed::unpacked_why_). */
+const char *const kOddSize = "its size is not a multiple of 4";
+const char *const kNotTaken = "the cluster renderer does not take it";
+
 }  // namespace
 
 MapFeed::MapFeed(const FeedConfig &cfg)
@@ -43,8 +47,17 @@ MapFeed::MapFeed(const FeedConfig &cfg)
         refused_.clear();
         status_asked_ = false;
         log_info("render: connected to the cluster renderer (%s; %s)", client_.backend.c_str(), client_.targets.c_str());
-        if (!layer_)
+        if (!layer_) {
             make_layer();
+        } else if (cfg_.always_packed && unpacked_why_ != kOddSize &&
+                   (unpacked_why_ == nullptr) != client_.takes_always_packed()) {
+            /* a cluster-render that takes always_packed now, or no longer:
+             * the layer made again for it, its next write whole */
+            keep_newest();
+            client_.drop(layer_);
+            layer_ = 0;
+            make_layer();
+        }
     };
     client_.on_layer = [this](uint32_t ref, const std::string &state, const std::string &reason) {
         if (ref != layer_)
@@ -84,6 +97,7 @@ MapFeed::MapFeed(const FeedConfig &cfg)
 
 void MapFeed::make_layer()
 {
+    part_ = OutputPart();
     uint32_t tw = 0, th = 0;
     if (!target_size(client_.targets, cfg_.target, &tw, &th)) {
         refused_ = "the cluster renderer has no target " + cfg_.target;
@@ -146,8 +160,10 @@ void MapFeed::make_layer()
         shape_.crop_w = crop.w;
         shape_.crop_h = crop.h;
         shape_.level_bits = cfg_.video.level_bits;
-        log_info("render: hosted by a scene on %s: the map's %ux%u at %u,%u, as %ux%u", host_.into.c_str(), crop.w,
-                 crop.h, crop.x, crop.y, dw, dh);
+        if (cfg_.vpp_scale)
+            part_ = OutputPart{crop.x, crop.y, crop.w, crop.h, dw, dh};
+        log_info("render: hosted by a scene on %s: the map's %ux%u at %u,%u, as %ux%u%s", host_.into.c_str(), crop.w,
+                 crop.h, crop.x, crop.y, dw, dh, part_.set() ? ", made by VPP (hosted_vpp_scale)" : "");
     } else if (cfg_.target == "hud" && cfg_.scale_down && (sw < cfg_.video.w || sh < cfg_.video.h) && sw >= 64 &&
                sh >= 32 && sw <= cfg_.video.w && sh <= cfg_.video.h) {
         q.x += (q.w - sw) / 2;
@@ -166,6 +182,22 @@ void MapFeed::make_layer()
         shape_.radius = cfg_.hud_round_corners ? (sh / 12 > 6 ? sh / 12 : 6) : 0;
         shape_.black = cfg_.hud_black_background;
     }
+    /* a VPP-made picture is of no use to a layer of another part, or none */
+    if (held_part_.set() && held_part_ != part_) {
+        held_part_ = OutputPart();
+        held_.clear();
+        held_new_ = false;
+    }
+    if (cfg_.always_packed) {
+        /* the size first: only the renderer's answer changes on a reconnect */
+        const char *why = vo.w % 4 || vo.h % 4 ? kOddSize : !client_.takes_always_packed() ? kNotTaken : nullptr;
+        if (why && why != unpacked_why_)
+            log_warn("render: always_packed: the map's %ux%u not packed, %s: its updates as pan_blocks decides", vo.w,
+                     vo.h, why);
+        unpacked_why_ = why;
+        vo.always_packed = !why;
+        vo.pan_blocks = vo.pan_blocks || vo.always_packed;
+    }
     lo_ = cr::LayerOptions();
     lo_.target = drawn_target();
     lo_.klass = "content";
@@ -182,8 +214,11 @@ void MapFeed::make_layer()
     layer_ = client_.video(lo_, vo);
     if (hosted())
         target_size(client_.targets, host_.into, &tw, &th);
-    log_info("render: map layer on %s (%ux%u), quad %ux%u at %u,%u%s", lo_.target.c_str(), tw, th, q.w, q.h, q.x, q.y,
-             scaling_ ? ", the frame scaled to it on the head unit" : "");
+    log_info("render: map layer on %s (%ux%u), quad %ux%u at %u,%u%s%s", lo_.target.c_str(), tw, th, q.w, q.h, q.x, q.y,
+             part_.set() ? ", the part made to it by VPP on the GPU"
+             : scaling_  ? ", the frame scaled to it on the head unit"
+                         : "",
+             vo.always_packed ? ", every update packed (always_packed)" : "");
 }
 
 void MapFeed::set_host(const cr::Host &h)
@@ -191,6 +226,7 @@ void MapFeed::set_host(const cr::Host &h)
     if (h == host_)
         return;
     host_ = h;
+    part_ = OutputPart();   /* the next layer's, if any */
     if (!hosted())
         log_info("render: %s is not hosted any more: the map on its own target", cfg_.target.c_str());
     else
@@ -297,6 +333,7 @@ bool MapFeed::set_target(const std::string &name)
     cfg_.target = t;
     auto host = client_.hosts.find(t);
     host_ = host == client_.hosts.end() ? cr::Host() : host->second;
+    part_ = OutputPart();   /* the next layer's, if any */
     if (client_.connected())
         make_layer();
     return true;
@@ -366,6 +403,18 @@ void MapFeed::offer(std::vector<uint8_t> *atlas, uint64_t id, int64_t now_ms)
     count_second(now_ms);
 }
 
+void MapFeed::offer_part(std::vector<uint8_t> *atlas, uint64_t id, const OutputPart &part, int64_t now_ms)
+{
+    if (!part_.set() || part != part_)
+        return;   /* made for a part the layer no longer shows */
+    if (layer_ && client_.connected())
+        frames_++;
+    hold(atlas, id);
+    held_part_ = part;
+    send_pending(now_ms);
+    count_second(now_ms);
+}
+
 void MapFeed::repeat(uint64_t id, int64_t now_ms)
 {
     id_ = id;
@@ -380,7 +429,7 @@ void MapFeed::send_newest()
 {
     if (!held_new_)
         client_.repeat(layer_, id_);
-    else if (!scaling_ && !elsewhere_)
+    else if (!elsewhere_ && (!scaling_ || (held_part_.set() && worker_.idle())))
         held_new_ = !client_.frame(layer_, &held_, id_);
 }
 
@@ -391,6 +440,12 @@ void MapFeed::send_pending(int64_t now_ms)
         in_worker_ = false;
         if (!scaled_.empty() && layer_)
             client_.frame(layer_, &scaled_, sid);
+    }
+    /* a VPP-made picture goes as it is, after the worker's */
+    if (held_part_.set()) {
+        if (held_new_ && sending() && worker_.idle())
+            held_new_ = !client_.frame(layer_, &held_, id_);
+        return;
     }
     if (!scaling_ || !held_new_ || elsewhere_ || in_worker_ || !sending() || now_ms < next_send_ms_ ||
         !worker_.idle())
@@ -408,6 +463,7 @@ void MapFeed::hold(std::vector<uint8_t> *atlas, uint64_t id)
     held_.swap(*atlas);
     held_new_ = true;
     elsewhere_ = in_worker_ = false;
+    held_part_ = OutputPart();
 }
 
 void MapFeed::changed(uint64_t id)
@@ -424,7 +480,7 @@ bool MapFeed::wants_picture(int64_t now_ms) const
 
 bool MapFeed::latest(std::vector<uint8_t> *out) const
 {
-    if (elsewhere_ || in_worker_)
+    if (elsewhere_ || in_worker_ || held_part_.set())
         return false;
     if (scaling_ ? held_.empty() : !held_new_)
         return layer_ && !scaling_ && client_.latest(layer_, out);
@@ -449,7 +505,10 @@ int64_t MapFeed::wake_in_ms(int64_t now_ms) const
 
 void MapFeed::keep_newest()
 {
-    if (scaling_)
+    if (held_part_.set()) {   /* the layer's last VPP-made picture, for a layer of its part */
+        if (!held_new_)
+            held_new_ = client_.latest(layer_, &held_);
+    } else if (scaling_)
         held_new_ = true;
     else if (!held_new_)
         held_new_ = client_.latest(layer_, &held_);

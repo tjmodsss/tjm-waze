@@ -4,7 +4,8 @@
 #
 #   make test                 host build + NAL, RTP, the SPS fields, the decoder
 #                             against a fake MSDK, receive queue and catch-up, stream health,
-#                             keyframe wait, the turn-box setting, the map's saved settings, the map feed
+#                             keyframe wait, the turn-box setting, the map's saved settings,
+#                             the local conf and opt-in settings, the map feed
 #                             against the shared renderer, the kit's tests, patcher,
 #                             the aapd locator on every build in AAPD_BIN and
 #                             AAPD_BINS, patchd patch/install activation/DLT/restart/driver profiles, the CarPlay
@@ -51,7 +52,7 @@ VERSION := $(shell sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' component.json)
 # The capture, decode and map feed (own files), the kit's atlas, packing and
 # geometry, and the shared renderer's client.
 WOC_SRC = src/main.cpp src/refused.cpp src/video_producer.cpp src/freeze_watch.cpp src/alt_screen.cpp src/map_feed.cpp src/map_feeds.cpp src/atlas_scale.cpp src/control.cpp src/h264_source.cpp \
-          src/guide_setting.cpp src/map_state.cpp \
+          src/guide_setting.cpp src/map_state.cpp src/local_conf.cpp \
           src/udp_source.cpp src/avb_source.cpp src/framing_probe.cpp src/rtp_h264.cpp src/sps_info.cpp \
           src/decoder_msdk.cpp src/nal_reader.cpp src/stream_health.cpp $(KIT)/map_geometry.cpp $(KIT)/yuv_atlas.cpp \
           $(KIT)/block_pack.cpp
@@ -65,7 +66,7 @@ CPP_TESTS = $(BUILD)/host/nal_reader_test $(BUILD)/host/rtp_h264_test $(BUILD)/h
 		$(BUILD)/host/alt_screen_test $(BUILD)/host/packet_queue_test \
 		$(BUILD)/host/stream_health_test $(BUILD)/host/source_crop_test \
 		$(BUILD)/host/map_rect_test $(BUILD)/host/guide_setting_test $(BUILD)/host/decoder_test \
-		$(BUILD)/host/map_state_test $(BUILD)/host/atlas_scale_test $(BUILD)/host/sps_info_test \
+		$(BUILD)/host/map_state_test $(BUILD)/host/local_conf_test $(BUILD)/host/atlas_scale_test $(BUILD)/host/sps_info_test \
 		$(BUILD)/host/picture_pace_test
 # The control socket (accept4) and the producer (pipe2) are Linux's: built and run on Linux only
 # (make test-x86).
@@ -92,6 +93,7 @@ test-node:
 	umask 077 && $(NODE) patch/test/mutation_test.js
 	umask 077 && $(NODE) patch/test/undo_test.js
 	umask 077 && $(NODE) patch/test/rollback_test.js
+	umask 077 && $(NODE) patch/test/rollback_conf_test.js
 	umask 077 && $(NODE) patch/test/patch_test.js
 	umask 077 && $(NODE) patch/test/patchd_patch_test.js
 	umask 077 && $(NODE) patch/test/patchd_activate_test.js
@@ -129,6 +131,7 @@ test-cpp: $(CPP_TESTS)
 	$(BUILD)/host/guide_setting_test
 	$(BUILD)/host/decoder_test
 	$(BUILD)/host/map_state_test
+	$(BUILD)/host/local_conf_test
 	$(BUILD)/host/atlas_scale_test
 	$(BUILD)/host/sps_info_test
 	$(if $(LINUX_TESTS),$(foreach t,$(LINUX_TESTS),$(t) &&) true,@echo 'refused_test, video_producer_test: Linux only (make test-x86)')
@@ -153,7 +156,7 @@ $(BUILD)/host/source_crop_test: test/source_crop_test.cpp src/source_crop.h
 
 # The decoder against a fake MSDK and libva.
 DEC_SRC = test/decoder_test.cpp test/fake_msdk.cpp src/decoder_msdk.cpp src/nal_reader.cpp $(KIT)/yuv_atlas.cpp $(CR)/src/log.cpp
-$(BUILD)/host/decoder_test: $(DEC_SRC) test/fake_msdk.h src/decoder_msdk.h src/source_crop.h src/nal_reader.h src/bit_reader.h \
+$(BUILD)/host/decoder_test: $(DEC_SRC) test/fake_msdk.h src/decoder_msdk.h src/source_crop.h src/map_rect.h src/nal_reader.h src/bit_reader.h \
 		$(KIT)/yuv_atlas.h
 	mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -Isrc -I$(KIT) -I$(CR)/src -Iabi/include -o $@ $(DEC_SRC) -lpthread
@@ -252,6 +255,10 @@ $(BUILD)/host/guide_setting_test: test/guide_setting_test.cpp src/guide_setting.
 $(BUILD)/host/map_state_test: test/map_state_test.cpp src/map_state.cpp src/map_state.h $(CR)/src/config.cpp $(CR)/src/log.cpp
 	mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -Isrc -I$(CR)/src -o $@ test/map_state_test.cpp src/map_state.cpp $(CR)/src/config.cpp $(CR)/src/log.cpp -lpthread
+
+$(BUILD)/host/local_conf_test: test/local_conf_test.cpp src/local_conf.cpp src/local_conf.h $(CR)/src/config.cpp $(CR)/src/log.cpp
+	mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -Isrc -I$(CR)/src -o $@ test/local_conf_test.cpp src/local_conf.cpp $(CR)/src/config.cpp $(CR)/src/log.cpp -lpthread
 
 # ---- target binary (in Docker) --------------------------------------------
 target:

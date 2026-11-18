@@ -82,6 +82,7 @@ public:
     int next = 1;
     uint64_t flushes = 0, last_tag = 0;
     size_t written = 0;            /* bytes written since the last flush */
+    uint64_t writes = 0;           /* write() calls that went */
     uint64_t flushed_bytes = 0;    /* bytes carried by flushes that went */
     int64_t *clock_us = nullptr;   /* advanced by *flush_cost_us at each flush */
     const int64_t *flush_cost_us = nullptr;
@@ -131,6 +132,7 @@ public:
             std::memcpy(&it->second.px[((size_t)(y + row) * it->second.w + x) * bpp], px + (size_t)row * w * bpp,
                         (size_t)w * bpp);
         written += (size_t)w * h * bpp;
+        writes++;
         return true;
     }
     int quad(int effect, const Rect &r) override

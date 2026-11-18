@@ -113,6 +113,7 @@ Kind fields:
 | | `dirty_threshold` | 8 | tiles differing by at most this many levels are not written (0-64) |
 | | `settle_ms` | 1000 | such a tile is written after this long anyway (0: never) |
 | | `pan_blocks` | 1 | fast motion as packed 4x4 blocks |
+| | `always_packed` | 0 | optional; 1: every write as packed 4x4 blocks, never the exact atlas. Each update is planned as an exact one (`dirty_threshold`, `settle_ms`, the tiles), and only the blocks in its tiles that changed are written, in place; the whole packed buffer goes only with the layer's first write in a scene or after a failed one, and a still picture writes nothing. Needs `pan_blocks` 1 and `vh` a multiple of 4, else it is off. A target's shared video has it only when all of its videos do. Send it only to a service whose hello has `always_packed` 1 (a service without it ignores it and writes the layer exact); a layer without it is written exact |
 | | `stall_ms` | 6000 | no frame for this long: the layer is stalled (not drawn) |
 | image | `iw`, `ih` | the rect | the image size, up to 1920x720 |
 | | `fps` | 30 | writes a second at most |
@@ -434,7 +435,7 @@ Every JSON message has `ev`.
 
 | ev | Fields | When |
 |---|---|---|
-| `hello` | `proto`, `backend` (`id7`, or `id8` on iDrive 8), `targets` (`map:1088x480,panel:1920x720,hud:800x480`; on iDrive 8 `map:874x749,hud:353x203,guide:702x213,widget:2240x896,popup:2240x896`, then any a drop-in adds, README.md "iDrive 8"), `repeat` (1: takes `repeat`) | after the client's hello |
+| `hello` | `proto`, `backend` (`id7`, or `id8` on iDrive 8), `targets` (`map:1088x480,panel:1920x720,hud:800x480`; on iDrive 8 `map:874x749,hud:353x203,guide:702x213,widget:2240x896,popup:2240x896`, then any a drop-in adds, README.md "iDrive 8"), `repeat` (1: takes `repeat`), `always_packed` (1: takes a video layer's `always_packed`; absent from older services) | after the client's hello |
 | `layer` | `ref`, `state`, `reason` | the layer's state changed |
 | `target` | `target`, `state`, `holder`, `reason`, `retry_in_ms`, `rendering`, `guide_disabled`, `disabled` | a target's state changed |
 | `budget` | `cap_kb_per_s`, `max_kb_per_s`, `floor_kb_per_s`, `reason` | the upload cap changed |

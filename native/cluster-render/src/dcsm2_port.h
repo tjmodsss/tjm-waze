@@ -31,6 +31,9 @@
  *   REMOVED meanwhile makes remap send nothing (the slot manager then
  *   releases it and asks for it in full); a refused re-map, or a REMOVED
  *   before it shows, is a refusal as for any map;
+ * - a fetch the KOMBI accepted (its E_DCSM_OK reply, or FETCHING) is
+ *   fetch_accepted until FETCHED (told on_fetched), FAILED or REMOVED;
+ * - the slot table names the stock HMI's content (slot_table);
  * - Dcsm2 going away loses every scene at once;
  * - the REMOVED that answers our own unfetch is not a loss, even when the
  *   same scene id was asked for again since (panel and HUD share one);
@@ -103,6 +106,12 @@ public:
         return it != contents_.end() && it->second.phase == Phase::Mapping ? it->second.accepted_ms : -1;
     }
     void no_answer(const TargetSpec &t, int64_t now_ms) override;
+    bool fetch_accepted(const TargetSpec &t) const override
+    {
+        auto it = contents_.find(t.scene_id);
+        return it != contents_.end() && it->second.phase == Phase::Fetching && it->second.fetch_accepted;
+    }
+    bool slot_table() const override { return true; }
     std::string status_text(int64_t now_ms) const override;
 
     /* What the KOMBI says, in the order it said it (render thread). */
@@ -134,6 +143,7 @@ private:
         Phase phase = Phase::Fetching;
         bool map_asked = false;   /* a map went out and was not refused */
         bool fetched = false;     /* FETCHED, and not removed since */
+        bool fetch_accepted = false;   /* the fetch's E_DCSM_OK reply, or FETCHING, came */
         /* The map's first E_DCSM_OK reply came then (-1: none) and no map
          * status has come: the map is asked again every kMapAgainMs
          * (remind), until a map status comes or a repeat is refused. */

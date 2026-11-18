@@ -84,6 +84,39 @@ inline bool host_crop(const MapRect &q, uint32_t fw, uint32_t fh, const MapRect 
     return true;
 }
 
+/* hosted_vpp_scale: the part of a decoded frame that the decoder's VPP makes
+ * instead of the whole frame, at dw x dh: a host's part of the map
+ * (host_crop), at the size MapFeed would scale it to on the CPU. Unset (dw
+ * 0): the whole frame, as without the setting. */
+struct OutputPart {
+    uint32_t x = 0, y = 0, w = 0, h = 0;   /* in the frame's pixels */
+    uint32_t dw = 0, dh = 0;               /* the size it is made at */
+
+    bool set() const { return dw != 0; }
+    bool operator==(const OutputPart &o) const
+    {
+        return x == o.x && y == o.y && w == o.w && h == o.h && dw == o.dw && dh == o.dh;
+    }
+    bool operator!=(const OutputPart &o) const { return !(*this == o); }
+};
+
+/* The rect of a picture that part p covers, where the picture's rect at rx,
+ * ry of rw x rh is scaled to a frame of fw x fh: grown to even edges (4:2:0)
+ * and held inside the picture's rect. */
+inline void part_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh, uint32_t fw, uint32_t fh,
+                      const OutputPart &p, uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
+{
+    const uint64_t x0 = ((uint64_t)p.x * rw / fw) & ~(uint64_t)1, y0 = ((uint64_t)p.y * rh / fh) & ~(uint64_t)1;
+    uint64_t x1 = ((((uint64_t)p.x + p.w) * rw + fw - 1) / fw + 1) & ~(uint64_t)1;
+    uint64_t y1 = ((((uint64_t)p.y + p.h) * rh + fh - 1) / fh + 1) & ~(uint64_t)1;
+    x1 = x1 < rw ? x1 : rw;
+    y1 = y1 < rh ? y1 : rh;
+    *x = rx + (uint32_t)x0;
+    *y = ry + (uint32_t)y0;
+    *w = (uint32_t)(x1 - x0);
+    *h = (uint32_t)(y1 - y0);
+}
+
 }  // namespace woc
 
 #endif

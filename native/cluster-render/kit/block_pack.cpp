@@ -318,26 +318,34 @@ void fit_block(const Block &p, uint8_t *out, bool simd)
                                kSelector[cnt[r * 4 + 3]] << 6);
 }
 
-/* Block rows by0 .. by1 - 1. */
-void pack_rows(const uint8_t *atlas, uint32_t w, uint32_t h, uint32_t by0, uint32_t by1, uint8_t *out, bool simd)
+/* Blocks bx0 .. bx1 - 1 of block rows by0 .. by1 - 1, block (bx, by) at
+ * out + ((by - by0) * stride + bx - bx0) * 8. */
+void pack_part(const uint8_t *atlas, uint32_t w, uint32_t h, uint32_t bx0, uint32_t bx1, uint32_t by0, uint32_t by1,
+               uint8_t *out, size_t stride, bool simd)
 {
     std::vector<uint8_t> planes((size_t)w * 4 * 3);   /* 4 rows of R, then of G, then of B */
     std::vector<int16_t> cu(w / 2 + 1), cv(w / 2 + 1);
     const size_t plane = (size_t)w * 4;
-    const uint32_t bw = w / 4;
     for (uint32_t by = by0; by < by1; by++) {
         for (uint32_t j = 0; j < 4; j++) {
             uint8_t *r = planes.data() + (size_t)j * w;
             rgb_row(atlas, w, h, by * 4 + j, cu.data(), cv.data(), r, r + plane, r + 2 * plane, simd);
         }
-        for (uint32_t bx = 0; bx < bw; bx++) {
+        for (uint32_t bx = bx0; bx < bx1; bx++) {
             Block p;
             for (int c = 0; c < 3; c++)
                 for (int j = 0; j < 4; j++)
                     std::memcpy(p.c[c] + 4 * j, planes.data() + c * plane + (size_t)j * w + bx * 4, 4);
-            fit_block(p, out + ((size_t)by * bw + bx) * 8, simd);
+            fit_block(p, out + ((size_t)(by - by0) * stride + (bx - bx0)) * 8, simd);
         }
     }
+}
+
+/* Block rows by0 .. by1 - 1. */
+void pack_rows(const uint8_t *atlas, uint32_t w, uint32_t h, uint32_t by0, uint32_t by1, uint8_t *out, bool simd)
+{
+    const uint32_t bw = w / 4;
+    pack_part(atlas, w, h, 0, bw, by0, by1, out + (size_t)by0 * bw * 8, bw, simd);
 }
 
 }  // namespace
@@ -374,6 +382,29 @@ void pack_blocks(const uint8_t *atlas, uint32_t w, uint32_t h, uint8_t *out, uns
         pack_rows(atlas, w, h, rows * t / n, rows, out, true);
     for (std::thread &helper : helpers)
         helper.join();
+}
+
+void pack_block_rect(const uint8_t *atlas, uint32_t w, uint32_t h, uint32_t bx0, uint32_t by0, uint32_t bx1,
+                     uint32_t by1, uint8_t *out)
+{
+    pack_part(atlas, w, h, bx0, bx1, by0, by1, out, bx1 - bx0, true);
+}
+
+bool block_differs(const uint8_t *a, const uint8_t *b, uint32_t w, uint32_t h, uint32_t bx, uint32_t by)
+{
+    for (uint32_t y = 4 * by; y < 4 * by + 4; y++)
+        if (std::memcmp(a + (size_t)y * w + 4 * bx, b + (size_t)y * w + 4 * bx, 4) != 0)
+            return true;
+    /* rgb_row's chroma: columns 2 bx to 2 bx + 2, rows 2 by - 1 to 2 by + 2,
+     * each held inside its plane */
+    const uint32_t cw = w / 2, ch = h / 2;
+    const uint32_t c0 = 2 * bx, c1 = std::min(2 * bx + 2, cw - 1), r0 = by ? 2 * by - 1 : 0, r1 = std::min(2 * by + 2, ch - 1);
+    for (uint32_t r = r0; r <= r1; r++) {
+        const size_t u = (size_t)(h + r) * w + c0, v = u + cw;
+        if (std::memcmp(a + u, b + u, c1 - c0 + 1) != 0 || std::memcmp(a + v, b + v, c1 - c0 + 1) != 0)
+            return true;
+    }
+    return false;
 }
 
 void block_rgb(const uint8_t *packed, uint32_t w, uint32_t x, uint32_t y, uint8_t rgb[3])

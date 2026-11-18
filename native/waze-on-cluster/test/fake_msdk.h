@@ -16,6 +16,8 @@
  *   "header WxH"        DecodeHeader read an SPS
  *   "init WxH"          the decoder set up for a sequence
  *   "vpp-init X,Y,W,H"  VPP set up for an input rect
+ *   "vpp-reset X,Y,W,H WxH"
+ *                       VPP reset for an input rect and an output size
  *   "decode-sync"       SyncOperation on a decode task
  *   "vpp X,Y,W,H"       VPP run on a picture with this input rect
  *   "vpp-sync"          SyncOperation on a VPP task
@@ -59,6 +61,9 @@ extern bool timestamps;
 /* The newest `refs` decoded pictures stay locked as references (0: none),
  * so the decoder hands other surfaces as work surfaces. */
 extern int refs;
+
+/* The next reset_faults VPP resets return reset_status (0: none fail). */
+extern int reset_status, reset_faults;
 
 /* An access unit of the fake stream: the SPS and PPS when sps is a size
  * ("1088x480"), then an IDR slice (idr) or a P slice whose picture is

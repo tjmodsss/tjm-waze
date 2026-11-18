@@ -78,6 +78,11 @@ public:
 
     void offer(std::vector<uint8_t> *atlas, uint64_t id, int64_t now_ms);
     void repeat(uint64_t id, int64_t now_ms);
+    /* hosted_vpp_scale: the part the cluster's feed asks the decoder for
+     * (MapFeed::part), while the HUD is off (its feed scales the whole
+     * frame); and a frame that is a part, to the cluster's feed only. */
+    OutputPart part() const { return cluster_ && !hud_ ? cluster_->part() : OutputPart(); }
+    void offer_part(std::vector<uint8_t> *atlas, uint64_t id, const OutputPart &part, int64_t now_ms);
     void set_stream(bool live, bool frozen, Picture picture);
 
     FeedStatus status(const std::string &decode, const std::string &stream = std::string()) const;

@@ -9,8 +9,6 @@
  * - the stock map taking the slot shows as starting with that reason; the
  *   contending map asks again, parks behind it, takes it over and is shown,
  *   the stock map parked behind it;
- * - a control start moves it to the whole panel, centred at 416,120, and an
- *   unknown target is refused;
  * - frames stopping: idle after stall_ms, the slot released;
  * - the renderer restarting: starting while it is gone, an error once it
  *   stays gone 15 s, then the map again with the next frames;
@@ -465,11 +463,6 @@ static void only_what_is_needed()
     r.pump(3000, &f2);
     r.drawing("map", f2, &drawn);
     ok("the renderer restarted: repeats alone bring the picture back", r.st().state == "showing" && drawn);
-
-    ok("another target", r.feed->set_target("panel"));
-    r.pump(1500, &f2);
-    r.drawing("panel", f2, &drawn);
-    ok("another target: repeats alone bring the picture", r.st().state == "showing" && r.st().target == "panel" && drawn);
 }
 
 /* The w x h part at x, y of a 1088x480 atlas, as an atlas of its own. */
@@ -1022,20 +1015,6 @@ int main()
         }
     ok("frames faster than the writes: the newest is drawn", newest && !stale);
 
-    ok("an unknown target is refused", !r.feed->set_target("cockpit"));
-    ok("a control start moves the map to the whole panel", r.feed->set_target("panel"));
-    r.pump(1200, &f3);
-    l = r.map_layer();
-    ok("centred in the 1920x720 panel at 416,120, showing",
-       l && l->target() == 1 && l->params.rect.x == 416 && l->params.rect.y == 120 && l->params.rect.w == 1088 &&
-           r.st().state == "showing" && r.st().target == "panel");
-    r.pump(1600);
-    ok("the map target, no longer wanted, is released after its linger",
-       r.port.releases >= 1 && !r.port.row(0x100, 0x010004f0));
-    r.feed->set_target("sail");
-    r.pump(1200, &f3);
-    ok("sail is the map slot", r.map_layer() && r.map_layer()->target() == 0 && r.st().state == "showing");
-
     const int releases = r.port.releases;
     r.pump(6100);
     ok("frames stop: idle after stall_ms", r.st().state == "idle");
@@ -1368,15 +1347,6 @@ int main()
                feeds.status("decode").hud_state == "showing");
     }
 
-    ok("start: the HUD alone is no cluster target", !feeds.set_target("hud") && feeds.cluster()->target() == "map");
-    ok("start: panel keeps the HUD's feed", feeds.set_target("panel") && feeds.hud_feed());
-    bpump(2500, &f2);
-    ok("on panel: the panel and the HUD both shown, each with the map",
-       layer_on(1) && layer_on(2) && shown_r8("panel", f2) && feeds.status("decode").hud_state == "showing" &&
-           b.svc->slots().status(1).state == crs::TargetState::Shown &&
-           b.svc->slots().status(2).state == crs::TargetState::Shown);
-    ok("start: back on map, the HUD's feed kept", feeds.set_target("map") && feeds.hud_feed());
-    bpump(2500, &f2);
 
     /* ---- the HUD map's size ---- */
     const crs::Layer *hl = layer_on(2);

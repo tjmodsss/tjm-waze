@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Robert Nisipeanu
 /* Every released waze-on-cluster against the settings files this version
- * leaves: with the opt-in keys (hosted_vpp_scale, always_packed) turned on,
- * waze-on-cluster.local.conf stays one each release starts with, through
- * an install or update (patchd activate), a head-unit start (patchd's
- * daemon), Undo update, Remove and removal (patchd deactivate), a reinstall,
- * an update cut short or undone, and a move cut short between its two
- * writes; a removal is refused while the local conf cannot be rewritten;
- * and every release whose code reads features.conf, where the keys live,
- * knows them.
+ * leaves. This version does not read waze-on-cluster.local.conf; earlier
+ * ones do, so it stays on the unit, one each release starts with: with the
+ * opt-in keys (hosted_vpp_scale, always_packed) turned on, and on a car whose
+ * local conf has the owner's settings, the app's map settings and the opt-in
+ * keys, through an install or update (patchd activate), a head-unit start
+ * (patchd's daemon), a downgrade (Undo update), Remove and uninstall (patchd
+ * deactivate), a reinstall, an update cut short or undone, and a move cut
+ * short between its two writes; a removal is refused while the local conf
+ * cannot be rewritten; a unit without a local conf is left without one; and
+ * every release whose code reads features.conf, where the keys live, knows
+ * them.
  *
  * A release loads its shipped waze-on-cluster.conf first and refuses to
  * start with a key it does not know, so a key that file sets is one the
@@ -53,7 +56,8 @@ if (!list.length) {
     list = tags() || [];
 }
 var RELEASES = list.map(function (t) { return t.slice('waze-on-cluster@'.length); }).filter(function (v) { return /^\d+\.\d+\.\d+$/.test(v); }).sort(cmp);
-ok('every release from 0.5.0 to 0.10.7 is at hand', RELEASES.indexOf('0.5.0') >= 0 && RELEASES.indexOf('0.10.7') >= 0, RELEASES.join(' '));
+ok('every release from 0.5.0 to 0.10.9 is at hand', ['0.5.0', '0.10.7', '0.10.8', '0.10.9'].every(function (v) { return RELEASES.indexOf(v) >= 0; }),
+    RELEASES.join(' '));
 if (!RELEASES.length) process.exit(1);
 
 /* A conf's lines as Config::load reads them: [key, value] or [null, line]
@@ -117,6 +121,7 @@ process.on('exit', function () {
     try { cp.execFileSync('rm', ['-rf', dir]); } catch (e) {}
 });
 var STATE = path.join(dir, 'state'), LOCAL = path.join(STATE, 'waze-on-cluster.local.conf'), FEATURES = path.join(STATE, 'features.conf');
+var MAP_STATE = path.join(STATE, 'map.state.conf');
 var SOCK = path.join(dir, 'shm', 'patch.sock');
 fs.mkdirSync(STATE);
 var ENV = Object.assign({}, process.env, {
@@ -247,6 +252,39 @@ var ON = 'hosted_vpp_scale = 1\nalways_packed = 1\n';
     out = hook('activate');
     check('the move cut short between its writes', USER, null, out);
     fs.rmdirSync(FEATURES + '.tmp');
+
+    /* 5. A car with a local conf: the owner's settings (a target, a frame
+     * rate), the app's map settings and an opt-in key, which releases up to
+     * 0.8.8 and 0.10.7 refuse. The first install moves those two into their
+     * files; the owner's lines stay in the local conf, which every release
+     * starts with, through every step after. */
+    var OWN = '# mine\ntarget = panel\ntarget_fps = 20\n';
+    var CAR_LOCAL = OWN + 'cluster = 0\nhud_width_pct = 50\nhosted_vpp_scale = 1\n';
+    var CAR_MAP = 'cluster = 0\nhud_width_pct = 50\n', CAR_FEAT = 'hosted_vpp_scale = 1\n';
+    ok('every release starts with the owner\'s settings', refusing(OWN).length === 0, refusing(OWN).join(' '));
+    ok('releases refuse the car\'s local conf as it was', refusing(CAR_LOCAL).length > 0);
+    var life = [['an update to this version', 'activate'], ['a head-unit start', 'boot'], ['a downgrade', 'deactivate'],
+        ['an update to this version again', 'activate'], ['a head-unit start', 'boot'], ['Remove', 'deactivate'],
+        ['a reinstall', 'activate'], ['a head-unit start', 'boot'], ['uninstall', 'deactivate'], ['a reinstall', 'activate']];
+    async function step(which) { return which === 'boot' ? boot() : hook(which); }
+    set(CAR_LOCAL, null);
+    try { fs.unlinkSync(MAP_STATE); } catch (e) {}
+    for (i = 0; i < life.length; i++) {
+        out = await step(life[i][1]);
+        var map = read(MAP_STATE);
+        check('a car with a local conf, ' + life[i][0], OWN, CAR_FEAT, out);
+        ok('a car with a local conf, ' + life[i][0] + ': the app\'s map settings in map.state.conf', map === CAR_MAP,
+            JSON.stringify(map));
+    }
+
+    /* 6. No local conf (every Store install): none made, nor any other
+     * settings file, through every step. */
+    [LOCAL, FEATURES, MAP_STATE].forEach(function (f) { try { fs.unlinkSync(f); } catch (e) {} });
+    for (i = 0; i < life.length; i++) {
+        out = await step(life[i][1]);
+        ok('no local conf, ' + life[i][0] + ': none made, no settings file', read(LOCAL) === null && read(FEATURES) === null &&
+            read(MAP_STATE) === null, out.slice(-300));
+    }
 
     process.stdout.write(fails ? ('\n' + fails + ' check(s) failed\n') : '\nall checks passed\n');
     process.exit(fails ? 1 : 0);

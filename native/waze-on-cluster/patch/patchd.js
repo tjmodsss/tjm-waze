@@ -234,7 +234,9 @@ var REBOOT_CMD = (process.env.WOC_REBOOT_CMD || '/usr/bin/nsm_control --requestR
 var REBOOT_CMD_TIMEOUT_MS = 30000;
 /* A restart NSM took that has not taken the unit down by then failed. */
 var REBOOT_WAIT_MS = parseInt(process.env.WOC_REBOOT_WAIT_MS, 10) || 180000;
-/* The unit's own render settings, which updates keep. */
+/* The local conf waze-on-cluster up to 0.10.9 reads over its configuration;
+ * later versions do not read it. It stays on the unit for a downgrade, kept
+ * one every release starts with (moveMapSettings, moveFeatures). */
 var LOCAL_CONF = process.env.WOC_LOCAL_CONF || '/var/opt/waze-on-cluster/waze-on-cluster.local.conf';
 /* Where the map shows and the HUD map's size, place and whether it stays
  * shown over BMW's pop-ups, as the app chose them: the render reads this file (its map_state_file) over its
@@ -244,7 +246,7 @@ var MAP_STATE = path.join(STATE_DIR, 'map.state.conf');
 var MAP_KEYS = ['cluster', 'hud', 'hud_width_pct', 'hud_offset_x', 'hud_offset_y', 'hud_keep_shown'];
 /* The opt-in settings: the render reads this file (its features_file) over
  * its configuration. Not in LOCAL_CONF, which every release up to 0.10.7
- * refuses to start with any of FEATURE_KEYS in; no release before this one
+ * refuses to start with any of FEATURE_KEYS in; no release before 0.10.9
  * reads FEATURES. */
 var FEATURES = path.join(STATE_DIR, 'features.conf');
 var FEATURE_KEYS = ['hosted_vpp_scale', 'always_packed'];
@@ -1622,8 +1624,8 @@ function aaRevert(noRestart, dropBackup, done) {
 function saveFile(f, text) {
     try { fs.mkdirSync(STATE_DIR, 0o755); } catch (e) { if (e.code !== 'EEXIST') throw e; }
     var fd = fs.openSync(f + '.tmp', 'w', 0o644);
-    /* The capture (hmi_5000) reads waze-on-cluster.local.conf and the map
-     * settings, whatever umask the caller (an install hook) has. */
+    /* The render (hmi_5000) reads the map settings, and an earlier version
+     * the local conf, whatever umask the caller (an install hook) has. */
     try { fs.fchmodSync(fd, 0o644); fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(f + '.tmp', f);
 }

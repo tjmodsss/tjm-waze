@@ -110,9 +110,6 @@ unless **Keep HUD map over BMW's pop-ups** is ticked. **Own settings for
 this driver** gives the driver profile in use its own copy of these
 settings.
 
-From a shell, `waze-on-cluster -c <conf> run map|panel` sets the cluster
-target until the service restarts and prints the status.
-
 **Inside another app's scene.** An app that shows a scene file on a target
 with `layers` 1 can host the map there (cluster-render PROTOCOL.md
 "Hosting another target"): the map is then drawn only in the rect it
@@ -122,12 +119,16 @@ hosted_vpp_scale and always_packed" below).
 
 ### Settings
 
-Settings are in `waze-on-cluster.conf` (documented inline). Overrides go in
-`/var/opt/waze-on-cluster/waze-on-cluster.local.conf`, which updates keep;
-the app's map settings are in `/var/opt/waze-on-cluster/map.state.conf`, and
-the opt-in settings in `/var/opt/waze-on-cluster/features.conf`. A key the
-local conf has that this version does not know is left out with a warning
-in the log.
+Settings are in `waze-on-cluster.conf` (documented inline), which each
+install writes anew. Besides it and the command line (the Android Auto
+crop, PATCH.md), the service reads only the app's saved choices
+(`/var/opt/waze-on-cluster/map.state.conf` and the turn-box setting) and
+the opt-in settings in `/var/opt/waze-on-cluster/features.conf`. On the
+cluster the map goes on its map slot, or into a hosting app's scene.
+
+`/var/opt/waze-on-cluster/waze-on-cluster.local.conf`, which versions up to
+0.10.9 read, is not read; it stays on the unit for a downgrade, and the log
+names it at each start.
 
 ### Map size and upload
 
@@ -140,7 +141,7 @@ The map covers the cluster's central map area, 1088x480 on the 1920x720
 panel. The patch advertises exactly that, so `tex_size` must equal it.
 `src_crop` takes part of a picture of one size and scales it to `tex_size`
 (Android Auto's 1280x720 stream has its map in the top 1280x564).
-`map_rect` draws the map stretched into a rect of the current target.
+`map_rect` draws the map stretched into a rect of the map slot.
 `target_fps` (30) caps the frame rate; `picture_fps` (0: every frame) makes
 at most that many pictures a second, which saves CPU when the phone sends
 more than the cluster takes (set it to `target_fps` then).
@@ -172,8 +173,8 @@ They take effect when waze-on-cluster next starts (the next head-unit
 start). A restart of the service applies them at once, but the map stays
 blank until the phone connects again.
 
-Not in `waze-on-cluster.local.conf`: there they are left out, and patchd
-moves them to `features.conf`.
+patchd moves any it finds in `waze-on-cluster.local.conf` to
+`features.conf`, so a downgrade never meets them there.
 
 **What they need.**
 - Both: a waze-on-cluster whose `waze-on-cluster.conf` has the key. An older

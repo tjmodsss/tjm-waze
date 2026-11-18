@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Robert Nisipeanu
-/* The control socket: newline-delimited JSON between its owner (the app, or
- * `waze-on-cluster run`) and the tool (README.md "Using it").
+/* The control socket: newline-delimited JSON between its owner (the app)
+ * and the tool (README.md "Using it").
  *
- *   owner -> tool  {"cmd":"start","target":"sail"|"map"|"panel"}
- *                  {"cmd":"cluster","on":"0"|"1"}  the map on the cluster off or on
+ *   owner -> tool  {"cmd":"cluster","on":"0"|"1"}  the map on the cluster off or on
  *                  {"cmd":"hud","on":"0"|"1"}  the map on the HUD off or on
  *                  {"cmd":"hud","hud_width_pct":"0"|"20".."100"}  the HUD map's size
  *                  {"cmd":"hud","hud_x":"-800".."800","hud_y":...}  where it is, from the centre

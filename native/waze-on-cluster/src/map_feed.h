@@ -5,8 +5,8 @@
  *
  * One video layer, class content and contending with the stock map, on the
  * target the map goes to: `map` (the native central-map slot 0x100, whose
- * 1088x480 scene the map fills) unless a control start chose another; on a
- * whole-panel or HUD target it is the centred map area (map_geometry.h).
+ * 1088x480 scene the map fills) for the cluster, `hud` for the HUD, where
+ * it is the centred map area (map_geometry.h).
  * The renderer draws every frame the way waze-on-cluster always has (one
  * persistent R8 atlas written in changed tiles, packed fast motion, the
  * frame clock, newest frame only) within the budget all its clients share,
@@ -24,10 +24,10 @@
  * held, and goes with the next frame or repeat; when the layer shows again
  * it goes (or a repeat of the last one sent) before the layer is made
  * visible, so the renderer never draws an older picture first. A new
- * layer (another target) starts from a copy of the old one's newest. A
- * layer that scales (the HUD's) keeps the newest picture whole, scales it
- * once, at most video.fps a second, and sends a repeat as a repeat of its
- * last scaled frame.
+ * layer (a host taking or dropping the map, a new size) starts from a copy
+ * of the old one's newest. A layer that scales (the HUD's) keeps the
+ * newest picture whole, scales it once, at most video.fps a second, and
+ * sends a repeat as a repeat of its last scaled frame.
  *
  * The app's status line follows the stream, the layer and its target: idle
  * until the first frame or while the stream is not live, idle with kWaiting
@@ -164,10 +164,6 @@ public:
 
     explicit MapFeed(const FeedConfig &cfg);
 
-    /* Where the map goes from now on: a renderer target, or "sail" for the
-     * native central-map slot. False for a name the renderer has not got
-     * (known once connected). */
-    bool set_target(const std::string &name);
     /* The layer's guide_hold from now on. */
     void set_guide_hold(bool hold);
     const std::string &target() const { return cfg_.target; }

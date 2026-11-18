@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Robert Nisipeanu
-#include "local_conf.h"
+#include "opt_in.h"
 
 #include <unistd.h>
 
@@ -38,31 +38,6 @@ std::string key_of(const std::string &line)
 }
 
 }  // namespace
-
-void load_local_conf(cld::Config *cfg, const std::string &path, std::vector<std::string> *warnings)
-{
-    if (path.empty() || access(path.c_str(), F_OK) != 0)
-        return;
-    std::ifstream f(path);
-    if (!f) {
-        warnings->push_back(path + ": cannot read it: the shipped settings instead");
-        return;
-    }
-    std::string line, err;
-    for (int n = 1; std::getline(f, line); n++) {
-        const size_t hash = line.find('#');
-        if (hash != std::string::npos)
-            line.erase(hash);
-        line = trim(line);
-        if (line.empty())
-            continue;
-        const std::string where = path + ":" + std::to_string(n) + ": ";
-        if (feature_key(key_of(line)))
-            warnings->push_back(where + key_of(line) + " is left out: it goes in features_file (patchd moves it there)");
-        else if (!cfg->set_pair(line, &err))
-            warnings->push_back(where + err + ": left out");
-    }
-}
 
 void load_features(cld::Config *cfg, const std::string &path)
 {

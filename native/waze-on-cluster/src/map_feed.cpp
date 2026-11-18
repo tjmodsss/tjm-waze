@@ -317,28 +317,6 @@ void MapFeed::set_hud_width(unsigned pct)
     make_layer();
 }
 
-bool MapFeed::set_target(const std::string &name)
-{
-    const std::string t = name == "sail" ? "map" : name;
-    uint32_t w, h;
-    if (client_.connected() && !target_size(client_.targets, t, &w, &h))
-        return false;
-    if (t == cfg_.target && layer_)
-        return true;
-    if (layer_) {
-        keep_newest();
-        client_.drop(layer_);
-    }
-    layer_ = 0;
-    cfg_.target = t;
-    auto host = client_.hosts.find(t);
-    host_ = host == client_.hosts.end() ? cr::Host() : host->second;
-    part_ = OutputPart();   /* the next layer's, if any */
-    if (client_.connected())
-        make_layer();
-    return true;
-}
-
 void MapFeed::set_guide_hold(bool hold)
 {
     cfg_.guide_hold = hold;

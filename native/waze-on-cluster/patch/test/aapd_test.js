@@ -464,7 +464,7 @@ function patchdUnit(opts) {
     fs.writeFileSync(path.join(d, 'bin', 'systemctl'), '#!' + process.execPath + '\n' + [
         "var fs = require('fs'), a = process.argv.slice(2), u = JSON.parse(fs.readFileSync(" + JSON.stringify(t.unitState) + ", 'utf8'));",
         "fs.appendFileSync(" + JSON.stringify(t.calls) + ", 'systemctl ' + a.join(' ') + '\\n');",
-        "if (a[0] === 'show') process.stdout.write('MainPID=' + u.pid + '\\nInvocationID=run-' + u.pid + '\\nExecMainStartTimestampMonotonic=1\\nActiveState=active\\nDropInPaths=\\n');",
+        "if (a[0] === 'show') process.stdout.write('MainPID=' + u.pid + '\\nInvocationID=run-' + u.pid + '\\nExecMainStartTimestampMonotonic=1\\nActiveState=active\\nDropInPaths=\\nEnvironment=\\nUser=cia_13002\\n');",
         "else if (a[0] === 'is-active') process.stdout.write('active\\n');",
     ].join('\n') + '\n');
     fs.chmodSync(path.join(d, 'bin', 'systemctl'), 0o755);
@@ -478,7 +478,12 @@ function patchdUnit(opts) {
     fs.utimesSync(t.recmgr, boot - 3600, boot - 3600);
     fs.writeFileSync(path.join(d, 'stat'), 'btime ' + boot + '\n');
     t.shm = path.join(d, 'shm');
+    /* carplay's patch in memory: the preload library it names, carplay's
+     * user, and this boot's arming. */
+    fs.writeFileSync(path.join(d, 'libwocpatch.so'), 'a stand-in for libwocpatch.so\n');
+    fs.writeFileSync(path.join(d, 'passwd'), 'root:x:0:0::/:/bin/sh\ncia_13002:x:13002:13002::/:/bin/false\n');
     t.env = Object.assign({}, process.env, {
+        WOC_PRELOAD_LIB: path.join(d, 'libwocpatch.so'), WOC_PASSWD: path.join(d, 'passwd'), WOC_PRELOAD_DIR: path.join(d, 'run'),
         PATH: path.join(d, 'bin') + path.delimiter + process.env.PATH,
         WOC_PATCH_SOCK: path.join(t.shm, 'patch.sock'), WOC_CARPLAY: t.carplay, WOC_AAPD: t.bin, WOC_AAPD_CONF: t.conf, WOC_CODING: t.coding,
         WOC_DF: t.df, WOC_MOUNT: mount, WOC_PROC_MOUNTS: t.mounts, WOC_PROC: path.join(d, 'proc'), WOC_RECMGR_CONF: t.recmgr,
@@ -504,17 +509,19 @@ function ro(t) { return /\bro\b/.test(fs.readFileSync(t.mounts, 'utf8')); }
     var r = hook(t, 'activate');
     ok('activate: Android Auto written, pending its own marker, / read-only', r.code === 0 && /Android Auto patch written/.test(r.result.aa && r.result.aa.status) &&
         marker(t, 'aa-pending').action === 'apply' && /next head-unit start/.test(r.result.reboot || '') && ro(t), r.out);
-    ok('activate: CarPlay ' + (HAVE_CP ? 'written alongside' : 'refused on its own (not a carplay build)'),
-        HAVE_CP ? /map patch written/.test(r.result.status) && marker(t, 'activation-pending').action === 'apply' : /not patchable/.test(r.result.conflict || ''), JSON.stringify(r.result));
-    ok('activate: no systemctl, kill or reboot even with recmgr\'s entries loaded', calls(t).length === 0, calls(t).join('; '));
+    ok('activate: CarPlay ' + (HAVE_CP ? 'armed in memory alongside, its file as it ships' : 'refused on its own (not a carplay build)'),
+        HAVE_CP ? /map patch armed in memory/.test(r.result.status) && marker(t, 'activation-pending').action === 'apply' && sha(t.carplay) === sha(CARPLAY)
+            : /not patchable/.test(r.result.conflict || ''), JSON.stringify(r.result));
+    ok('activate: no systemctl but its reads, no kill or reboot, even with recmgr\'s entries loaded', calls(t).every(function (l) { return /^systemctl show /.test(l); }),
+        calls(t).join('; '));
     r = hook(t, 'activate');
     ok('activate again: Android Auto left pending, nothing rewritten', r.code === 0 && /already waits/.test(r.result.aa.status), JSON.stringify(r.result));
     r = hook(t, 'deactivate');
     ok('deactivate: aapd and aapd.conf restored byte-exact, backups dropped', r.code === 0 && sha(t.bin) === sha(SRC) && sha(t.conf) === sha(SRCCONF) &&
         !fs.existsSync(t.bin + '.woc-orig') && !fs.existsSync(t.conf + '.woc-orig') && ro(t), r.out);
-    if (HAVE_CP) ok('deactivate: carplay restored byte-exact too', sha(t.carplay) === sha(CARPLAY));
+    if (HAVE_CP) ok('deactivate: carplay as it ships, its plan gone', sha(t.carplay) === sha(CARPLAY) && !fs.existsSync(path.join(t.d, 'var', 'inmem-carplay.json')));
 
-    /* Not supported, untested, absent: CarPlay is patched as ever, except
+    /* Not supported, untested, absent: CarPlay is patched in memory as ever, except
      * on a car not coded 7, where CarPlay's patch is left too, with the
      * same conflict. */
     [['coding 9', function (u) { fs.writeFileSync(u.coding, coding(9)); }, /not supported on this car \(KI_KOMBI_VARIANT 9\)/],
@@ -537,7 +544,7 @@ function ro(t) { return /\bro\b/.test(fs.readFileSync(t.mounts, 'utf8')); }
             (before === null || sha(u.bin) === before) && sha(u.conf) === confBefore && !marker(u, 'aa-pending'), x.out);
         if (HAVE_CP && c[0] === 'coding 9') ok('activate with ' + c[0] + ': CarPlay left as it is, the same conflict', x.result.conflict === 'not supported on this car (KI_KOMBI_VARIANT 9)' &&
             sha(u.carplay) === sha(CARPLAY) && !marker(u, 'activation-pending'), JSON.stringify(x.result));
-        else if (HAVE_CP) ok('activate with ' + c[0] + ': CarPlay patched as ever', /map patch written/.test(x.result.status) && sha(u.carplay) !== sha(CARPLAY), JSON.stringify(x.result));
+        else if (HAVE_CP) ok('activate with ' + c[0] + ': CarPlay patched as ever, in memory', /map patch armed in memory/.test(x.result.status) && sha(u.carplay) === sha(CARPLAY), JSON.stringify(x.result));
     });
 
     /* A running aapd keeps its file linked and is handed over at removal. */
@@ -1363,7 +1370,8 @@ async function recoveryTests() {
     if (HAVE_CP) {
         var both = patchdUnit();
         patcher(both, ['apply', '--yes']);
-        var cpr = cp.spawnSync(process.execPath, [path.join(PATCH, 'carplay_patch.js'), 'apply', '--panel', 'high', '--target', both.carplay, '--yes'], { encoding: 'utf8' });
+        /* carplay as an earlier release patched its file: put back at its boot step. */
+        var cpr = cp.spawnSync(process.execPath, [require('./earlier_patcher.js').script(), 'apply', '--panel', 'high', '--target', both.carplay, '--yes'], { encoding: 'utf8' });
         fs.writeFileSync(both.env.WOC_MOUNT, '#!/bin/sh\nsleep 1\ncase "$*" in *rw*) echo "/dev/root / ext4 rw 0 0" > "' + both.mounts + '";; *) echo "/dev/root / ext4 ro 0 0" > "' + both.mounts + '";; esac\n');
         var bv = path.join(both.d, 'var');
         fs.writeFileSync(path.join(bv, 'boot-recovery.json'), JSON.stringify({ fails: 2, unknown: 0, arm: null }));
@@ -1389,11 +1397,15 @@ async function recoveryTests() {
     [[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 1]].forEach(function (c) {
         var x = patchdUnit();
         var vs = path.join(x.d, 'var');
-        fs.writeFileSync(x.carplay + '.woc-orig', 'x');
+        /* carplay's patch in memory (inmem.js): a plan and its record for the file as it is. */
+        var plan = 'wocplan test\n', cst0 = fs.statSync(x.carplay);
+        fs.writeFileSync(path.join(vs, 'inmem-carplay.plan'), plan);
+        fs.writeFileSync(path.join(vs, 'inmem-carplay.json'), JSON.stringify({ v: 1, enabled: true, target: x.carplay, ino: cst0.ino, size: cst0.size,
+            mtime: cst0.mtime.getTime(), sha256: sha(x.carplay), planSha256: crypto.createHash('sha256').update(plan).digest('hex'), proven: true, trial: false }) + '\n');
         fs.writeFileSync(path.join(vs, 'boot-recovery.json'), JSON.stringify({ fails: 0, unknown: c[3], arm: { boot: 'old', crashes: 0 } }));
         fs.writeFileSync(path.join(vs, 'aa-boot-recovery.json'), JSON.stringify({ fails: 0, unknown: 0, prev: null, arm: { boot: 'old', crashes: c[0] } }));
         fs.writeFileSync(path.join(x.d, 'bootid'), 'new\n');
-        var e = Object.assign({}, x.env, { WOC_RECOVERY_STATE: path.join(vs, 'boot-recovery.json'), WOC_BOOT_ID: path.join(x.d, 'bootid') });
+        var e = Object.assign({}, x.env, { WOC_RECOVERY_STATE: path.join(vs, 'boot-recovery.json'), WOC_BOOT_ID: path.join(x.d, 'bootid'), WOC_PRELOAD_DIR: path.join(x.d, 'run') });
         cp.spawnSync(process.execPath, [path.join(PATCH, 'recovery.js'), 'boot', 'carplay'], { env: e, encoding: 'utf8', timeout: 30000 });
         var cst = JSON.parse(fs.readFileSync(path.join(vs, 'boot-recovery.json'), 'utf8'));
         ok(c[0] ? 'an unrecorded end after aapd crashed in that boot is not carplay\'s failure'

@@ -8,7 +8,9 @@
 #
 # It writes woc-logs-<UTC date and time>.tar.gz into the folder (/tmp by
 # default) and prints its path: both tools' log files (with their .1), the
-# journal lines the journal service keeps (journal.log and its rotations),
+# journal lines the journal service keeps (in RAM: journal.log and its
+# rotations; on /var/opt: the journal-*.log written around failures and at
+# shutdowns),
 # the renderer's and the capture's status files, this boot's journal of the
 # tools and of carplay (what the journal still holds), the list of boots,
 # the carplay patch probe (where its edit sites are in this carplay), the
@@ -76,7 +78,7 @@ for tool in cluster-render waze-on-cluster; do
     done
     copy "$ROOT/var/opt/$tool/$tool.local.conf" "$tool.local.conf"
 done
-for f in "$ROOT"/var/opt/waze-on-cluster/journal/journal.log*; do
+for f in "$ROOT"/run/waze-on-cluster-journal/journal.log* "$ROOT"/var/opt/waze-on-cluster/journal/journal-*.log; do
     copy "$f" "kept-${f##*/}"
 done
 copy "$ROOT/var/opt/waze-on-cluster/boot-recovery.json" boot-recovery.json
@@ -120,7 +122,8 @@ if [ -f "$HERE/logs_extra.js" ]; then
     "$NODE" "$HERE/logs_extra.js" patchd "$DIR" > /dev/null 2>&1
 fi
 
-ls -l /var/opt/cluster-render /var/opt/waze-on-cluster /var/opt/waze-on-cluster/journal /var/opt/waze-on-cluster/saved > "$DIR/ls.txt" 2>&1
+ls -l /var/opt/cluster-render /var/opt/waze-on-cluster /var/opt/waze-on-cluster/journal /var/opt/waze-on-cluster/saved \
+    /run/waze-on-cluster-journal > "$DIR/ls.txt" 2>&1
 
 # The kernel's lines for the P2P interfaces: the journal's (the logs
 # service's group reads it), else dmesg's.

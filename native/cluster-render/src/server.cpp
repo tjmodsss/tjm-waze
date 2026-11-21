@@ -605,7 +605,8 @@ void Server::on_json(Client &c, const std::string &body, int64_t now_ms)
                                  {"backend", cr::json_quote(backend_)},
                                  {"targets", cr::json_quote(targets)},
                                  {"repeat", "1"},
-                                 {"always_packed", "1"}}));
+                                 {"always_packed", "1"},
+                                 {"host_edge", "1"}}));
         c.target_sent.clear();
         c.host_sent.clear();
         c.host_gen = 0;
@@ -833,10 +834,25 @@ void Server::op_host(Client &c, uint32_t ref, const cr::Json &j)
         refuse("src_x, src_y, src_w, src_h go together (none: all of " + from.name + ")");
         return;
     }
+    /* the optional edge drawn on the hosted picture (PROTOCOL.md "host") */
+    static const char *const edge_keys[] = {"edge_top", "edge_bottom", "edge_fade", "edge_dim", "edge_blur"};
+    static const double edge_max[] = {720, 720, 360, 4096, 32};
+    double ev[5] = {0, 0, 0, 0, 0};
+    for (size_t i = 0; i < 5; i++)
+        if (!num(j, edge_keys[i], 0, edge_max[i], &ev[i], &err)) {
+            comp_->unhost(c.id, scene, hosted);
+            refuse(err);
+            return;
+        }
     Host h;
     h.rect = Rect{(int32_t)v[0], (int32_t)v[1], (uint32_t)v[2], (uint32_t)v[3]};
     h.src = Rect{(int32_t)v[4], (int32_t)v[5], (uint32_t)v[6], (uint32_t)v[7]};
     h.shown = v[8] != 0;
+    h.edge.top = (uint32_t)ev[0];
+    h.edge.bottom = (uint32_t)ev[1];
+    h.edge.fade = (uint32_t)ev[2];
+    h.edge.dim = (uint32_t)ev[3];
+    h.edge.blur = (uint32_t)ev[4];
     if (!comp_->host(c.id, scene, hosted, h, &err)) {
         refuse(err);
         return;

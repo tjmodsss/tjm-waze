@@ -1319,6 +1319,39 @@ static void layers_and_hosting()
     r.pump(100);
     ok("edits flush with the layers", gauge_edited_turn(r.gpu.file("panel"), 45));
 
+    /* The host's edge: two quads over the producer's video draw its rows 2
+     * in from its top and bottom on past its rect, held within the panel
+     * (160 below it), the picture fading into them; out of range refused;
+     * without it, none. */
+    cr::Host eh = h;
+    eh.edge_top = 50;
+    eh.edge_bottom = 400;
+    eh.edge_fade = 36;
+    eh.edge_dim = 160;
+    eh.edge_blur = 9;
+    a.host(sc, eh);
+    r.pump(100);
+    g = r.gpu.graph("panel");
+    std::vector<FakeQuad> edges;
+    for (int q : g->visible())
+        if (g->shown.quads.at(q).uniforms.count("u_edge"))
+            edges.push_back(g->shown.quads.at(q));
+    ok("an edge: two quads over the video, 50 up and 160 down (the panel's end), the picture fading into them over 36",
+       g->visible().size() == 4 && edges.size() == 2 && edges[0].r.x == 700 && edges[0].r.w == 560 && edges[0].r.y == 110 &&
+           edges[0].r.h == 86 && edges[1].r.y == 524 && edges[1].r.h == 196 &&
+           edges[0].uniforms["u_edge"] == std::vector<float>({2.5f, 50, -36, 36}) &&
+           edges[1].uniforms["u_edge"] == std::vector<float>({397.5f, -36, 160, 36}) &&
+           edges[0].uniforms["u_look"] == std::vector<float>({160, 9}) && edges[0].uniforms["u_opacity"][0] > 0 &&
+           eb.layer[video] == "shown" && has(r.svc->server().status_text(r.now), "its edge 50 up and 400 down"));
+    cr::Host blurry = eh;
+    blurry.edge_blur = 33;
+    a.host(sc, blurry);
+    r.pump(100);
+    ok("an edge out of range refused", has(ea.errors, "host: edge_blur must be a number from 0 to 32"));
+    a.host(sc, h);
+    r.pump(100);
+    ok("hosted again without an edge: no edge quads", b.hosts.count("map") && g->visible().size() == 2);
+
     /* The video's write refused: it holds the target (a half-written
      * buffer); the file's edits flush all the same. */
     g->write_budget = 0;

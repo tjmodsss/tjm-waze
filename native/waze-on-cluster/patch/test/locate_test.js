@@ -5,16 +5,16 @@
  * (synthetic_carplay.js): every site found where the build put it, also with
  * other offsets, addresses and code order, and in its patched state; a
  * signature found twice refused as ambiguous; a damaged site, a broken
- * cross-check or a relocation over an edit refused with the reason; apply
- * (only with --unproven), verify, probe and revert on a build outside the
- * proven list, byte-exact; a file with carplay 21.27.4's build-id but not its
- * shipped bytes proven yet refused; the map URL sites found by structure,
- * patched with either URL, partly patched, and each of their checks broken
- * refused while the other edits apply; a patch with the URL with ETA updated
- * and reverted; the ShowUI URL sites found by structure, stock, patched,
- * one written, cut short inside either site, each of their checks broken
- * refused while the other edits apply, a build that adds carplay.conf's
- * options itself left alone; carplay 22.28.3's stock bytes of both edits
+ * cross-check or a relocation over an edit refused with the reason; verify,
+ * probe and revert of an earlier release's patch (earlier_patcher.js) on a
+ * build outside the proven list, byte-exact; a file with carplay 21.27.4's
+ * build-id but not its shipped bytes read as proven; the map URL sites found
+ * by structure, patched with either URL, partly patched, and each of their
+ * checks broken with the other edits patched; a patch with the URL with ETA
+ * reverted; the ShowUI URL sites found by structure, stock, patched, one
+ * written, cut short inside either site, each of their checks broken with
+ * the other edits patched, a build that adds carplay.conf's options itself
+ * left alone; carplay 22.28.3's stock bytes of both edits
  * checked against the code they encode. With CARPLAY_BIN, the reference
  * build's sites are the documented offsets; with CARPLAY_BINS (paths
  * separated by `:`), every other build is located or refused as recorded
@@ -32,6 +32,7 @@ var path = require('path');
 var cp = require('child_process');
 var locator = require('../carplay_locate.js');
 var synthetic = require('./synthetic_carplay.js');
+var earlier = require('./earlier_patcher.js');
 
 var SCRIPT = path.join(__dirname, '..', 'carplay_patch.js');
 
@@ -40,8 +41,9 @@ function ok(name, cond, detail) {
     process.stdout.write((cond ? 'ok   ' : 'FAIL ') + name + (detail !== undefined && !cond ? '  — ' + detail : '') + '\n');
     if (!cond) fails++;
 }
+/* `apply`: an earlier release's patch of the file (this version has none). */
 function run(args) {
-    var r = cp.spawnSync(process.execPath, [SCRIPT].concat(args), { encoding: 'utf8' });
+    var r = cp.spawnSync(process.execPath, [earlier.scriptFor(args, SCRIPT)].concat(args), { encoding: 'utf8' });
     return { code: r.status, out: (r.stdout || '') + (r.stderr || '') };
 }
 function json(x) { return JSON.stringify(x); }
@@ -298,14 +300,10 @@ try {
         r.out.indexOf('immediates ' + [at.mm, at.px, at.safe1, at.safe2].map(hx).join(' ')) >= 0 &&
         r.out.indexOf('build-id:  ' + at.buildId) >= 0, r.out);
 
-    r = run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
-    ok('apply without --unproven: refused, no write, no backup', r.code !== 0 && /is not a proven build; pass --unproven/.test(r.out) &&
-        fs.readFileSync(tgt).equals(orig) && !fs.existsSync(tgt + '.woc-orig'), r.out);
     r = run(['apply', '--target', tgt, '--panel', 'high', '--sink', 'udp://127.0.0.1:20557?mime_type=video/H264', '--unproven', '--yes']);
     var b = fs.readFileSync(tgt), want = Buffer.from(orig);
     writeMapUrl(want, at); writeShowUi(want, at);
-    ok('apply high: every edit written', r.code === 0 && /patched OK/.test(r.out) && /map URL -> maps:\/car\/instrumentcluster\/map$/m.test(r.out) &&
-        /ShowUI URL -> maps:\/car\/instrumentcluster\?showETA=yes$/m.test(r.out) &&
+    ok('an earlier release\'s patch, high: every edit written where the locator finds its site', r.code === 0 &&
         b.readUInt32LE(at.slot) === at.high && b.toString('hex', at.call, at.call + 5) === at.callPatched && b.toString('latin1', at.sink, at.sink + 9) === 'udp://127' &&
         b.readUInt32LE(at.mm) === 138 && b.readUInt32LE(at.px) === 1088 &&
         b.slice(at.spare, at.spare + 55).equals(want.slice(at.spare, at.spare + 55)) && b.slice(at.urlLea, at.urlLea + 7).equals(want.slice(at.urlLea, at.urlLea + 7)) &&
@@ -313,19 +311,13 @@ try {
     r = run(['status', '--target', tgt]);
     ok('status: the map URL and the ShowUI URL PATCHED', /^mapurl:\s+PATCHED \(the phone streams the cluster map from connect: maps:\/car\/instrumentcluster\/map\)$/m.test(r.out) &&
         /^showui:\s+PATCHED \(ShowUI asks the phone for maps:\/car\/instrumentcluster\?showETA=yes, with the arrival-time card\)$/m.test(r.out), r.out);
-    ok('apply high: the backup is the original', fs.readFileSync(tgt + '.woc-orig').equals(orig));
     r = run(['verify', '--target', tgt]);
     ok('verify: enabled', r.code === 0 && /OK: variant IC_HIGH, sink udp:\/\/127\.0\.0\.1:20557\?mime_type=video\/H264, self-start on, res 1088x480, map URL on, ShowUI URL with ETA$/m.test(r.out), r.out);
-    r = run(['apply', '--target', tgt, '--panel', 'mid', '--yes']);
-    b = fs.readFileSync(tgt);
-    ok('apply mid: the stock geometry back from the backup, the stock sink', r.code === 0 && /resolution -> stock 1600x800/.test(r.out) &&
-        b.slice(at.mm, at.safe2 + 8).equals(orig.slice(at.mm, at.safe2 + 8)) && b.slice(at.sink, at.sink + 59).equals(orig.slice(at.sink, at.sink + 59)) &&
-        b.readUInt32LE(at.slot) === at.mid, r.out);
     r = run(['revert', '--target', tgt, '--yes']);
     ok('revert: byte-exact original', r.code === 0 && fs.readFileSync(tgt).equals(orig), r.out);
 
-    /* One map URL site written and not the other: unrecognised; apply
-     * refuses it, revert writes the whole backup. */
+    /* One map URL site written and not the other: unrecognised; revert
+     * writes the whole backup. */
     run(['apply', '--target', tgt, '--panel', 'high', '--unproven', '--yes']);
     b = fs.readFileSync(tgt);
     orig.copy(b, at.spare, at.spare, at.spare + 55);
@@ -333,13 +325,11 @@ try {
     r = run(['status', '--target', tgt]);
     ok('partly patched map URL: not known, restorable', /^mapurl:\s+UNKNOWN \(map URL: partly patched\)$/m.test(r.out) &&
         /known:\s+NO — map URL: partly patched/.test(r.out) && /^restorable:\s+yes$/m.test(r.out), r.out);
-    r = run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
-    ok('partly patched map URL: apply refuses, no write', r.code !== 0 && /refusing: map URL: partly patched/.test(r.out) && fs.readFileSync(tgt).equals(b), r.out);
     r = run(['revert', '--target', tgt, '--yes']);
     ok('partly patched map URL: revert writes the whole backup', r.code === 0 && fs.readFileSync(tgt).equals(orig), r.out);
 
     /* The ShowUI URL edit with one site written, or one cut short: unrecognised;
-     * apply refuses it, revert writes the whole backup. */
+     * revert writes the whole backup. */
     run(['apply', '--target', tgt, '--panel', 'high', '--unproven', '--yes']);
     var full = fs.readFileSync(tgt);
     [['the log text stock', function (x) { orig.copy(x, at.showStr, at.showStr, at.showStr + 64); }],
@@ -351,8 +341,6 @@ try {
         r = run(['status', '--target', tgt]);
         ok('ShowUI URL, ' + t[0] + ': not known, restorable', /^showui:\s+UNKNOWN \(ShowUI URL: partly patched\)$/m.test(r.out) &&
             /known:\s+NO — ShowUI URL: partly patched/.test(r.out) && /^restorable:\s+yes$/m.test(r.out), r.out);
-        r = run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
-        ok('ShowUI URL, ' + t[0] + ': apply refuses, no write', r.code !== 0 && /refusing: ShowUI URL: partly patched/.test(r.out) && fs.readFileSync(tgt).equals(b), r.out);
         r = run(['revert', '--target', tgt, '--yes']);
         ok('ShowUI URL, ' + t[0] + ': revert writes the whole backup', r.code === 0 && fs.readFileSync(tgt).equals(orig), r.out);
         fs.writeFileSync(tgt, full);
@@ -361,8 +349,7 @@ try {
 
     /* The patch 0.10.2-0.10.3 wrote (the initial URL with ETA, no ShowUI
      * URL edit), and the one 0.9.11-0.10.1 wrote (this initial URL, no
-     * ShowUI URL edit): known, status says so, verify passes; apply brings
-     * either up to date, changing only the URL edits' sites; revert of
+     * ShowUI URL edit): known, status says so, verify passes; revert of
      * either restores the original. */
     run(['apply', '--target', tgt, '--panel', 'high', '--unproven', '--yes']);
     var cur = fs.readFileSync(tgt), etaPatch = Buffer.from(cur), mapPatch = Buffer.from(cur);
@@ -371,25 +358,18 @@ try {
     fs.writeFileSync(tgt, etaPatch);
     r = run(['status', '--target', tgt]);
     ok('0.10.2\'s patch: known, restorable, PATCHED WITH ETA, ShowUI URL ORIGINAL', /known:\s+yes, modified build/.test(r.out) && /^restorable:\s+yes$/m.test(r.out) &&
-        /^mapurl:\s+PATCHED WITH ETA \(the phone streams the cluster map from connect: maps:\/car\/instrumentcluster\/map\?showETA=yes; apply writes maps:\/car\/instrumentcluster\/map\)$/m.test(r.out) &&
+        /^mapurl:\s+PATCHED WITH ETA \(the phone streams the cluster map from connect: maps:\/car\/instrumentcluster\/map\?showETA=yes; the patch writes maps:\/car\/instrumentcluster\/map\)$/m.test(r.out) &&
         /^showui:\s+ORIGINAL \(ShowUI asks the phone for maps:\/car\/instrumentcluster\)$/m.test(r.out), r.out);
     r = run(['verify', '--target', tgt]);
     ok('0.10.2\'s patch: verify passes, map URL on with ETA, ShowUI URL stock', r.code === 0 && /map URL on with ETA, ShowUI URL stock$/m.test(r.out), r.out);
     [['0.10.2\'s patch', etaPatch, true], ['0.9.11\'s patch', mapPatch, false]].forEach(function (t) {
-        fs.writeFileSync(tgt, t[1]);
-        r = run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
-        b = fs.readFileSync(tgt);
-        var od = []; for (var oi = 0; oi < b.length; oi++) if (b[oi] !== t[1][oi]) od.push(oi);
-        function inUrlSites(x) { return (x >= at.spare && x < at.spare + 55) || (x >= at.urlLea && x < at.urlLea + 7) || (x >= at.showStr && x < at.showStr + 64) || (x >= at.showCall && x < at.showCall + 11); }
-        ok(t[0] + ': apply brings it up to date, only the URL edits\' sites change', r.code === 0 && /map URL -> maps:\/car\/instrumentcluster\/map$/m.test(r.out) === t[2] &&
-            /ShowUI URL -> /.test(r.out) && !/variant ->|self-start ->|resolution ->|sink ->/.test(r.out) && b.equals(cur) && od.length > 0 && od.every(inUrlSites), r.out);
         fs.writeFileSync(tgt, t[1]);
         r = run(['revert', '--target', tgt, '--yes']);
         ok(t[0] + ': revert restores the original byte-exact', r.code === 0 && fs.readFileSync(tgt).equals(orig), r.out);
         fs.writeFileSync(tgt, cur);
     });
     /* The two sites holding different forms: unrecognised, like a write cut
-     * short; apply refuses, revert writes the whole backup. */
+     * short; revert writes the whole backup. */
     [['eta', 'current'], ['current', 'eta']].forEach(function (f) {
         var mixed = Buffer.from(cur);
         writeMapUrl(mixed, at, 'slot', f[0]); writeMapUrl(mixed, at, 'lea', f[1]);
@@ -397,8 +377,6 @@ try {
         r = run(['status', '--target', tgt]);
         ok('the ' + f[0] + ' spare string with the ' + f[1] + ' lea: not known, restorable', /^mapurl:\s+UNKNOWN \(map URL: partly patched\)$/m.test(r.out) &&
             /^restorable:\s+yes$/m.test(r.out), r.out);
-        r = run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
-        ok('the ' + f[0] + ' spare string with the ' + f[1] + ' lea: apply refuses, no write', r.code !== 0 && fs.readFileSync(tgt).equals(mixed), r.out);
         r = run(['revert', '--target', tgt, '--yes']);
         ok('the ' + f[0] + ' spare string with the ' + f[1] + ' lea: revert writes the whole backup', r.code === 0 && fs.readFileSync(tgt).equals(orig), r.out);
     });
@@ -430,8 +408,8 @@ try {
     fs.writeFileSync(tgt, orig);
     [tgt + '.woc-orig', tgt + '.woc-orig.json'].forEach(function (f) { try { fs.unlinkSync(f); } catch (e) {} });
 
-    /* A build where the map URL edit is not found: the other four apply,
-     * verify and revert as without it. */
+    /* A build where the map URL edit is not found: an earlier release's patch
+     * holds the other four, which verify and revert as without it. */
     var nmBuild = synthetic.build({ gateCmp: 2 }), noMap = nmBuild.buf, nm = nmBuild.at;
     fs.writeFileSync(tgt, noMap);
     [tgt + '.woc-orig', tgt + '.woc-orig.json'].forEach(function (f) { try { fs.unlinkSync(f); } catch (e) {} });
@@ -440,7 +418,7 @@ try {
         /known:\s+yes, pristine build/.test(r.out), r.out);
     r = run(['apply', '--target', tgt, '--panel', 'high', '--unproven', '--yes']);
     b = fs.readFileSync(tgt);
-    ok('map URL not found: the other edits applied, not it', r.code === 0 && /patched OK/.test(r.out) && !/map URL ->/.test(r.out) &&
+    ok('map URL not found: an earlier release\'s patch holds the other edits, not it', r.code === 0 &&
         b.readUInt32LE(nm.slot) === nm.high && b.toString('hex', nm.call, nm.call + 5) === nm.callPatched, r.out);
     var dd = []; for (var i = 0; i < b.length; i++) if (b[i] !== noMap[i]) dd.push(i);
     ok('map URL not found: the diff stays out of the log string and the lea', dd.length > 0 && dd.every(function (x) {
@@ -453,8 +431,8 @@ try {
     [tgt + '.woc-orig', tgt + '.woc-orig.json'].forEach(function (f) { try { fs.unlinkSync(f); } catch (e) {} });
 
     /* A build where the ShowUI URL edit is not found, and one that adds
-     * carplay.conf's options itself: the other edits apply, verify and
-     * revert as without it. */
+     * carplay.conf's options itself: an earlier release's patch holds the
+     * other edits, which verify and revert as without it. */
     [['not found', { showUnchecked: true }, 'ShowUI URL: ShowUI result not checked with its log text'],
      ['not applicable', { setShowUi: true }, 'ShowUI URL: not applicable (the build adds carplay.conf\'s SHOW_UI_OPTIONS to it)']].forEach(function (t) {
         var nsBuild = synthetic.build(t[1]), noShow = nsBuild.buf, ns = nsBuild.at;
@@ -465,7 +443,7 @@ try {
             /known:\s+yes, pristine build/.test(r.out), r.out);
         r = run(['apply', '--target', tgt, '--panel', 'high', '--unproven', '--yes']);
         b = fs.readFileSync(tgt);
-        ok('ShowUI URL ' + t[0] + ': the other edits applied, not it', r.code === 0 && /patched OK/.test(r.out) && /map URL ->/.test(r.out) && !/ShowUI URL ->/.test(r.out) &&
+        ok('ShowUI URL ' + t[0] + ': an earlier release\'s patch holds the other edits, not it', r.code === 0 &&
             b.readUInt32LE(ns.slot) === ns.high && b.slice(ns.showStr, ns.showStr + 64).equals(noShow.slice(ns.showStr, ns.showStr + 64)) &&
             b.slice(ns.showCall, ns.showCall + 11).equals(noShow.slice(ns.showCall, ns.showCall + 11)), r.out);
         r = run(['verify', '--target', tgt]);
@@ -491,12 +469,10 @@ try {
     var noId = Buffer.from(orig);
     noId.writeUInt32LE(0, 0x208);   /* the build-id note's type */
     [tgt + '.woc-orig', tgt + '.woc-orig.json'].forEach(function (f) { try { fs.unlinkSync(f); } catch (e) {} });
-    fs.writeFileSync(tgt + '.woc-orig.tmp', 'cut short');        /* an earlier apply's, cut short */
-    fs.writeFileSync(tgt + '.woc-orig.json.tmp', '{"sha');
     fs.writeFileSync(tgt, noId);
     r = run(['apply', '--target', tgt, '--panel', 'high', '--unproven', '--yes']);
-    ok('no build-id: apply writes the backup and its record, an earlier temporary file gone', r.code === 0 && fs.existsSync(tgt + '.woc-orig') &&
-        fs.existsSync(tgt + '.woc-orig.json') && !fs.existsSync(tgt + '.woc-orig.tmp') && !fs.existsSync(tgt + '.woc-orig.json.tmp'), r.out);
+    ok('no build-id: an earlier release\'s patch with its backup and the backup\'s record', r.code === 0 && fs.existsSync(tgt + '.woc-orig') &&
+        fs.existsSync(tgt + '.woc-orig.json'), r.out);
     var noIdPatched = fs.readFileSync(tgt), mangled = Buffer.from(noIdPatched);
     mangled[at.highHandler] = 0x90;   /* a site the locator now refuses */
     fs.writeFileSync(tgt, mangled);
@@ -543,12 +519,13 @@ try {
     ok('probe of an ambiguous build: not patchable, with the reason', /patchable:\s+no — sink: URL slot found 2 times/.test(r.out), r.out);
     r = run(['status', '--target', tgt]);
     ok('status of an ambiguous build: known NO with the reason', /known:\s+NO — sink: URL slot found 2 times/.test(r.out), r.out);
-    r = run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
-    ok('apply refuses it, no write', r.code !== 0 && /refusing: sink: URL slot found 2 times/.test(r.out) && fs.readFileSync(tgt).equals(amb), r.out);
+    r = run(['plan', '--target', tgt, '--panel', 'high', '--unproven', '--out', path.join(dir, 'amb.plan')]);
+    ok('plan refuses it with the reason, no plan written', r.code !== 0 && /sink: URL slot found 2 times/.test(r.out) && !fs.existsSync(path.join(dir, 'amb.plan')) &&
+        fs.readFileSync(tgt).equals(amb), r.out);
 
     /* A file with carplay 21.27.4's build-id and every site stock, but not
-     * that build's shipped file: on the proven list, so its first edit needs
-     * the shipped file, --unproven or not. */
+     * that build's shipped file: on the proven list, so a plan needs the
+     * shipped file, --unproven or not. */
     var b2127 = Buffer.from(orig);
     Buffer.from('389c1d0536f8cc9283c156410f2f2634a9f952c0', 'hex').copy(b2127, b2127.indexOf(Buffer.from(at.buildId, 'hex')));
     fs.writeFileSync(tgt, b2127);
@@ -559,10 +536,11 @@ try {
     ok('carplay 21.27.4 build-id: status proven, a modified build, the map URL found by structure', /^proven:\s+yes$/m.test(r.out) && /known:\s+yes, modified build/.test(r.out) &&
         /^mapurl:\s+ORIGINAL/m.test(r.out), r.out);
     [[], ['--unproven']].forEach(function (extra) {
-        r = run(['apply', '--target', tgt, '--panel', 'high', '--yes'].concat(extra));
-        ok('carplay 21.27.4 build-id, not its shipped file: apply ' + (extra[0] ? extra[0] + ' ' : '') + 'refuses, no write, no backup', r.code !== 0 &&
-            /first edit requires the pristine build: sha256 fb5d6b179ad4f62a968697d21e84dbb80adc1ad8e618a6f02c6a9a0467aca1ac, got /.test(r.out) &&
-            fs.readFileSync(tgt).equals(b2127) && !fs.existsSync(tgt + '.woc-orig'), r.out);
+        var out = path.join(dir, '2127.plan');
+        r = run(['plan', '--target', tgt, '--panel', 'high', '--out', out].concat(extra));
+        ok('carplay 21.27.4 build-id, not its shipped file: plan ' + (extra[0] ? extra[0] + ' ' : '') + 'refuses, no plan, no write', r.code !== 0 &&
+            /in memory needs the pristine build on disk: sha256 fb5d6b179ad4f62a968697d21e84dbb80adc1ad8e618a6f02c6a9a0467aca1ac, got /.test(r.out) &&
+            fs.readFileSync(tgt).equals(b2127) && !fs.existsSync(out), r.out);
     });
 
 } finally {

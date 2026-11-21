@@ -2,22 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Robert Nisipeanu
 'use strict';
-/* journal_keep — the tools' part of the journal, kept on /var/opt, where it
- * outlives the unit's volatile journal (about four minutes on the car) and
- * its reboots. waze-on-cluster-journal.service runs it as a dynamic user in
- * the systemd-journal group.
+/* journal_keep — the tools' part of the journal, kept in RAM where it
+ * outlives the unit's volatile journal (about four minutes on the car), and
+ * on /var/opt only when there is something to keep: a short, condensed
+ * window around a failure, and at each head-unit shutdown.
+ * waze-on-cluster-journal.service runs it as a dynamic user in the
+ * systemd-journal group.
  *
  * It reads this boot's entries of UNITS, systemd's lines and the kernel's,
  * then follows them. Each becomes one line of at most LINE_MAX bytes,
  *   2026-11-03T06:58:54.365447Z cluster-render.service cluster-render[1152]: <message>
- * appended to DIR/journal.log every FLUSH_MS, the file opened only for the
- * write. In the boot's first EARLY_S seconds of uptime each append is also
- * synced to disk (fdatasync, through a read-only descriptor, so a remount
- * read-only never finds the file open for writing): a start the head unit
- * resets without a shutdown keeps its lines up to the last append. Later,
- * the file system's own commit makes them durable within seconds.
- * A file that would pass FILE_MAX becomes journal.log.1, the older
- * ones move up and journal.log.<FILES-1> is dropped. The tools' lines
+ * appended to DIR/journal.log (tmpfs) every FLUSH_MS, the file opened only
+ * for the write. A file that would pass FILE_MAX becomes journal.log.1, the
+ * older ones move up and journal.log.<FILES-1> is dropped. The tools' lines
  * (waze-on-cluster, cluster-render) and the others (carplay, aapd, recmgr,
  * crashhandler, systemd, the kernel) each have RATE / 2 bytes a minute, with a
  * minute's worth in reserve, so a flood of one kind never pushes out the
@@ -38,6 +35,24 @@
  *     (BOOT_KEEP, or priority err and worse) are kept, then a line saying
  *     how many were left out.
  *
+ * Kept on /var/opt (keep(), into KEPT): a line that reports a failure
+ * (trigger(): an INCIDENT line, a crash or failure of a unit, the kernel's
+ * segfault or OOM kill, a boot recovery step, a patch removed) has the
+ * files' newest lines written KEEP_DELAY_MS later, so the burst around it is
+ * in, and once more KEEP_AFTER_MS after that, for what followed; at most one
+ * write every KEEP_GAP_MS. A stop of the service writes them too, and so
+ * does `keep shutdown`, which var-opt-ro.service runs as root at each
+ * head-unit shutdown before /var/opt goes read-only. Each write holds the
+ * lines after the last one written (DIR/kept-last), of the newest KEEP_READ
+ * bytes and at most WINDOW_S older than the newest line, condensed: of the
+ * lines that differ only in their numbers, the newest REPEAT_KEEP; then the
+ * newest KEEP_MAX bytes. It is one file, journal-<UTC>-<why>.log, made
+ * whole under a temporary name, synced and linked into place, so a power
+ * cut leaves either all of it or none. Past KEEP_FILES files or KEEP_TOTAL
+ * bytes the oldest of a stop or shutdown go first, then the oldest of a
+ * failure. A power cut loses what is only in RAM. As root runs `keep`, it
+ * follows no link in the folders and creates only new files.
+ *
  * Every LOAD_MS it logs a load line (to the journal, which brings it back
  * here): the load averages, MemAvailable, the processes in D state and the
  * TOP processes by CPU over the interval, from /proc/<pid>/stat (name and
@@ -51,10 +66,12 @@
  * A start reads this boot's entries so far (journalctl without -f) and
  * writes those after the newest line the files hold, or all of them when
  * this boot has no such line; it then follows from the last entry's cursor,
- * as does a journalctl started again. Nothing depends on the clock.
+ * as does a journalctl started again. Neither depends on the clock.
  *
- *   node journal_keep.js prepare   (root) makes DIR, group systemd-journal,
- *                                  mode 2770
+ *   node journal_keep.js prepare   (root) makes DIR and KEPT, group
+ *                                  systemd-journal, mode 2770
+ *   node journal_keep.js keep <why>
+ *                                  writes the files' newest lines to KEPT
  *
  * Node 8 on the unit. No dependencies.
  */
@@ -63,16 +80,16 @@ var os = require('os');
 var path = require('path');
 var cp = require('child_process');
 
-var DIR = process.env.WOC_JOURNAL_DIR || '/var/opt/waze-on-cluster/journal';
+var DIR = process.env.WOC_JOURNAL_DIR || '/run/waze-on-cluster-journal';
+var KEPT = process.env.WOC_JOURNAL_KEPT || '/var/opt/waze-on-cluster/journal';
 var JOURNALCTL = process.env.WOC_JOURNALCTL || 'journalctl';
 var FILE = 'journal.log';
 var FILES = 10;
 var FILE_MAX = 384 * 1024;
 var LINE_MAX = 1024;
 var RATE = 256 * 1024;
-var FLUSH_MS = Number(process.env.WOC_JOURNAL_FLUSH_MS) || 2000;
+var FLUSH_MS = Number(process.env.WOC_JOURNAL_FLUSH_MS) || 1000;
 var RESPAWN_MS = Number(process.env.WOC_JOURNAL_RESPAWN_MS) || 10000;
-var EARLY_S = 120;
 var PENDING_MAX = 256 * 1024;
 var BOOT_S = 10;
 var LOAD_MS = Number(process.env.WOC_JOURNAL_LOAD_MS) || 30000;
@@ -80,6 +97,16 @@ var PROC = process.env.WOC_PROC || '/proc';
 var TOP = 5;
 var PIDS_MAX = 4096;
 var CLK_TCK = 100;
+var MARK = 'kept-last';
+var KEEP_DELAY_MS = Number(process.env.WOC_JOURNAL_KEEP_DELAY_MS) || 5000;
+var KEEP_AFTER_MS = Number(process.env.WOC_JOURNAL_KEEP_AFTER_MS) || 60000;
+var KEEP_GAP_MS = Number(process.env.WOC_JOURNAL_KEEP_GAP_MS) || 60000;
+var KEEP_READ = 1024 * 1024;
+var WINDOW_S = 600;
+var REPEAT_KEEP = 3;
+var KEEP_MAX = 256 * 1024;
+var KEEP_FILES = 16;
+var KEEP_TOTAL = 2 * 1024 * 1024;
 
 var UNITS = ['waze-on-cluster.service', 'waze-on-cluster-patchd.service', 'waze-on-cluster-boot.service',
     'waze-on-cluster-recovery.service', 'waze-on-cluster-capture.service', 'waze-on-cluster-journal.service',
@@ -274,19 +301,14 @@ Ring.prototype.trim = function () {
     if (this.size > this.fileMax) this.rotate();
 };
 /* Appends lines (Buffers, each at most fileMax bytes), rotating between
- * lines so no file passes fileMax. sync: each write is on disk before the
- * next (fdatasync through a read-only descriptor, the write's closed). */
-Ring.prototype.append = function (lines, sync) {
+ * lines so no file passes fileMax. */
+Ring.prototype.append = function (lines) {
     if (this.size === null) this.trim();
     var batch = [], bytes = 0, self = this;
     function write() {
         if (!batch.length) return;
         var fd = fs.openSync(self.name(0), 'a', 0o660);
         try { fs.writeSync(fd, Buffer.concat(batch)); } finally { fs.closeSync(fd); }
-        if (sync) {
-            fd = fs.openSync(self.name(0), 'r');
-            try { fs.fdatasyncSync(fd); } finally { fs.closeSync(fd); }
-        }
         self.size += bytes;
         batch = [];
         bytes = 0;
@@ -314,6 +336,174 @@ Ring.prototype.newest = function () {
     }
     return null;
 };
+
+/* The newest max bytes of a regular file, opened without following a
+ * link (root reads these folders, which others write): a Buffer, or null
+ * when it is missing. */
+function readEnd(file, max) {
+    var fd;
+    try {
+        fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    } catch (e) {
+        if (e.code === 'ENOENT') return null;
+        throw e;
+    }
+    try {
+        var st = fs.fstatSync(fd);
+        if (!st.isFile()) throw new Error(file + ' is not a file');
+        var n = Math.min(st.size, max), b = Buffer.alloc(n);
+        return b.slice(0, fs.readSync(fd, b, 0, n, st.size - n));
+    } finally { fs.closeSync(fd); }
+}
+
+/* The files' newest lines, oldest first, from at most max bytes (a line
+ * cut by that is left out). */
+Ring.prototype.tail = function (max) {
+    var parts = [], bytes = 0;
+    for (var i = 0; i < this.files && bytes < max; i++) {
+        var b = readEnd(this.name(i), max - bytes);
+        if (!b) continue;
+        parts.unshift(b);
+        bytes += b.length;
+    }
+    var lines = Buffer.concat(parts).toString('utf8').split('\n');
+    lines.pop();
+    if (bytes >= max) lines.shift();
+    return lines;
+};
+
+/* Why a kept line is worth writing to /var/opt (see the top), or null:
+ * unit and msg as Filter reads them, pid1: systemd's line. */
+var TRIGGER = {
+    incident: /\bINCIDENT\b/,
+    crash: /Main process exited, code=(killed|dumped)|Failed with result|[Ww]atchdog/,
+    kernel: /\bsegfault\b|Out of memory|oom-kill|Killed process/,
+    recovery: /boot check: (restored|restore-failed|crash|killed)|restor(ing|ed) the original|restore failed|crashes while patched|failed patched boots|stays down|was killed|starting \S+ failed/,
+    patch: /patch removed|removed the patch/
+};
+function trigger(entry) {
+    var msg = text(entry.MESSAGE), unit = unitOf(entry);
+    if (entry._TRANSPORT === 'kernel') return TRIGGER.kernel.test(msg) ? 'crash' : null;
+    if (UNITS.indexOf(unit) < 0) return null;
+    if (text(entry._PID) === '1') return TRIGGER.crash.test(msg) ? 'crash' : null;
+    if (!/^(waze-on-cluster|cluster-render)[.-]/.test(unit)) return null;
+    if (TRIGGER.incident.test(msg)) return 'incident';
+    if (TRIGGER.recovery.test(msg)) return 'recovery';
+    if (TRIGGER.patch.test(msg)) return 'patch';
+    return null;
+}
+
+/* Of lines (oldest first), the newest REPEAT_KEEP of those alike but for
+ * their numbers, in order: { lines, left, leftBytes }. */
+function condense(lines) {
+    var seen = {}, out = [], left = 0, leftBytes = 0;
+    for (var i = lines.length - 1; i >= 0; i--) {
+        var key = lines[i].replace(/^\S+ /, '').replace(/[0-9a-fA-F]*[0-9][0-9a-fA-F.:x]*/g, '#');
+        seen[key] = (seen[key] || 0) + 1;
+        if (seen[key] > REPEAT_KEEP) { left++; leftBytes += Buffer.byteLength(lines[i]) + 1; continue; }
+        out.push(lines[i]);
+    }
+    return { lines: out.reverse(), left: left, leftBytes: leftBytes };
+}
+
+/* A new file at p (one left there by an earlier run, or a link, removed
+ * first, never followed): its descriptor. */
+function newFile(p, mode) {
+    try { fs.unlinkSync(p); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    return fs.openSync(p, 'wx', mode);
+}
+
+function fsyncDir(dir) {
+    var fd = fs.openSync(dir, 'r');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+/* "20261103T065854Z" */
+function stampOf(ms) { return new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z'); }
+
+/* Writes the ring's newest lines not written yet to kept (see the top) as
+ * journal-<UTC>-<why>.log; returns its name, or null when there was
+ * nothing new. o: { ring, kept, why, now (ms), bootId, uptime (s) }. */
+function keep(o) {
+    var markFile = path.join(o.ring.dir, MARK), mark = null;
+    var m = readEnd(markFile, 2 * LINE_MAX);
+    if (m) mark = m.toString('utf8').replace(/\n$/, '');
+    var lines = o.ring.tail(KEEP_READ), total;
+    if (mark) {
+        var at = lines.lastIndexOf(mark);
+        if (at >= 0) lines = lines.slice(at + 1);
+    }
+    lines = lines.filter(Boolean);
+    if (!lines.length) return null;
+    var last = lines[lines.length - 1], newest = null;
+    for (var i = lines.length - 1; i >= 0 && newest === null; i--) {
+        var t = Date.parse(lines[i].split(' ')[0]);
+        if (t) newest = t;
+    }
+    if (newest !== null) {
+        lines = lines.filter(function (l) {
+            var t = Date.parse(l.split(' ')[0]);
+            return !t || t >= newest - WINDOW_S * 1000;
+        });
+    }
+    total = lines.length;
+    var c = condense(lines), body = c.lines, bytes = 0, from = body.length;
+    while (from > 0 && bytes + Buffer.byteLength(body[from - 1]) + 1 <= KEEP_MAX) bytes += Buffer.byteLength(body[--from]) + 1;
+    body = body.slice(from);
+    var iso = new Date(o.now).toISOString().replace(/Z$/, '000Z');
+    var head = iso + ' journal-keep: boot ' + String(o.bootId).slice(0, 8) + ', up ' + Math.round(o.uptime) + ' s\n' +
+        iso + ' journal-keep: kept for ' + o.why + ': ' + body.length + ' of the last ' + total + ' lines; ' + c.left +
+        ' repeated lines (' + Math.ceil(c.leftBytes / 1024) + ' KiB) and ' + (c.lines.length - body.length) + ' older lines left out\n';
+    var data = Buffer.from(head + body.join('\n') + '\n');
+    var base = 'journal-' + stampOf(o.now) + '-' + o.why, tmp = path.join(o.kept, '.' + base + '.' + process.pid + '.tmp');
+    var fd = newFile(tmp, 0o640);
+    try {
+        fs.writeSync(fd, data);
+        fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    var name = base + '.log';
+    try {
+        for (var n = 1; ; n++) {
+            try { fs.linkSync(tmp, path.join(o.kept, name)); break; } catch (e) {
+                if (e.code !== 'EEXIST' || n > 9) throw e;
+                name = base + '-' + n + '.log';
+            }
+        }
+    } finally { try { fs.unlinkSync(tmp); } catch (e) { /* gone */ } }
+    fsyncDir(o.kept);
+    var mtmp = markFile + '.' + process.pid + '.tmp';
+    var mfd = newFile(mtmp, 0o660);
+    try { fs.writeSync(mfd, last + '\n'); } finally { fs.closeSync(mfd); }
+    fs.renameSync(mtmp, markFile);
+    prune(o.kept, name);
+    return name;
+}
+
+/* Deletes kept files past KEEP_FILES or KEEP_TOTAL bytes, never keep (the
+ * one just written): the oldest of a stop or shutdown first, then the
+ * oldest of a failure; and temporary files over a minute old. */
+function prune(dir, keep) {
+    var list = [], total = 0;
+    fs.readdirSync(dir).forEach(function (n) {
+        var p = path.join(dir, n), st;
+        try { st = fs.lstatSync(p); } catch (e) { return; }
+        if (/^\.journal-.*\.tmp$/.test(n)) {
+            if (Date.now() - st.mtime.getTime() > 60000) try { fs.unlinkSync(p); } catch (e) { /* gone */ }
+        } else if (/^journal-\d{8}T\d{6}Z-[\w-]+\.log$/.test(n) && st.isFile()) {
+            list.push({ n: n, size: st.size, routine: /^journal-\w+-(stop|shutdown)(-\d+)?\.log$/.test(n) });
+            total += st.size;
+        }
+    });
+    list.sort(function (a, b) { return a.routine !== b.routine ? (a.routine ? -1 : 1) : a.n < b.n ? -1 : a.n > b.n ? 1 : 0; });
+    list = list.filter(function (x) { return x.n !== keep; });
+    var count = list.length + (keep ? 1 : 0);
+    while (list.length && (count > KEEP_FILES || total > KEEP_TOTAL)) {
+        var old = list.shift();
+        count--;
+        total -= old.size;
+        try { fs.unlinkSync(path.join(dir, old.n)); } catch (e) { /* gone */ }
+    }
+}
 
 function readSmall(file, buf) {
     var fd = fs.openSync(file, 'r');
@@ -370,8 +560,35 @@ LoadSampler.prototype.line = function () {
 function main() {
     var ring = new Ring(DIR), limit = { tool: new Limiter(RATE / 2), other: new Limiter(RATE / 2) }, filter = new Filter();
     var pending = [], pendingBytes = 0, cursor = null, child = null, quitting = false, warned = '';
+    var keepTimer = null, keepWhy = null, lastKeep = -Infinity;
     function warn(msg) { if (msg !== warned) { warned = msg; console.error('journal-keep: ' + msg); } }
+    function mono() { var t = process.hrtime(); return t[0] * 1000 + t[1] / 1e6; }
     try { ring.trim(); } catch (e) { warn(e.message); }
+
+    /* The files' newest lines to KEPT (see the top). */
+    function keepNow(why) {
+        flush();
+        try {
+            var name = keep({ ring: ring, kept: KEPT, why: why, now: Date.now(), bootId: require('./boot_id.js').bootId(), uptime: os.uptime() });
+            if (name) console.log('journal-keep: kept ' + name);
+        } catch (e) { warn('cannot keep in ' + KEPT + ': ' + e.message); }
+        lastKeep = mono();
+    }
+    function later(ms) {
+        keepTimer = setTimeout(function () {
+            keepTimer = null;
+            var why = keepWhy;
+            keepWhy = null;
+            keepNow(why);
+            if (why !== 'after') { keepWhy = 'after'; later(KEEP_AFTER_MS); }
+        }, Math.max(0, ms));
+    }
+    /* A line worth keeping: the next write within KEEP_DELAY_MS, at most one
+     * every KEEP_GAP_MS; its reason the first since the last write. */
+    function want(why) {
+        if (!keepWhy || keepWhy === 'after') keepWhy = why;
+        if (!keepTimer) later(Math.max(KEEP_DELAY_MS, lastKeep + KEEP_GAP_MS - mono()));
+    }
 
     function flush() {
         ['tool', 'other'].forEach(function (k) {
@@ -382,10 +599,12 @@ function main() {
         var lines = pending;
         pending = [];
         pendingBytes = 0;
-        try { ring.append(lines, os.uptime() < EARLY_S); warned = ''; } catch (e) { ring.size = null; warn('cannot write ' + DIR + ': ' + e.message); }
+        try { ring.append(lines); warned = ''; } catch (e) { ring.size = null; warn('cannot write ' + DIR + ': ' + e.message); }
     }
     function take(entry) {
         if (entry.__CURSOR) cursor = String(entry.__CURSOR);
+        var why = trigger(entry);
+        if (why) want(why);
         filter.lines(entry).forEach(function (f) {
             if (!limit[f.tool ? 'tool' : 'other'].take(f.line.length)) return;
             pending.push(f.line);
@@ -398,7 +617,7 @@ function main() {
      * writes what it read once it is past the files' newest line, and the
      * follow goes on from there; before that it writes nothing. */
     function backlog(done) {
-        var newest = null, lines = [], bytes = 0, read = null, past = false;
+        var newest = null, lines = [], bytes = 0, read = null, past = false, why = null;
         try { newest = ring.newest(); } catch (e) { warn(e.message); }
         past = !newest;
         filter = new Filter();
@@ -406,18 +625,20 @@ function main() {
             if (entry.__CURSOR) read = String(entry.__CURSOR);
             /* the newest line as a version that kept every line wrote it */
             var whole = newest && !past && format(entry);
-            if (whole && whole.line.toString() === newest) { lines = []; bytes = 0; past = true; }
+            if (whole && whole.line.toString() === newest) { lines = []; bytes = 0; past = true; why = null; }
             filter.lines(entry).forEach(function (f) {
-                if (newest && f.line.toString() === newest) { lines = []; bytes = 0; past = true; return; }
+                if (newest && f.line.toString() === newest) { lines = []; bytes = 0; past = true; why = null; return; }
                 lines.push(f.line);
                 bytes += f.line.length;
                 while (bytes > FILES * FILE_MAX) bytes -= lines.shift().length;
             });
+            why = why || trigger(entry);
         }, function (ok) {
             if (ok || past) {
                 pending = pending.concat(lines);
                 flush();
                 if (read !== null) cursor = read;
+                if (why) want(why);
             }
             done(ok || (past && read !== null));
         });
@@ -479,8 +700,9 @@ function main() {
         quitting = true;
         clearInterval(timer);
         clearInterval(loadTimer);
+        if (keepTimer) clearTimeout(keepTimer);
         if (child) child.kill('SIGTERM');
-        flush();
+        keepNow('stop');
         process.exit(0);
     }
     process.on('SIGTERM', quit);
@@ -488,10 +710,28 @@ function main() {
     start();
 }
 
+/* prepare: DIR and KEPT made, and the rolling journal.log files an older
+ * version kept in KEPT removed. */
+function prepare() {
+    var gd = require('./group_dir.js');
+    gd.groupDir(DIR, 'systemd-journal');
+    gd.groupDir(KEPT, 'systemd-journal');
+    fs.readdirSync(KEPT).forEach(function (n) { if (/^journal\.log(\.\d+)?$/.test(n)) fs.unlinkSync(path.join(KEPT, n)); });
+}
+
 if (require.main === module) {
-    if (process.argv[2] === 'prepare') require('./group_dir.js').groupDir(DIR, 'systemd-journal');
-    else main();
+    if (process.argv[2] === 'prepare') prepare();
+    else if (process.argv[2] === 'keep' && /^[a-z]+$/.test(process.argv[3] || '')) {
+        var name = keep({ ring: new Ring(DIR), kept: KEPT, why: process.argv[3], now: Date.now(),
+            bootId: require('./boot_id.js').bootId(), uptime: os.uptime() });
+        console.log(name ? 'journal-keep: kept ' + name : 'journal-keep: nothing new to keep');
+    } else if (process.argv[2]) {
+        console.error('usage: journal_keep.js [prepare | keep <why>]');
+        process.exit(2);
+    } else main();
 }
 
 module.exports = { journalArgs: journalArgs, format: format, Filter: Filter, LoadSampler: LoadSampler, Limiter: Limiter, Ring: Ring,
-    FILES: FILES, FILE_MAX: FILE_MAX, LINE_MAX: LINE_MAX, RATE: RATE, UNITS: UNITS, BOOT_S: BOOT_S };
+    trigger: trigger, condense: condense, keep: keep, prune: prune,
+    FILES: FILES, FILE_MAX: FILE_MAX, LINE_MAX: LINE_MAX, RATE: RATE, UNITS: UNITS, BOOT_S: BOOT_S, REPEAT_KEEP: REPEAT_KEEP,
+    KEEP_MAX: KEEP_MAX, KEEP_FILES: KEEP_FILES, KEEP_TOTAL: KEEP_TOTAL, WINDOW_S: WINDOW_S };

@@ -61,7 +61,8 @@
  *   node logs_extra.js incidents <dir>
  *       incidents.txt: the INCIDENT lines of the tools' logs in dir
  *       (cluster-render.log*, waze-on-cluster.log*), each boot the kept
- *       journal in dir saw (journal-keep's "boot" line) and this export,
+ *       journal in dir saw (kept-journal*: journal-keep's "boot" lines) and
+ *       this export,
  *       oldest first, at most INCIDENTS lines
  *
  *   node logs_extra.js scrub <from> <to>
@@ -381,9 +382,9 @@ function incidentsText(dir, now) {
                 var m = /^(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d(\.\d+)?)Z? ?(.*)$/.exec(l);
                 rows.push(m ? { t: m[1] + ' ' + (m[2] + (m[3] ? '' : '.000')).slice(0, 12), s: tool[1] + ': ' + m[4] } : { t: '~', s: tool[1] + ': ' + l });
             });
-        } else if (/^kept-journal\.log(\.\d+)?$/.test(n)) {
+        } else if (/^kept-journal(\.log(\.\d+)?|-[\w-]+\.log)$/.test(n)) {
             each(n, function (l) {
-                var m = /^(\S+Z) .* journal-keep: boot (\w+), up (\d+) s$/.exec(l), t = m && Date.parse(m[1]);
+                var m = /^(\S+Z) (?:.* )?journal-keep: boot (\w+), up (\d+) s$/.exec(l), t = m && Date.parse(m[1]);
                 if (!t) return;
                 var at = t - Number(m[3]) * 1000;
                 if (!boots[m[2]] || at < boots[m[2]]) boots[m[2]] = at;

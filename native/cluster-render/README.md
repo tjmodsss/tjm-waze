@@ -230,7 +230,10 @@ Beside the layers:
   only from under `/var/opt/`, owned by root and writable by no one else,
   with the SHA-256 the client gives. With `layers` 1 the target's layers
   are drawn over the file (RAMSES 19 only), and the scene may host another
-  target's content (PROTOCOL.md "Hosting another target").
+  target's content (PROTOCOL.md "Hosting another target"), with an
+  optional edge: the hosted picture's top and bottom rows drawn on past its
+  rect, blurred and darkened, for a picture shorter than the shape it shows
+  in.
 
 Each target's changes are flushed together once a tick, so the cluster never
 shows a half-written frame: a video or exclusive image left half written

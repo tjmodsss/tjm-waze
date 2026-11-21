@@ -216,10 +216,12 @@ struct SceneLayers {
 
 /* A scene content showing another target's content (PROTOCOL.md "host"): at
  * rect in its own target, the part src of the hosted target; shown 0:
- * nowhere. */
+ * nowhere. edge: drawn on the videos other clients draw inside rect there
+ * (the hosted producer's), held within the target. */
 struct Host {
     Rect rect, src;
     bool shown = true;
+    VideoEdge edge;
 };
 
 class Compositor : public Scenes {
@@ -654,6 +656,11 @@ private:
     int64_t second_ms_ = 0;
     int64_t (*clock_us_)() = nullptr;
     int atlas_fx_ = 0, block_fx_ = 0, image_fx_ = 0;
+    int edge_fx_[2] = {0, 0};   /* kEdgeAtlasFragmentShader, kEdgeBlockFragmentShader; 0: no edges */
+    bool edge_tried_ = false;
+    bool edge_effects();
+    /* The edge of the host whose rect holds e's video on target ti, or none. */
+    VideoEdge edge_for(int ti, const Entry &e) const;
     int atlas_view_fx_ = 0, block_view_fx_ = 0;   /* the composite's, made with the first one */
     std::string plan_error_;   /* why the last reconcile changed nothing; logged once */
     std::map<uint32_t, Entry> layers_;

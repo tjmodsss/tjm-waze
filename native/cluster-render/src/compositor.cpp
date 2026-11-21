@@ -113,6 +113,8 @@ Compositor::~Compositor()
     if (atlas_fx_) gpu_->drop_effect(atlas_fx_);
     if (block_fx_) gpu_->drop_effect(block_fx_);
     if (image_fx_) gpu_->drop_effect(image_fx_);
+    for (int fx : edge_fx_)
+        if (fx) gpu_->drop_effect(fx);
 }
 
 bool Compositor::init(std::string *err)
@@ -124,6 +126,21 @@ bool Compositor::init(std::string *err)
     if (block_fx_)
         image_fx_ = gpu_->effect(kQuadVertexShader, kImageFragmentShader, err);
     return image_fx_ != 0;
+}
+
+/* Compiled at the first edge a host asks for; refused, the service draws
+ * none (and runs as without them). */
+bool Compositor::edge_effects()
+{
+    if (!edge_tried_) {
+        edge_tried_ = true;
+        std::string why;
+        if (!(edge_fx_[0] = gpu_->effect(kQuadVertexShader, kEdgeAtlasFragmentShader, &why)))
+            log_warn("compositor: no edges for hosts: %s", why.c_str());
+        else if (!(edge_fx_[1] = gpu_->effect(kQuadVertexShader, kEdgeBlockFragmentShader, &why)))
+            log_warn("compositor: no edges for hosts' packed videos: %s", why.c_str());
+    }
+    return edge_fx_[0] != 0;
 }
 
 uint32_t Compositor::admit(uint64_t owner, int target, int64_t pixel_bytes, std::string *err)
@@ -671,6 +688,12 @@ std::string Compositor::scene_text(uint32_t id) const
                       slots_->targets()[kv.first].name.c_str(), h.rect.w, h.rect.h, h.rect.x, h.rect.y, h.src.w,
                       h.src.h, h.src.x, h.src.y, h.shown ? "" : ", not shown");
         text += b;
+        if (h.edge.on()) {
+            std::snprintf(b, sizeof b, ", its edge %u up and %u down (fade %u, dim %u, blur %u)%s", h.edge.top,
+                          h.edge.bottom, h.edge.fade, h.edge.dim, h.edge.blur,
+                          edge_tried_ && !edge_fx_[0] ? ", not drawn here" : "");
+            text += b;
+        }
     }
     return text;
 }
@@ -878,10 +901,42 @@ void Compositor::arrange(int64_t now_ms)
                 t.dirty = true;
                 mark(e, t.arr.order[pos], t);
             }
+            if (!std::strcmp(e.layer->kind(), "video")) {
+                VideoEdge ed = edge_for((int)ti, e);
+                if (ed.on() && !edge_effects())
+                    ed = VideoEdge();
+                if (static_cast<VideoLayer *>(e.layer.get())->set_edge(ed, edge_fx_[0], edge_fx_[1])) {
+                    t.dirty = true;
+                    mark(e, t.arr.order[pos], t);
+                }
+            }
         }
         if (t.composite && t.composite->arranged())
             t.dirty = true;
     }
+}
+
+VideoEdge Compositor::edge_for(int ti, const Entry &e) const
+{
+    const Rect &r = e.layer->params.rect;
+    const int64_t x0 = r.x, y0 = r.y, x1 = x0 + r.w, y1 = y0 + r.h, th = slots_->targets()[ti].height;
+    for (const auto &kv : scenes_) {
+        const SceneEntry &s = kv.second;
+        if (s.target != ti || s.owner == e.owner || !s.error.empty())
+            continue;
+        for (const auto &hk : s.hosts) {
+            const Host &h = hk.second;
+            if (!h.shown || !h.edge.on() || x0 < h.rect.x || y0 < h.rect.y || x1 > (int64_t)h.rect.x + h.rect.w ||
+                y1 > (int64_t)h.rect.y + h.rect.h)
+                continue;
+            VideoEdge v = h.edge;
+            v.top = (uint32_t)std::min<int64_t>(v.top, y0);
+            v.bottom = (uint32_t)std::min<int64_t>(v.bottom, std::max<int64_t>(0, th - y1));
+            v.fade = std::min(v.fade, r.h / 2);
+            return v;
+        }
+    }
+    return VideoEdge();
 }
 
 void Compositor::fade(int ti, Target &t, int64_t now_ms)

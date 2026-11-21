@@ -36,11 +36,12 @@ process.on('exit', function () {
 });
 
 /* A unit with a pending change (CarPlay's, or the marker `marker` names);
- * nsm_control answers as `mode` says. */
+ * nsm_control answers as `mode` says; systemctl gives carplay's main PID
+ * (4242 while <d>/proc/4242 is there). */
 function unit(waitMs, marker) {
     var d = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-rb-'));
     dirs.push(d);
-    ['shm', 'var', 'bin', 'units'].forEach(function (x) { fs.mkdirSync(path.join(d, x)); });
+    ['shm', 'var', 'bin', 'units', 'proc'].forEach(function (x) { fs.mkdirSync(path.join(d, x)); });
     var t = { d: d, calls: path.join(d, 'calls'), mode: path.join(d, 'mode'), sock: path.join(d, 'shm', 'patch.sock') };
     fs.writeFileSync(t.calls, '');
     fs.writeFileSync(path.join(d, 'carplay'), 'not a carplay build\n');
@@ -54,6 +55,10 @@ function unit(waitMs, marker) {
         'exit) echo "nsm_control: cannot reach NSM" >&2; exit 3;;\n' +
         '*) echo "[Info. request sent]";;\nesac\n');
     fs.chmodSync(nsm, 0o755);
+    var sc = path.join(d, 'bin', 'systemctl');
+    fs.writeFileSync(sc, '#!/bin/sh\ncase "$*" in *MainPID*) if [ -d "' + path.join(d, 'proc', '4242') + '" ]; then echo MainPID=4242; else echo MainPID=0; fi;; esac\n');
+    fs.chmodSync(sc, 0o755);
+    fs.writeFileSync(path.join(d, 'lib'), 'a stand-in for libwocpatch.so\n');
     t.env = Object.assign({}, process.env, {
         PATH: path.join(d, 'bin') + path.delimiter + process.env.PATH,
         WOC_PATCH_SOCK: t.sock, WOC_CARPLAY: path.join(d, 'carplay'), WOC_AAPD: path.join(d, 'none'),
@@ -61,7 +66,8 @@ function unit(waitMs, marker) {
         WOC_MOUNT: '/usr/bin/true', WOC_UNIT_DIRS: path.join(d, 'units'), WOC_CAPTURE_SOCK: path.join(d, 'none.sock'),
         WOC_DLT_RECEIVE: path.join(d, 'none'), WOC_DLT_RETRY_MS: '600000', WOC_REMOUNT_LOCK: path.join(d, 'shm', 'remount.lock'),
         WOC_STATE_DIR: path.join(d, 'var'), WOC_REBOOT_CMD: nsm + ' --requestRestart 7 --normal',
-        WOC_REBOOT_WAIT_MS: String(waitMs || 600000), WOC_BOOT_ID: path.join(d, 'boot_id'), WOC_PROC_STAT: path.join(d, 'stat')
+        WOC_REBOOT_WAIT_MS: String(waitMs || 600000), WOC_BOOT_ID: path.join(d, 'boot_id'), WOC_PROC_STAT: path.join(d, 'stat'),
+        WOC_PRELOAD_DIR: path.join(d, 'run'), WOC_PRELOAD_LIB: path.join(d, 'lib'), WOC_PASSWD: path.join(d, 'none'), WOC_PROC: path.join(d, 'proc')
     });
     return t;
 }
@@ -102,6 +108,22 @@ function daemon(t) {
             s.on('connect', function () { resolve(api); });
         })(0);
     });
+}
+
+/* t's carplay runs a patch in memory: the plan (one edit at 0x4) and its
+ * record, and carplay's process (4242) holding the plan's bytes at the base
+ * of its mapping of the stand-in file. */
+function inMemory(t) {
+    var target = path.join(t.d, 'carplay'), plan = 'wocplan 1\nbuild-id 00\nedit variant 4 61 62\nend 1\n', st = fs.statSync(target);
+    fs.writeFileSync(path.join(t.d, 'var', 'inmem-carplay.plan'), plan);
+    fs.writeFileSync(path.join(t.d, 'var', 'inmem-carplay.json'), JSON.stringify({ v: 1, enabled: true, target: target, ino: st.ino, size: st.size,
+        mtime: st.mtime.getTime(), planSha256: require('crypto').createHash('sha256').update(plan).digest('hex'), args: [], proven: false, trial: true }) + '\n');
+    var pd = path.join(t.d, 'proc', '4242');
+    fs.mkdirSync(pd);
+    fs.writeFileSync(path.join(pd, 'maps'), '00001000-00002000 r-xp 00000000 fd:00 ' + st.ino + ' /usr/bin/carplay\n');
+    var mem = Buffer.alloc(0x1000 + 8);
+    mem[0x1004] = 0x62;
+    fs.writeFileSync(path.join(pd, 'mem'), mem);
 }
 
 function calls(t) { return fs.readFileSync(t.calls, 'utf8').split('\n').filter(Boolean); }
@@ -205,14 +227,16 @@ async function main() {
     rb = await pk2.next(reply);
     ok('an older patchd\'s marker without a boot id is kept: the restart it waits for is taken', rb.ok === true && fs.existsSync(aam), JSON.stringify(rb));
 
-    /* a marker patchd writes carries this boot's id: the removal rewrites a
-     * pending revert as its own */
+    /* a marker patchd writes carries this boot's id: the removal of a patch
+     * the running carplay holds in memory leaves a revert pending, its own */
     var w = unit(0);
     var wm = path.join(w.d, 'shm', 'activation-pending');
     fs.writeFileSync(wm, JSON.stringify({ action: 'revert' }) + '\n');
+    inMemory(w);
     var hr = cp.spawnSync(process.execPath, [PATCHD, 'deactivate'], { env: w.env, encoding: 'utf8', timeout: 60000 });
     var written = JSON.parse(fs.readFileSync(wm, 'utf8'));
-    ok('writePending stamps the boot id', written.boot === 'boot-2' && written.by === 'removal' && written.action === 'revert',
+    ok('writePending stamps the boot id', written.boot === 'boot-2' && written.by === 'removal' && written.action === 'revert' &&
+        !fs.existsSync(path.join(w.d, 'var', 'inmem-carplay.json')),
         JSON.stringify(written) + ' ' + hr.stdout + hr.stderr);
 
     process.stdout.write(fails ? fails + ' failed\n' : 'all passed\n');

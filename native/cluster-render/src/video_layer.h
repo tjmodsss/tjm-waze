@@ -76,6 +76,25 @@ struct VideoParams {
     bool always_packed = false;
 };
 
+/* A host's edge (PROTOCOL.md "host"): the picture's rows kEdgeInset in
+ * from its top and its bottom drawn on past them, top px above its rect and
+ * bottom px below, blurred along the row by a Gaussian of sigma blur px (0:
+ * none) and darkened with the distance d from the rect to max(1/4, 1 - d /
+ * dim) (dim 0: not); the picture's own rows fade into them over fade px
+ * inside the rect. top and bottom 0: none. */
+struct VideoEdge {
+    uint32_t top = 0, bottom = 0, fade = 0, dim = 0, blur = 0;
+    bool on() const { return top || bottom; }
+    bool operator==(const VideoEdge &o) const
+    {
+        return top == o.top && bottom == o.bottom && fade == o.fade && dim == o.dim && blur == o.blur;
+    }
+    bool operator!=(const VideoEdge &o) const { return !(*this == o); }
+};
+/* The edge quads' effects: the atlas's colour and the packed blocks'. */
+extern const char *const kEdgeAtlasFragmentShader;
+extern const char *const kEdgeBlockFragmentShader;
+
 class VideoLayer : public Layer {
 public:
     /* The packed quad gives way to the exact atlas once no update has needed
@@ -120,6 +139,14 @@ public:
     bool fades() const override { return true; }
 
     const VideoParams &video() const { return p_; }
+
+    /* Its edge (none by default), within its target (the caller clamps
+     * it), drawn by these effects of the edge shaders above: two quads a
+     * kind, over the picture, shown with the atlas or the packed one. True
+     * when it changed. A turned layer's edge is drawn unturned. */
+    bool set_edge(const VideoEdge &e, int atlas_effect, int block_effect);
+    const VideoEdge &edge() const { return edge_; }
+    static const uint32_t kEdgeInset = 2;
 
     /* The atlas tiles (row by row, planner's) the next flush shows wholly
      * under opaque layers, given each tick before stage(); null: none. */
@@ -243,6 +270,12 @@ private:
     bool have_ = false;
 
     int atlas_quad_ = 0, block_quad_ = 0;
+    VideoEdge edge_;
+    int edge_fx_[2] = {0, 0};
+    int edge_quad_[2][2] = {{0, 0}, {0, 0}};   /* [atlas, blocks][top, bottom] */
+    Rect edge_at_;                               /* the rect they were made for */
+    void make_edge_quads();
+    void drop_edge_quads();
     /* parked_: a failed exact write left the atlas unlike any frame; the
      * target holds its flushes until the next whole write. first_: the
      * scene's first write is still to go. source_: drawn by the composite. */

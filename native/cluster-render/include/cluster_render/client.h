@@ -167,10 +167,15 @@ struct Host {
     int src_x = 0, src_y = 0;
     unsigned src_w = 0, src_h = 0;   /* 0: the whole target */
     bool shown = true;
+    /* the edge drawn on the hosted picture (sent, all five, with edge_top or
+     * edge_bottom; the event never carries it) */
+    unsigned edge_top = 0, edge_bottom = 0, edge_fade = 0, edge_dim = 0, edge_blur = 0;
     bool operator==(const Host &o) const
     {
         return target == o.target && into == o.into && x == o.x && y == o.y && w == o.w && h == o.h &&
-               src_x == o.src_x && src_y == o.src_y && src_w == o.src_w && src_h == o.src_h && shown == o.shown;
+               src_x == o.src_x && src_y == o.src_y && src_w == o.src_w && src_h == o.src_h && shown == o.shown &&
+               edge_top == o.edge_top && edge_bottom == o.edge_bottom && edge_fade == o.edge_fade &&
+               edge_dim == o.edge_dim && edge_blur == o.edge_blur;
     }
     bool operator!=(const Host &o) const { return !(*this == o); }
 };

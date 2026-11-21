@@ -556,6 +556,10 @@ bool Client::host(uint32_t ref, const Host &h)
     if (h.src_w && h.src_h)
         kv.insert(kv.end(), {{"src_x", num(h.src_x)}, {"src_y", num(h.src_y)}, {"src_w", num(h.src_w)},
                              {"src_h", num(h.src_h)}});
+    if (h.edge_top || h.edge_bottom)
+        kv.insert(kv.end(), {{"edge_top", num(h.edge_top)}, {"edge_bottom", num(h.edge_bottom)},
+                             {"edge_fade", num(h.edge_fade)}, {"edge_dim", num(h.edge_dim)},
+                             {"edge_blur", num(h.edge_blur)}});
     const std::string json = json_object(kv);
     it->second.hosts[h.target] = json;
     queue(json);

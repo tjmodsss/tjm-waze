@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Robert Nisipeanu
 'use strict';
 /* journal_keep.js: the files' caps, the rate limit that keeps 10 minutes in
- * them under a flood, the lines it writes and leaves out, the load line, and
- * a restart resuming after the newest line with a fake journalctl. */
+ * them under a flood, the lines it writes and leaves out, the load line, a
+ * restart resuming after the newest line with a fake journalctl, and what
+ * it writes to /var/opt: when, what of the files' lines, and how. */
 var assert = require('assert'), fs = require('fs'), os = require('os'), path = require('path'), cp = require('child_process');
 var jk = require('../journal_keep.js');
 
@@ -38,47 +39,6 @@ async function until(what, fn) {
     assert.deepStrictEqual(files(dir), ['journal.log', 'journal.log.1', 'journal.log.2', 'journal.log.3']);
     assert.strictEqual(fs.statSync(again.name(1)).size, 1500, 'the oversize file moved to .1, not written to');
     console.log('ok   rotation: at most FILES files, none past FILE_MAX, oldest dropped, stray rotations removed');
-})();
-
-/* sync (the boot's first minutes): every write is followed by an
- * fdatasync of a read-only descriptor, the write's own closed by then; the
- * files only grow by appends, and the caps and rotation hold. */
-(function () {
-    var dir = fresh('sync'), ring = new jk.Ring(dir, { files: 4, fileMax: 1000 });
-    var realOpen = fs.openSync, realSync = fs.fdatasyncSync, realClose = fs.closeSync, open = {}, events = [];
-    fs.openSync = function (p, flags) {
-        var fd = realOpen.apply(fs, arguments);
-        open[fd] = flags;
-        if (flags === 'a') events.push('write');
-        return fd;
-    };
-    fs.closeSync = function (fd) { delete open[fd]; return realClose.apply(fs, arguments); };
-    fs.fdatasyncSync = function (fd) {
-        assert.strictEqual(open[fd], 'r', 'synced through a read-only descriptor');
-        assert(!Object.keys(open).some(function (k) { return open[k] !== 'r'; }), 'no descriptor open for writing while it syncs');
-        events.push('sync');
-        return realSync.apply(fs, arguments);
-    };
-    try {
-        ring.append([line(0, 90), line(1, 90)], true);
-        var ino = fs.statSync(ring.name(0)).ino, before = fs.readFileSync(ring.name(0));
-        ring.append([line(2, 90)], true);
-        var after = fs.readFileSync(ring.name(0));
-        assert.strictEqual(fs.statSync(ring.name(0)).ino, ino, 'the same file');
-        assert(after.slice(0, before.length).equals(before) && after.length === before.length + 90, 'appended, nothing rewritten');
-        for (var i = 3; i < 200; i += 3) ring.append([line(i, 90), line(i + 1, 90), line(i + 2, 90)], true);
-        var plain = events.length;
-        ring.append([line(300, 90)]);
-    } finally {
-        fs.openSync = realOpen; fs.fdatasyncSync = realSync; fs.closeSync = realClose;
-    }
-    var writes = events.slice(0, plain).filter(function (e) { return e === 'write'; }).length;
-    assert(writes > 67, 'a batch that rotates is written in two');
-    assert.strictEqual(events.slice(0, plain).join(' '), new Array(writes + 1).join('write sync ').trim(), 'each write synced before the next');
-    assert.deepStrictEqual(events.slice(plain), ['write'], 'without sync: the write alone');
-    assert.deepStrictEqual(files(dir), ['journal.log', 'journal.log.1', 'journal.log.2', 'journal.log.3']);
-    files(dir).forEach(function (n) { assert(fs.statSync(path.join(dir, n)).size <= 1000, n); });
-    console.log('ok   sync: each write fdatasynced through a read-only descriptor, appended only, the caps hold');
 })();
 
 /* The shipped caps under a flood: lines of LINE_MAX from both kinds, each
@@ -118,6 +78,141 @@ async function until(what, fn) {
     recent.forEach(function (x) { assert(held[x.n], 'line ' + x.n + ' of the last 10 minutes is held'); });
     assert(/dropped \d+ some lines \(\d+ KiB\) over the rate limit/.test(fs.readFileSync(path.join(dir, 'journal.log'), 'utf8')));
     console.log('ok   a 30-minute flood at 10x the rate: ' + files(dir).length + ' files, ' + total + ' B, the last 10 minutes held');
+})();
+
+/* what is worth writing to /var/opt */
+(function () {
+    function e(unit, msg, extra) {
+        return Object.assign({ __REALTIME_TIMESTAMP: '1', _SYSTEMD_UNIT: unit, SYSLOG_IDENTIFIER: 'x', _PID: '9', MESSAGE: msg }, extra || {});
+    }
+    function pid1(unit, msg) { return { __REALTIME_TIMESTAMP: '1', _SYSTEMD_UNIT: 'init.scope', UNIT: unit, _PID: '1', MESSAGE: msg }; }
+    var cases = [
+        [e('cluster-render.service', 'W cluster-render: INCIDENT target map lost: no frame'), 'incident'],
+        [e('waze-on-cluster.service', 'W waze-on-cluster: INCIDENT map stalled'), 'incident'],
+        [pid1('aapd.service', 'aapd.service: Main process exited, code=dumped, status=11/SEGV'), 'crash'],
+        [pid1('carplay.service', 'carplay.service: Failed with result \'signal\'.'), 'crash'],
+        [pid1('waze-on-cluster.service', 'waze-on-cluster.service: Watchdog timeout (limit 10s)!'), 'crash'],
+        [{ __REALTIME_TIMESTAMP: '1', _TRANSPORT: 'kernel', MESSAGE: 'aapd[812]: segfault at 0 ip 0000 sp 0000 error 4' }, 'crash'],
+        [{ __REALTIME_TIMESTAMP: '1', _TRANSPORT: 'kernel', MESSAGE: 'Out of memory: Killed process 812 (aapd)' }, 'crash'],
+        [e('waze-on-cluster-recovery.service', '[t] recovery: aapd crashes while patched: 1'), 'recovery'],
+        [e('waze-on-cluster-aa-boot.service', '[t] recovery: aapd boot check: restored (aa patch, 1 failed) in 40 ms'), 'recovery'],
+        [e('waze-on-cluster-recovery.service', '[t] recovery: aapd stays down: started 4 times this boot already'), 'recovery'],
+        [e('waze-on-cluster-patchd.service', '[t] boot recovery removed the patch after the patched aapd crashed'), 'patch'],
+        [e('waze-on-cluster-boot.service', '[t] recovery: carplay boot check: idle in 12 ms'), null],
+        [e('waze-on-cluster-boot.service', '[t] recovery: carplay boot check: armed (carplay patch, 0 failed) in 12 ms'), null],
+        [e('waze-on-cluster.service', 'I waze-on-cluster: map — 29 frames/s'), null],
+        [e('carplay.service', 'INCIDENT of carplay\'s own'), null],
+        [pid1('aapd.service', 'Started aapd.'), null],
+        [pid1('other.service', 'other.service: Main process exited, code=dumped, status=11/SEGV'), null],
+        [{ __REALTIME_TIMESTAMP: '1', _SYSTEMD_UNIT: 'init.scope', _PID: '1', MESSAGE: 'Failed to stat watchdog file: No such file or directory' }, null],
+        [{ __REALTIME_TIMESTAMP: '1', _TRANSPORT: 'kernel', MESSAGE: 'Blocking unknown connection: IN=wlan0' }, null]
+    ];
+    cases.forEach(function (c) { assert.strictEqual(jk.trigger(c[0]), c[1], c[0].MESSAGE); });
+    console.log('ok   written to /var/opt for: INCIDENT lines, crashes and failures of the units, segfaults and OOM kills, recovery steps, a patch removed');
+})();
+
+/* condensed: of lines alike but for their numbers, the newest REPEAT_KEEP, in order */
+(function () {
+    var lines = [];
+    for (var i = 0; i < 10; i++) {
+        lines.push('2026-11-03T07:00:0' + i + '.000000Z waze-on-cluster.service waze-on-cluster[7]: I map — ' + (20 + i) + ' frames/s');
+        if (i === 4) lines.push('2026-11-03T07:00:04.500000Z aapd.service aapd[9]: session ended');
+    }
+    var c = jk.condense(lines);
+    assert.strictEqual(c.left, 10 - jk.REPEAT_KEEP);
+    assert.deepStrictEqual(c.lines, [lines[5]].concat(lines.slice(-jk.REPEAT_KEEP)), c.lines.join('\n'));
+    assert.strictEqual(c.leftBytes, lines.slice(0, 5).concat(lines.slice(6, 8)).reduce(function (a, l) { return a + Buffer.byteLength(l) + 1; }, 0));
+    console.log('ok   condensed: repeated lines kept ' + jk.REPEAT_KEEP + ' times, the newest, the others in order');
+})();
+
+/* keep(): the files' newest lines not written yet, condensed, capped, as a
+ * whole file under its final name; the oldest go past the caps */
+(function () {
+    var ram = fresh('keep-ram'), kept = fresh('keep-kept'), ring = new jk.Ring(ram), t0 = Date.UTC(2026, 10, 3, 7);
+    function at(ms, msg) { return Buffer.from(new Date(t0 + ms).toISOString().replace(/Z$/, '000Z') + ' aapd.service aapd[9]: ' + msg + '\n'); }
+    function o(why, now) { return { ring: ring, kept: kept, why: why, now: now, bootId: '0a1b2c3d-4e5f', uptime: 4210.4 }; }
+    function read(n) { return fs.readFileSync(path.join(kept, n), 'utf8').split('\n').filter(Boolean); }
+    assert.strictEqual(jk.keep(o('crash', t0)), null, 'nothing in RAM: nothing written');
+    ring.append([at(0, 'too old'), at(1000, 'start')]);
+    for (var i = 0; i < 20; i++) ring.append([at(jk.WINDOW_S * 1000 + i, 'tick ' + i)]);
+    ring.append([at(jk.WINDOW_S * 1000 + 500, 'segfault')]);
+    var name = jk.keep(o('crash', t0 + 3600000));
+    assert.strictEqual(name, 'journal-20261103T080000Z-crash.log');
+    var l = read(name);
+    assert.deepStrictEqual(l.slice(0, 2), ['2026-11-03T08:00:00.000000Z journal-keep: boot 0a1b2c3d, up 4210 s',
+        '2026-11-03T08:00:00.000000Z journal-keep: kept for crash: 5 of the last 22 lines; 17 repeated lines (1 KiB) and 0 older lines left out']);
+    assert.deepStrictEqual(l.slice(2).map(function (x) { return x.replace(/^\S+ aapd.service aapd\[9\]: /, ''); }),
+        ['start', 'tick 17', 'tick 18', 'tick 19', 'segfault'], 'the window of WINDOW_S before the newest line, condensed');
+    assert.strictEqual(fs.statSync(path.join(kept, name)).mode & 0o777, 0o640 & ~process.umask());
+    assert.deepStrictEqual(fs.readdirSync(kept), [name], 'no temporary file left');
+    assert.strictEqual(jk.keep(o('stop', t0 + 3600000)), null, 'nothing new: nothing written');
+    ring.append([at(jk.WINDOW_S * 1000 + 600, 'after')]);
+    name = jk.keep(o('after', t0 + 3600000));
+    assert.strictEqual(name, 'journal-20261103T080000Z-after.log');
+    assert.deepStrictEqual(read(name).slice(2).map(function (x) { return x.replace(/^.*: /, ''); }), ['after'], 'only what came since');
+    /* the same second and reason twice: a second name, nothing replaced */
+    ring.append([at(jk.WINDOW_S * 1000 + 700, 'again')]);
+    assert.strictEqual(jk.keep(o('after', t0 + 3600000)), 'journal-20261103T080000Z-after-1.log');
+    assert.deepStrictEqual(read('journal-20261103T080000Z-after.log').slice(2).map(function (x) { return x.replace(/^.*: /, ''); }), ['after']);
+    /* a flood: the newest KEEP_MAX bytes */
+    var big = [];
+    for (i = 0; i < 2000; i++) big.push(at(jk.WINDOW_S * 1000 + 1000 + i, 'unique ' + 'abcdefghijklmnopqrstuvwxyz'.charAt(i % 26).repeat(1 + i % 7) + ' ' + 'x'.repeat(300) + ['k', 'l', 'm', 'n'][i % 4] + String.fromCharCode(65 + (i / 26 | 0) % 26)));
+    ring.append(big);
+    name = jk.keep(o('incident', t0 + 3601000));
+    var size = fs.statSync(path.join(kept, name)).size;
+    assert(size <= jk.KEEP_MAX + 512 && size > jk.KEEP_MAX / 2, size + ' B');
+    assert(/ older lines left out$/.test(read(name)[1]) && !/ 0 older lines/.test(read(name)[1]), read(name)[1]);
+    /* a write cut short by a power cut leaves only a temporary file: not a
+     * kept one, gone once a minute old */
+    var stale = path.join(kept, '.journal-20261103T080200Z-crash.123.tmp');
+    fs.writeFileSync(stale, 'half');
+    fs.utimesSync(stale, new Date(Date.now() - 120000), new Date(Date.now() - 120000));
+    var fresh2 = path.join(kept, '.journal-20261103T080300Z-crash.124.tmp');
+    fs.writeFileSync(fresh2, 'being written');
+    jk.prune(kept);
+    assert(!fs.existsSync(stale) && fs.existsSync(fresh2), 'an old temporary file removed, one being written left');
+    fs.unlinkSync(fresh2);
+    /* the caps: KEEP_FILES files, KEEP_TOTAL bytes, the oldest go */
+    for (i = 0; i < jk.KEEP_FILES + 4; i++) fs.writeFileSync(path.join(kept, 'journal-2026110' + (i < 10 ? '2T0' + i : '2T' + i) + '0000Z-crash.log'), 'x\n');
+    jk.prune(kept);
+    var names = fs.readdirSync(kept).sort();
+    assert.strictEqual(names.length, jk.KEEP_FILES);
+    assert(names.indexOf('journal-20261103T080000Z-crash.log') >= 0 && names.indexOf('journal-20261102T000000Z-crash.log') < 0, names.join(' '));
+    fs.writeFileSync(path.join(kept, 'journal-20261104T000000Z-crash.log'), Buffer.alloc(jk.KEEP_TOTAL - 1000));
+    jk.prune(kept);
+    var total = fs.readdirSync(kept).reduce(function (a, n) { return a + fs.statSync(path.join(kept, n)).size; }, 0);
+    assert(total <= jk.KEEP_TOTAL, total + ' B');
+    assert(fs.existsSync(path.join(kept, 'journal-20261104T000000Z-crash.log')), 'the newest stays');
+    /* a stop's or shutdown's files go before a failure's, the one just written never */
+    var rdir = fresh('keep-routine');
+    for (i = 0; i < jk.KEEP_FILES; i++) fs.writeFileSync(path.join(rdir, 'journal-202611' + (10 + i) + 'T000000Z-' + (i % 2 ? 'crash' : 'shutdown') + '.log'), 'x\n');
+    fs.writeFileSync(path.join(rdir, 'journal-20261130T000000Z-shutdown.log'), 'x\n');
+    jk.prune(rdir, 'journal-20261130T000000Z-shutdown.log');
+    names = fs.readdirSync(rdir).sort();
+    assert.strictEqual(names.length, jk.KEEP_FILES);
+    assert(names.indexOf('journal-20261110T000000Z-shutdown.log') < 0 && names.indexOf('journal-20261111T000000Z-crash.log') >= 0 &&
+        names.indexOf('journal-20261130T000000Z-shutdown.log') >= 0, names.join(' '));
+    /* run as root at shutdown: no link in the folders is followed, a file
+     * there is never written in place */
+    var lram = fresh('link-ram'), lkept = fresh('link-kept'), secret = path.join(tmp, 'secret'), target = path.join(tmp, 'target');
+    fs.writeFileSync(secret, 'root only\n');
+    fs.writeFileSync(target, 'untouched\n');
+    var lring = new jk.Ring(lram);
+    ['journal.log', 'kept-last'].forEach(function (n) {
+        fs.symlinkSync(secret, path.join(lram, n));
+        assert.throws(function () { jk.keep({ ring: lring, kept: lkept, why: 'shutdown', now: t0, bootId: 'b', uptime: 1 }); },
+            /ELOOP|EMLINK|not a file/, n);
+        fs.unlinkSync(path.join(lram, n));
+    });
+    assert.deepStrictEqual(fs.readdirSync(lkept), []);
+    lring.append([at(0, 'down')]);
+    fs.symlinkSync(target, path.join(lkept, '.journal-20261103T070000Z-shutdown.' + process.pid + '.tmp'));
+    fs.symlinkSync(target, path.join(lram, 'kept-last.' + process.pid + '.tmp'));
+    name = jk.keep({ ring: lring, kept: lkept, why: 'shutdown', now: t0, bootId: 'b', uptime: 1 });
+    assert.strictEqual(fs.readFileSync(target, 'utf8'), 'untouched\n', 'a link in place of a temporary file is replaced, not followed');
+    assert(/down\n$/.test(fs.readFileSync(path.join(lkept, name), 'utf8')) && !fs.lstatSync(path.join(lram, 'kept-last')).isSymbolicLink());
+    console.log('ok   keep: the last WINDOW_S not written yet, condensed, at most KEEP_MAX, whole or not at all; ' +
+        jk.KEEP_FILES + ' files, ' + jk.KEEP_TOTAL / 1048576 + ' MiB at most, a stop\'s or shutdown\'s first; no link followed');
 })();
 
 /* the line format and journalctl's arguments */
@@ -322,8 +417,8 @@ var USEFUL = [
     fs.writeFileSync(fake, '#!/bin/sh\necho "$@" >> ' + argsLog + '\ncase " $* " in *" -f "*) cat ' + liveFile +
         '; exec sleep 30;; *) cat ' + backlogFile + '; exit $(cat ' + codeFile + ' 2>/dev/null || echo 0);; esac\n');
     fs.chmodSync(fake, 0o755);
-    var env = Object.assign({}, process.env, { WOC_JOURNAL_DIR: dir, WOC_JOURNALCTL: fake, WOC_JOURNAL_FLUSH_MS: '50',
-        WOC_JOURNAL_RESPAWN_MS: '100' });
+    var env = Object.assign({}, process.env, { WOC_JOURNAL_DIR: dir, WOC_JOURNAL_KEPT: fresh('run-kept'), WOC_JOURNALCTL: fake,
+        WOC_JOURNAL_FLUSH_MS: '50', WOC_JOURNAL_RESPAWN_MS: '100' });
     function run() { return cp.spawn(process.execPath, [path.join(__dirname, '..', 'journal_keep.js')], { env: env, stdio: 'ignore' }); }
     function all(d) {
         return fs.readdirSync(d || dir).filter(function (n) { return /^journal\.log/.test(n); }).sort().reverse()
@@ -357,7 +452,7 @@ var USEFUL = [
     fs.chmodSync(early, 0o755);
     var t = Date.now();
     c = cp.spawn(process.execPath, [path.join(__dirname, '..', 'journal_keep.js')], { stdio: 'ignore',
-        env: Object.assign({}, process.env, { WOC_JOURNAL_DIR: edir, WOC_JOURNALCTL: early }) });
+        env: Object.assign({}, process.env, { WOC_JOURNAL_DIR: edir, WOC_JOURNAL_KEPT: fresh('early-kept'), WOC_JOURNALCTL: early }) });
     await until('this boot so far', function () { return all(edir).length >= 3; });
     var backlogMs = Date.now() - t, file = path.join(edir, 'journal.log'), ino = fs.statSync(file).ino, first = fs.readFileSync(file);
     assert(backlogMs < 3000, 'this boot so far written ' + backlogMs + ' ms after the start');
@@ -434,7 +529,10 @@ var USEFUL = [
     put(liveFile, live);
     env.WOC_JOURNAL_DIR = kdir;
     c = run();
-    await until('the flood summarised', function () { return all(kdir).some(function (l) { return /dropped \d+ other lines/.test(l); }); });
+    await until('the flood summarised, the tool lines in', function () {
+        var a = all(kdir);
+        return a.some(function (l) { return /dropped \d+ other lines/.test(l); }) && a.some(function (l) { return / tool 2000$/.test(l); });
+    });
     await stop(c);
     var k = all(kdir);
     assert.strictEqual(k.filter(function (l) { return / tool \d+$/.test(l); }).length, 20, 'every tool line kept');
@@ -506,17 +604,70 @@ var USEFUL = [
     assert(/^load 1\.00 0\.50 0\.25; MemAvailable 100 MiB; D state 0; CPU over 0 s: none; sampled in \d+ ms$/m.test(outText), outText);
     console.log('ok   the service logs a boot line at its start and a load line every LOAD_MS');
 
-    /* prepare: the folder, the group's, 2770 (as root only) */
+    /* written to /var/opt: a failure's lines KEEP_DELAY_MS after it, what
+     * followed KEEP_AFTER_MS later, what is new at a stop; nothing for
+     * routine lines */
+    var wram = fresh('w-ram'), wkept = fresh('w-kept'), wlive = path.join(tmp, 'wlive'), wctl = path.join(tmp, 'journalctl-w');
+    var routine = [];
+    for (i = 1; i <= 50; i++) routine.push(entry(9000 + i, { MESSAGE: 'I waze-on-cluster: map — ' + i + ' frames/s' }));
+    put(backlogFile, routine);
+    put(wlive, [entry(9100, { MESSAGE: 'W waze-on-cluster: INCIDENT map lost' })]);
+    put(liveFile, []);
+    fs.writeFileSync(wctl, '#!/bin/sh\ncase " $* " in *" -f "*) sleep 1; cat ' + wlive + '; sleep 1; cat ' + liveFile +
+        '; exec sleep 30;; *) cat ' + backlogFile + ';; esac\n');
+    fs.chmodSync(wctl, 0o755);
+    var wenv = Object.assign({}, env, { WOC_JOURNAL_DIR: wram, WOC_JOURNAL_KEPT: wkept, WOC_JOURNALCTL: wctl,
+        WOC_JOURNAL_KEEP_DELAY_MS: '300', WOC_JOURNAL_KEEP_AFTER_MS: '1500', WOC_JOURNAL_KEEP_GAP_MS: '1000' });
+    function keptFiles() { return fs.readdirSync(wkept).filter(function (n) { return n[0] !== '.'; }).sort(); }
+    function keptText(n) { return fs.readFileSync(path.join(wkept, n), 'utf8'); }
+    put(liveFile, [entry(9101, { MESSAGE: 'I waze-on-cluster: map back' })]);
+    c = cp.spawn(process.execPath, [path.join(__dirname, '..', 'journal_keep.js')], { env: wenv, stdio: 'ignore' });
+    await delay(800);
+    assert.deepStrictEqual(keptFiles(), [], 'routine lines: nothing written to /var/opt');
+    await until('the failure kept', function () { return keptFiles().length === 1; });
+    var f1 = keptFiles()[0];
+    assert(/^journal-\d{8}T\d{6}Z-incident\.log$/.test(f1), f1);
+    var t1 = keptText(f1);
+    assert(/INCIDENT map lost\n$/.test(t1) || /INCIDENT map lost\n.*map back\n$/.test(t1), t1.slice(-300));
+    assert.strictEqual((t1.match(/frames\/s/g) || []).length, jk.REPEAT_KEEP, 'the routine lines before it, condensed');
+    await until('what followed kept', function () { return keptFiles().length === 2; });
+    var f2 = keptFiles().filter(function (n) { return n !== f1; })[0];
+    assert(/-after\.log$/.test(f2), f2);
+    if (!/map back/.test(t1)) assert(/map back\n$/.test(keptText(f2)), keptText(f2));
+    assert(!/INCIDENT/.test(keptText(f2)), 'nothing twice');
+    new jk.Ring(wram).append([Buffer.from('2026-11-03T07:04:00.000000Z aapd.service aapd[9]: before the stop\n')]);
+    assert.strictEqual(await stop(c), 0);
+    assert(keptFiles().some(function (n) { return /-stop\.log$/.test(n); }), 'the stop writes what is new: ' + keptFiles());
+    var before = keptFiles();
+    /* the shutdown's write, as root runs it: only what is new */
+    var r0 = cp.spawnSync(process.execPath, [path.join(__dirname, '..', 'journal_keep.js'), 'keep', 'shutdown'], { env: wenv, encoding: 'utf8' });
+    assert.strictEqual(r0.status, 0, r0.stderr);
+    assert.strictEqual(r0.stdout.trim(), 'journal-keep: nothing new to keep');
+    assert.deepStrictEqual(keptFiles(), before);
+    new jk.Ring(wram).append([Buffer.from('2026-11-03T07:05:00.000000Z aapd.service aapd[9]: going down\n')]);
+    r0 = cp.spawnSync(process.execPath, [path.join(__dirname, '..', 'journal_keep.js'), 'keep', 'shutdown'], { env: wenv, encoding: 'utf8' });
+    assert(/^journal-keep: kept journal-\d{8}T\d{6}Z-shutdown\.log$/.test(r0.stdout.trim()), r0.stdout + r0.stderr);
+    var sd = keptFiles().filter(function (n) { return /-shutdown\.log$/.test(n); })[0];
+    assert.deepStrictEqual(keptText(sd).split('\n').slice(2), ['2026-11-03T07:05:00.000000Z aapd.service aapd[9]: going down', '']);
+    console.log('ok   /var/opt: a failure\'s lines and what followed a minute later, what is new at a stop and at shutdown; routine lines never');
+
+    /* prepare: the folders, the group's, 2770; the rolling files of an
+     * older version gone from /var/opt (as root only) */
     if (process.getuid && process.getuid() === 0) {
-        var pdir = path.join(tmp, 'prepared');
+        var pdir = path.join(tmp, 'prepared'), pkept = fresh('prepared-kept');
+        fs.writeFileSync(path.join(pkept, 'journal.log'), 'old\n');
+        fs.writeFileSync(path.join(pkept, 'journal.log.3'), 'old\n');
+        fs.writeFileSync(path.join(pkept, 'journal-20261103T080000Z-crash.log'), 'kept\n');
         var r = cp.spawnSync(process.execPath, [path.join(__dirname, '..', 'journal_keep.js'), 'prepare'],
-            { env: Object.assign({}, env, { WOC_JOURNAL_DIR: pdir }), encoding: 'utf8' });
+            { env: Object.assign({}, env, { WOC_JOURNAL_DIR: pdir, WOC_JOURNAL_KEPT: pkept }), encoding: 'utf8' });
         if (/no group systemd-journal/.test(r.stderr)) {
             console.log('ok   prepare: (no systemd-journal group here)');
         } else {
             assert.strictEqual(r.status, 0, r.stderr);
             assert.strictEqual(fs.statSync(pdir).mode & 0o7777, 0o2770);
-            console.log('ok   prepare: the folder made, mode 2770');
+            assert.strictEqual(fs.statSync(pkept).mode & 0o7777, 0o2770);
+            assert.deepStrictEqual(fs.readdirSync(pkept), ['journal-20261103T080000Z-crash.log']);
+            console.log('ok   prepare: the folders made, mode 2770; the older rolling files removed');
         }
     }
     cp.execFileSync('rm', ['-rf', tmp]);

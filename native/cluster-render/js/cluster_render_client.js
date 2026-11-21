@@ -228,6 +228,7 @@ class ClusterRender extends EventEmitter {
         if (ev.ev === 'hello') {
             this.backend = ev.backend;
             this.targets = ev.targets;
+            this.hostEdge = ev.host_edge === 1;   /* takes a host's edge_* */
             this.ready = true;
             this.backoff = 0;
             this._pump();
@@ -394,10 +395,12 @@ class ClusterRender extends EventEmitter {
     /* The scene (made with layers) hosts another target (PROTOCOL.md
      * "host"): opts target, x, y, w, h (in the scene's target), src_x,
      * src_y, src_w, src_h (in the hosted target's pixels; sent, all four,
-     * when src_w and src_h are set, else all of it), shown. Kept by target
-     * and sent again after a reconnect, until the service refuses it or the
-     * scene is replaced; false, nothing sent, for a scene without layers or
-     * a host of its own target. */
+     * when src_w and src_h are set, else all of it), shown; edge_top,
+     * edge_bottom, edge_fade, edge_dim, edge_blur (the edge drawn on the
+     * hosted picture; sent, all five, when edge_top or edge_bottom is set).
+     * Kept by target and sent again after a reconnect, until the service
+     * refuses it or the scene is replaced; false, nothing sent, for a scene
+     * without layers or a host of its own target. */
     host(ref, opts) {
         const l = this.layers.get(ref);
         /* what the service refuses whatever it holds is not sent or kept */
@@ -411,6 +414,8 @@ class ClusterRender extends EventEmitter {
             m.src_w = opts.src_w;
             m.src_h = opts.src_h;
         }
+        if (opts.edge_top || opts.edge_bottom)
+            ['edge_top', 'edge_bottom', 'edge_fade', 'edge_dim', 'edge_blur'].forEach((k) => { m[k] = opts[k] || 0; });
         l.hosts.set(opts.target, m);
         this._send(m);
         return true;

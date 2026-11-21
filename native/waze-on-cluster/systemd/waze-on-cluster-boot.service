@@ -3,7 +3,9 @@
 [Unit]
 Description=waze-on-cluster boot check: restore the original carplay before it starts if the map patch keeps the head unit from starting
 RequiresMountsFor=/var/opt
-After=local-fs.target
+# codingshm publishes the cluster coding a plan still to make reads; carplay
+# is ordered after it too, so this adds no wait to carplay's start.
+After=local-fs.target codingshm.service
 # carplay.service (WantedBy=late.target, after multi-user.target) starts only
 # once this has finished, failed or timed out; it does not require it.
 Before=carplay.service

@@ -311,11 +311,13 @@ var lx = require(path.join(CUR, 'logs_extra.js'));
     fs.writeFileSync(path.join(d, 'kept-journal.log.1'), '2026-11-14T17:50:10.000000Z waze-on-cluster-journal.service node[900]: journal-keep: boot 0a1b2c3d, up 10 s\n' +
         '2026-11-14T19:00:00.000000Z waze-on-cluster-journal.service node[901]: journal-keep: boot 0a1b2c3d, up 4210 s\n');
     fs.writeFileSync(path.join(d, 'kept-journal.log'), '2026-11-14T20:59:12.500000Z waze-on-cluster-journal.service node[700]: journal-keep: boot 99ffee00, up 12 s\n');
+    fs.writeFileSync(path.join(d, 'kept-journal-20261114T160000Z-shutdown.log'), '2026-11-14T16:00:00.000000Z journal-keep: boot 5e5e5e5e, up 600 s\n' +
+        '2026-11-14T16:00:00.000000Z journal-keep: kept for shutdown: 1 of the last 1 lines; 0 repeated lines (0 KiB) and 0 older lines left out\n');
     fs.writeFileSync(path.join(d, 'other.log'), '2026-11-14 20:00:00.000 W INCIDENT not a tool log\n');
     var t = lx.incidentsText(d, Date.UTC(2026, 10, 14, 21, 10));
     assert.strictEqual(t, '-- INCIDENT lines of cluster-render.log* and waze-on-cluster.log*, the boots the kept journal saw and this export; ' +
         'oldest first, UTC (~: no time)\n' +
-        '2026-11-14 17:49:50.000 -- boot 0a1b2c3d\n2026-11-14 18:00:00.000 cluster-render: W INCIDENT map lost: render restarted\n' +
+        '2026-11-14 15:50:00.000 -- boot 5e5e5e5e\n2026-11-14 17:49:50.000 -- boot 0a1b2c3d\n2026-11-14 18:00:00.000 cluster-render: W INCIDENT map lost: render restarted\n' +
         '2026-11-14 20:59:00.500 -- boot 99ffee00\n2026-11-14 21:04:59.900 waze-on-cluster: W INCIDENT no frames for 5 s\n' +
         '2026-11-14 21:05:00.100 cluster-render: W INCIDENT map lost: slot unmapped\n~ waze-on-cluster: no time INCIDENT odd\n' +
         '2026-11-14 21:10:00.000 -- this export\n', t);
@@ -331,10 +333,18 @@ var lx = require(path.join(CUR, 'logs_extra.js'));
     var IDS = ['WBA5R1C50KAB12345', 'AB12345', '4e:56:8d:d6:ba:f4', 'Alex Home WiFi', '203.0.113.77', 'Alex\'s iPhone', 'ghp_FAKEtoken0123456789abcdefghijklmnop'];
     put('var/opt/cluster-render/log/cluster-render.log', '2026-11-14 21:05:00.100 W INCIDENT map lost for WBA5R1C50KAB12345\n');
     put('var/opt/waze-on-cluster/log/waze-on-cluster.log', '2026-11-14 21:04:59.900 W INCIDENT peer 4e:56:8d:d6:ba:f4 gone\n');
-    put('var/opt/waze-on-cluster/journal/journal.log', '2026-11-14T20:59:12.500000Z waze-on-cluster-journal.service node[700]: journal-keep: boot 99ffee00, up 12 s\n' +
+    put('run/waze-on-cluster-journal/journal.log', '2026-11-14T20:59:12.500000Z waze-on-cluster-journal.service node[700]: journal-keep: boot 99ffee00, up 12 s\n' +
         '2026-11-14T21:00:00.000000Z kernel: connecting with4e:56:8d:d6:ba:f4 ssid "Alex Home WiFi", len (14)\n' +
         '2026-11-14T21:00:01.000000Z carplay.service carplay[812]: device name: Alex\'s iPhone\n');
-    put('var/opt/waze-on-cluster/journal/journal.log.1', '2026-11-14T20:00:00.000000Z recmgr.service recmgr[600]: AB12345 restart, gw 203.0.113.77\n');
+    put('run/waze-on-cluster-journal/journal.log.1', '2026-11-14T20:00:00.000000Z recmgr.service recmgr[600]: AB12345 restart, gw 203.0.113.77\n');
+    /* kept on /var/opt at an earlier boot's shutdown; a write a power cut
+     * left as a temporary file, and an older version's rolling file, not
+     * taken */
+    put('var/opt/waze-on-cluster/journal/journal-20261114T195000Z-shutdown.log', '2026-11-14T19:50:00.000000Z journal-keep: boot 5e5e5e5e, up 600 s\n' +
+        '2026-11-14T19:50:00.000000Z journal-keep: kept for shutdown: 1 of the last 1 lines; 0 repeated lines (0 KiB) and 0 older lines left out\n' +
+        '2026-11-14T19:49:59.000000Z aapd.service aapd[812]: phone Alex\'s iPhone gone\n');
+    put('var/opt/waze-on-cluster/journal/.journal-20261114T195500Z-crash.99.tmp', 'half\n');
+    put('var/opt/waze-on-cluster/journal/journal.log', 'old\n');
     put('var/opt/waze-on-cluster/waze-on-cluster.local.conf', 'token = ghp_FAKEtoken0123456789abcdefghijklmnop\n');
     /* the car's VIN known from the coding image only, its last 7 glued to a name in a log */
     var codingImage = Buffer.alloc(0x1030);
@@ -370,14 +380,18 @@ var lx = require(path.join(CUR, 'logs_extra.js'));
     var srv = serve('answer'), r;
     try { r = run(); } finally { srv.kill(); }
     var f = r.files;
-    ['cluster-render.log', 'waze-on-cluster.log', 'kept-journal.log', 'kept-journal.log.1', 'waze-on-cluster.local.conf', 'patchd-logs.json',
-        'incidents.txt', 'wifi.txt', 'time.txt'].forEach(function (n) { assert(f[n] !== undefined, n + ' in the archive: ' + Object.keys(f)); });
+    ['cluster-render.log', 'waze-on-cluster.log', 'kept-journal.log', 'kept-journal.log.1', 'kept-journal-20261114T195000Z-shutdown.log',
+        'waze-on-cluster.local.conf', 'patchd-logs.json', 'incidents.txt', 'wifi.txt', 'time.txt'].forEach(function (n) {
+        assert(f[n] !== undefined, n + ' in the archive: ' + Object.keys(f));
+    });
+    assert(!Object.keys(f).some(function (n) { return /tmp|^kept-\.|^journal\.log/.test(n); }), 'no temporary or older file: ' + Object.keys(f));
+    assert(/aapd\[812\]: phone <DEVICE> gone/.test(f['kept-journal-20261114T195000Z-shutdown.log']), f['kept-journal-20261114T195000Z-shutdown.log']);
     Object.keys(f).forEach(function (n) {
         IDS.forEach(function (x) { assert(f[n].indexOf(x) < 0, n + ' holds ' + x + ':\n' + f[n]); });
     });
     var pl = JSON.parse(f['patchd-logs.json']);
     assert(pl.ev === 'logs' && pl.dlt.state === 'receiving' && /CarPlay session with <DEVICE> \(<MAC-[0-9a-f]{6}>\)/.test(pl.carplay[0].msg), f['patchd-logs.json']);
-    assert(/^2026-11-14 20:59:00\.500 -- boot 99ffee00\n2026-11-14 21:04:59\.900 waze-on-cluster: W INCIDENT peer <MAC-[0-9a-f]{6}> gone\n2026-11-14 21:05:00\.100 cluster-render: W INCIDENT map lost for <VIN>\n\S+ \S+ -- this export\n$/m
+    assert(/^2026-11-14 19:40:00\.000 -- boot 5e5e5e5e\n2026-11-14 20:59:00\.500 -- boot 99ffee00\n2026-11-14 21:04:59\.900 waze-on-cluster: W INCIDENT peer <MAC-[0-9a-f]{6}> gone\n2026-11-14 21:05:00\.100 cluster-render: W INCIDENT map lost for <VIN>\n\S+ \S+ -- this export\n$/m
         .test(f['incidents.txt'].split('\n').slice(1).join('\n')), f['incidents.txt']);
     assert(f['left-out.txt'] === undefined, 'nothing left out: ' + f['left-out.txt']);
     console.log('ok   the export: patchd\'s diagnostics, incidents.txt, every file scrubbed (' + r.ms + ' ms)');

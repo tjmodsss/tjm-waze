@@ -84,6 +84,13 @@ assert(!c.enable.some(function (e) { return /journal\.service|logs(-fw)?\.servic
  * by themselves, are left to run out their window. */
 assert(c.restart.indexOf('waze-on-cluster-journal.service') >= 0);
 assert(c.restart.indexOf('waze-on-cluster-logs.service') < 0 && c.restart.indexOf('waze-on-cluster-logs-fw.service') < 0);
+/* The journal service writes only its RAM folder and its folder on
+ * /var/opt; var-opt-ro.service has it write its newest lines there at each
+ * shutdown, after the boot recovery's marks, a failure holding up nothing. */
+assert.deepStrictEqual(unit('waze-on-cluster-journal.service').ReadWritePaths, ['-/run/waze-on-cluster-journal -/var/opt/waze-on-cluster/journal']);
+var ro = unit('var-opt-ro.service.d/50-waze-on-cluster.conf');
+assert.deepStrictEqual(ro.ExecStartPre, ['-/bin/sh /var/opt/waze-on-cluster/current/shutdown_mark.sh',
+    '-/usr/bin/node /var/opt/waze-on-cluster/current/journal_keep.js keep shutdown']);
 console.log('ok   journal and logs units: in recmgr, ordered against none of the head unit\'s, started by a timer 10 s after boot or on demand, no core dumps, root only in node and the firewall unit');
 
 /* On a head unit that refuses it the capture stays up and exits only on a

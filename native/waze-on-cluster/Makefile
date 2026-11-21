@@ -59,7 +59,7 @@ WOC_SRC = src/main.cpp src/refused.cpp src/video_producer.cpp src/freeze_watch.c
 CR_SRC  = $(CR)/client/client.cpp $(CR)/client/protocol.cpp
 SRC     = $(WOC_SRC) $(CR_SRC) $(CR)/src/config.cpp $(CR)/src/log.cpp $(CR)/src/head_unit.cpp
 
-.PHONY: all test test-bin test-cpp test-node test-x86 test-x86-in-docker test-firmware target target-in-docker clean
+.PHONY: all test test-bin test-cpp test-node test-x86 test-x86-in-docker test-firmware target target-in-docker test-preload test-preload-in-docker clean
 
 CPP_TESTS = $(BUILD)/host/nal_reader_test $(BUILD)/host/rtp_h264_test $(BUILD)/host/udp_probe_test \
 		$(BUILD)/host/map_feed_test $(BUILD)/host/keyframe_wait_test $(BUILD)/host/freeze_watch_test \
@@ -105,6 +105,8 @@ test-node:
 	umask 077 && $(NODE) patch/test/wifi_band_test.js
 	umask 077 && $(NODE) patch/test/dlt_capture_test.js
 	umask 077 && $(NODE) patch/test/recovery_test.js
+	umask 077 && $(NODE) patch/test/recovery_lock_test.js
+	umask 077 && $(NODE) patch/test/inmem_test.js
 	umask 077 && $(NODE) patch/test/journal_keep_test.js
 	umask 077 && $(NODE) patch/test/logs_test.js
 	umask 077 && $(NODE) patch/test/collect_logs_test.js
@@ -266,7 +268,36 @@ target:
 	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w" -v "$(abspath $(CR)):/cr" -w /w $(IMAGE) \
 		make -s -j$(JOBS) BUILD=$(BUILD) CR=/cr target-in-docker
 
-target-in-docker: $(T)/waze-on-cluster
+target-in-docker: $(T)/waze-on-cluster $(T)/libwocpatch.so
+
+# The in-memory carplay patch (preload/wocpatch.c, PATCH.md "In memory"):
+# C, no C++ runtime, exports nothing, libc only.
+PRELOAD_FLAGS = -std=gnu99 -O2 -g -Wall -Wextra -Werror -fPIC -fvisibility=hidden -D_FORTIFY_SOURCE=2
+PRELOAD_LINK = -shared -Wl,-z,now -Wl,-z,relro -Wl,--no-undefined
+
+$(T)/libwocpatch.so: preload/wocpatch.c
+	@mkdir -p $(@D)
+	gcc $(PRELOAD_FLAGS) $(PRELOAD_LINK) -o $@ $<
+
+# The library against a test program, in the unit's toolchain image.
+test-preload:
+	$(DOCKER_IMAGE)
+	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w" -v "$(abspath $(CR)):/cr" -w /w $(IMAGE) \
+		make -s BUILD=$(BUILD)/x86 CR=/cr test-preload-in-docker
+
+test-preload-in-docker: $(BUILD)/preload/libwocpatch.so $(BUILD)/preload/libwocpatch-crash.so
+	gcc -std=gnu99 -O2 -fPIE -pie -Wl,--build-id -o $(BUILD)/preload/target preload/test/target.c
+	gcc -std=gnu99 -O2 -fPIC -shared -o $(BUILD)/preload/libthread.so preload/test/thread.c -lpthread
+	sh preload/test/preload_test.sh $(abspath $(BUILD)/preload/libwocpatch.so) $(abspath $(BUILD)/preload/target) $(abspath $(BUILD)/preload/work)
+
+# A test build that aborts once it has applied: an armed start that crashes.
+$(BUILD)/preload/libwocpatch-crash.so: preload/wocpatch.c
+	@mkdir -p $(@D)
+	gcc $(PRELOAD_FLAGS) -DWOC_TEST_CRASH $(PRELOAD_LINK) -o $@ $<
+
+$(BUILD)/preload/libwocpatch.so: preload/wocpatch.c
+	@mkdir -p $(@D)
+	gcc $(PRELOAD_FLAGS) $(PRELOAD_LINK) -o $@ $<
 
 # Link-only stubs exporting the unit libraries' symbols. Each carries the real
 # SONAME, so the binary records the right DT_NEEDED.

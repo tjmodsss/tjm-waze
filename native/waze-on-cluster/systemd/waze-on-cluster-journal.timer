@@ -5,8 +5,8 @@ Description=waze-on-cluster journal keeper, 10 s after boot
 
 [Timer]
 # Early, so a start the head unit resets within its first minute or two
-# still leaves its lines on /var/opt; the service reads what this boot
-# logged before it. Nothing waits for it: a timer orders nothing, and the
+# has its lines in RAM when the shutdown writes them to /var/opt; the
+# service reads what this boot logged before it. Nothing waits for it: a timer orders nothing, and the
 # service runs at the lowest CPU and I/O priority.
 OnBootSec=10
 # systemd's default accuracy (1 min) would let it start up to 70 s after boot.

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Robert Nisipeanu
 'use strict';
-var assert = require('assert'), fs = require('fs'), os = require('os');
+var assert = require('assert'), fs = require('fs');
 var net = require('net'), path = require('path'), cp = require('child_process');
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-'));
+var dir = require('./tmp.js').dir();
 var helper = path.join(__dirname, '..', 'dlt_capture.js');
 var children = [], sockets = [], modes = [], levels = [], reqs = [], behavior = 'ok', tcp, level = 4;
 var env = Object.assign({}, process.env, {

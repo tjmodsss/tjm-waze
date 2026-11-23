@@ -9,10 +9,10 @@
  * rewrites it, null removes it.
  */
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-hu-'));
+var dir = tmp.dir();
 var CMDLINE = process.env.WOC_CMDLINE = path.join(dir, 'cmdline');
 var CODING = process.env.WOC_CODING = path.join(dir, 'rawcodingdata');
 
@@ -44,6 +44,5 @@ function coding(v, flags) {
 
 set(HIGH);
 coding(7);
-process.on('exit', function () { [CMDLINE, CODING].forEach(function (f) { try { fs.unlinkSync(f); } catch (e) {} }); try { fs.rmdirSync(dir); } catch (e) {} });
 
 module.exports = { set: set, HIGH: HIGH, HIGHF: HIGHF, MID: MID, NONE: NONE, REFUSED: REFUSED, coding: coding, codingImage: codingImage, CODING: CODING };

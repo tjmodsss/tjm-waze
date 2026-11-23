@@ -556,6 +556,12 @@ void EffectLayer::cluster_time()
         log_warn("layer %u: u_time: %s", id_, err.c_str());
 }
 
+void EffectLayer::set_look(const PartLook &look)
+{
+    look_ = look;
+    look_dirty_ = g_ != nullptr;
+}
+
 bool EffectLayer::attach(Graph *g, int64_t, std::string *err)
 {
     g_ = g;
@@ -565,6 +571,12 @@ bool EffectLayer::attach(Graph *g, int64_t, std::string *err)
         detach(true);
         return false;
     }
+    if (look_ != quad_look() && !g->style(quad_, look_)) {
+        *err = "the renderer refused the layer's render state";
+        detach(true);
+        return false;
+    }
+    look_dirty_ = false;
     drawn_ = false;
     uniforms_.dirty_all();
     start_animations();
@@ -618,6 +630,13 @@ Stage EffectLayer::stage(int64_t now_ms)
         set_uniform("u_time", &t, 1);
     }
     staged_ = uniforms_.stage(g_, quad_);
+    if (look_dirty_) {
+        if (g_->style(quad_, look_))
+            staged_ = true;
+        else
+            log_error("layer %u: the renderer refused its render state", id_);
+        look_dirty_ = false;
+    }
     return staged_ ? Stage::Wrote : Stage::Idle;
 }
 

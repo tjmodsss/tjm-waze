@@ -12,8 +12,8 @@
 var headUnit = require('./head_unit_env.js');
 
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
 var synthetic = require('./synthetic_carplay.js');
 var gate = require('../head_unit.js');
@@ -40,7 +40,7 @@ cases.forEach(function (c) {
     ok('case: ' + c.name, got === c.refused, got);
 });
 
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-hu-patch-'));
+var dir = tmp.dir();
 var tgt = path.join(dir, 'carplay'), stock = synthetic.build({}).buf;
 function fresh() {
     [tgt + '.woc-orig', tgt + '.woc-orig.json'].forEach(function (f) { try { fs.unlinkSync(f); } catch (e) {} });
@@ -75,13 +75,14 @@ try {
     ok('no hwvariant=: carplay revert restores the original an earlier release patched', r.code === 0 && fs.readFileSync(tgt).equals(stock), r.out);
 
     /* aapd: the gate comes before any file is read, so these paths need not exist. */
-    var aa = ['apply', '--target', path.join(dir, 'aapd'), '--conf', path.join(dir, 'aapd.conf'), '--coding', path.join(dir, 'coding'), '--yes'];
+    var aa = ['plan', '--target', path.join(dir, 'aapd'), '--conf', path.join(dir, 'aapd.conf'), '--coding', path.join(dir, 'coding'),
+        '--out', path.join(dir, 'aapd.plan'), '--conf-out', path.join(dir, 'aapd.conf.copy')];
     r = run(AAPD_PATCH, aa);
-    ok('no hwvariant=: aapd apply refuses with the reason line', r.code !== 0 && r.out === 'error: refusing: ' + headUnit.REFUSED + '\n', r.out);
+    ok('no hwvariant=: aapd plan refuses with the reason line', r.code !== 0 && r.out === 'error: refusing: ' + headUnit.REFUSED + '\n', r.out);
     [['HIGH', headUnit.HIGH], ['HIGH F', headUnit.HIGHF]].forEach(function (u) {
         headUnit.set(u[1]);
         r = run(AAPD_PATCH, aa);
-        ok(u[0] + ': aapd apply gets past the gate (to the coding check)', r.code !== 0 && /cluster coding cannot be read/.test(r.out), r.out);
+        ok(u[0] + ': aapd plan gets past the gate (to the coding check)', r.code !== 0 && /cluster coding cannot be read/.test(r.out), r.out);
     });
 } finally {
     cp.execFileSync('rm', ['-rf', dir]);

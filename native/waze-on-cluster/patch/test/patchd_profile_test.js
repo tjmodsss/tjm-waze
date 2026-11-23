@@ -24,11 +24,11 @@
 var cp = require('child_process');
 var fs = require('fs');
 var net = require('net');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 
 var PATCHD = path.join(__dirname, '..', 'patchd.js');
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-prof-'));
+var dir = tmp.dir();
 var SOCK = path.join(dir, 'sock', 'patch.sock');
 var CONF = path.join(dir, 'waze-on-cluster.local.conf');
 var STATE = path.join(dir, 'map.state.conf');

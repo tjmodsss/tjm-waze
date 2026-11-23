@@ -38,6 +38,7 @@
 #ifdef CRS_RAMSES27
 #include "../src/graph_ramses27.h"
 #include "ramses-client-api/RamsesClient.h"
+#include "ramses-client-api/TextureEnums.h"
 #include "ramses-framework-api/RamsesFramework.h"
 #include "ramses-framework-api/RamsesFrameworkConfig.h"
 #else
@@ -365,16 +366,80 @@ static void backend(Gpu &gpu)
        atlas && sprite && g->write(atlas, 0, 0, 64, 32, px.data()) && g->write(sprite, 0, 0, 16, 16, px.data()) &&
            q1 && g->texture(q1, "u_atlas", atlas) && g->texture(q1, "u_sprite", sprite));
     const std::vector<uint8_t> blocks(tex_bytes(TexFormat::ETC2RGBA, 16, 16), 0x55);
-    const int etc2rgba =
-        g->immutable_texture(TexFormat::ETC2RGBA, 16, 16, Sampling::Bilinear, Wrap::Clamp, blocks.data(), blocks.size());
-    const int etc2rgb = g->immutable_texture(TexFormat::ETC2RGB, 16, 16, Sampling::Nearest, Wrap::Repeat, blocks.data(),
-                                             tex_bytes(TexFormat::ETC2RGB, 16, 16));
+    Sampler bilinear, repeat;
+    bilinear.sampling = Sampling::Bilinear;
+    repeat.u = repeat.v = Wrap::Repeat;
+    const int etc2rgba = g->immutable_texture(TexFormat::ETC2RGBA, 16, 16, bilinear, 1, blocks.data(), blocks.size());
+    const int etc2rgb =
+        g->immutable_texture(TexFormat::ETC2RGB, 16, 16, repeat, 1, blocks.data(), tex_bytes(TexFormat::ETC2RGB, 16, 16));
     const int q0 = g->quad(glyph_fx, r);
     ok("etc2rgba and etc2rgb textures, sampled by one quad",
        etc2rgba && etc2rgb && q0 && g->texture(q0, "u_atlas", etc2rgb) && g->texture(q0, "u_sprite", etc2rgba) &&
            !g->write(etc2rgb, 0, 0, 4, 4, blocks.data()));
     ok("a vec4 array uniform and a turn", g->uniform_array(q1, "u_cells", UniformType::Vec4, cells, 4) &&
                                              g->turn(q1, turn) && g->show(q1, true) && g->order(q1, 0));
+
+    /* Samplers and mip levels (PROTOCOL.md "Mipmaps"): every sampling,
+     * wrap per axis, anisotropy; a buffer's levels written each, and a
+     * compressed chain. */
+    const Sampling samplings[] = {Sampling::NearestMips, Sampling::BilinearMips, Sampling::Trilinear,
+                                  Sampling::MinLinearMagNearest, Sampling::MinNearestMagLinear};
+    bool sampled = true;
+    std::vector<int> mipped;
+    for (Sampling sm : samplings) {
+        Sampler smp;
+        smp.sampling = sm;
+        smp.u = Wrap::Mirror;
+        smp.v = Wrap::Repeat;
+        smp.anisotropy = 4;
+        const uint32_t levels = sampling_mips(sm) ? mip_levels(64, 32) : 1;
+        const int b = g->buffer(TexFormat::RGBA8, 64, 32, smp, levels);
+        for (uint32_t l = 0; b && l < levels; l++)
+            sampled = sampled && g->write_level(b, l, 0, 0, mip_size(64, l), mip_size(32, l), px.data());
+        sampled = sampled && b;
+        mipped.push_back(b);
+    }
+    ok("mipmapped, mirrored, anisotropic buffers of every sampling, each level written", sampled);
+    ok("a level past the buffer's refused", !g->write_level(mipped[0], 7, 0, 0, 1, 1, px.data()));
+    Sampler trilinear;
+    trilinear.sampling = Sampling::Trilinear;
+    const uint32_t clevels = mip_levels(TexFormat::ETC2RGBA, 64, 32);   /* 64x32, 32x16, 16x8, 8x4 */
+    const std::vector<uint8_t> chain(tex_chain_bytes(TexFormat::ETC2RGBA, 64, 32, clevels), 0x33);
+    const int etc2mips =
+        g->immutable_texture(TexFormat::ETC2RGBA, 64, 32, trilinear, clevels, chain.data(), chain.size());
+    ok("an etc2rgba texture with every mip level", etc2mips && g->texture(q0, "u_atlas", etc2mips) &&
+                                                       g->texture(q1, "u_sprite", mipped[2]));
+    ok("a chain of the wrong length refused",
+       !g->immutable_texture(TexFormat::ETC2RGBA, 64, 32, trilinear, clevels, chain.data(), chain.size() - 16));
+
+    /* Render state (PROTOCOL.md "Render state"): every blend factor and
+     * operation and a colour mask on a quad. */
+    const BlendFactor factors[] = {BlendFactor::Zero,     BlendFactor::One,      BlendFactor::SrcAlpha,
+                                   BlendFactor::OneMinusSrcAlpha, BlendFactor::DstAlpha, BlendFactor::OneMinusDstAlpha};
+    const BlendOp ops[] = {BlendOp::Add, BlendOp::Subtract, BlendOp::ReverseSubtract, BlendOp::Min, BlendOp::Max};
+    /* Each of the four factors takes every factor, each operation every
+     * operation, on colour and alpha. */
+    bool styled = true;
+    for (int f = 0; f < 6; f++)
+        for (int o = 0; o < 5; o++) {
+            PartLook look = quad_look();
+            look.has_custom = true;
+            look.custom.src = factors[f];
+            look.custom.dst = factors[(f + 1) % 6];
+            look.custom.src_alpha = factors[(f + 2) % 6];
+            look.custom.dst_alpha = factors[(f + 3) % 6];
+            look.custom.op = ops[o];
+            look.custom.op_alpha = ops[(o + 1) % 5];
+            look.color_mask = kMaskR | kMaskB;
+            styled = styled && g->style(q0, look);
+        }
+    for (Blend b : {Blend::Alpha, Blend::Add, Blend::None, Blend::Premultiplied, Blend::Max, Blend::Min,
+                    Blend::Subtract}) {
+        PartLook look = quad_look();
+        look.blend = b;
+        styled = styled && g->style(q1, look);
+    }
+    ok("quads styled with every factor, operation, preset and a colour mask", styled && g->flush(1));
     Projection persp;
     Projection ortho;
     ortho.ortho = true;
@@ -399,6 +464,9 @@ static void backend(Gpu &gpu)
     flat.depth = false; flat.cull = Cull::None; flat.blend = Blend::Add;
     PartLook opaque;
     opaque.blend = Blend::None; opaque.cull = Cull::Front;
+    opaque.depth_func = DepthFunc::GreaterEqual;
+    opaque.depth_write = false;
+    opaque.color_mask = kMaskA;
     const int p1 = g->part(v1, lit_fx, PartLook());
     const int p2 = g->part(v1, all_fx, flat);
     const int p3 = g->part(v2, all_fx, opaque);
@@ -457,6 +525,96 @@ static void backend(Gpu &gpu)
     ok("parts, views and quads dropped with their animations", g->flush(7));
 #ifndef CRS_RAMSES27
     ok("and the scene described whole again", described("check"));
+#endif
+    /* Canvases (PROTOCOL.md "Canvases"): one with a depth-stencil buffer,
+     * a quad in it writing the stencil and one testing it, a view with a
+     * part in it, a quad on screen sampling it; one drawn once, redrawn;
+     * both dropped. */
+    CanvasSpec cs;
+    cs.w = 256;
+    cs.h = 128;
+    cs.depth = true;
+    cs.clear[2] = 1;
+    cs.clear[3] = 1;
+    cs.sampler.sampling = Sampling::Bilinear;
+    const int canvas = g->canvas(cs);
+    CanvasSpec os = cs;
+    os.depth = false;
+    os.once = true;
+    const int once = g->canvas(os);
+    Rect cr;
+    cr.w = 128;
+    cr.h = 64;
+    const int cq1 = g->quad_in(canvas, glyph_fx, cr);
+    cr.x = 64;
+    const int cq2 = g->quad_in(canvas, glyph_fx, cr);
+    PartLook writes = quad_look(), tests = quad_look();
+    writes.stencil.func = StencilFunc::Always;
+    writes.stencil.ref = 1;
+    writes.stencil.pass = StencilOp::Replace;
+    writes.color_mask = 0;
+    tests.stencil.func = StencilFunc::NotEqual;
+    tests.stencil.ref = 1;
+    Rect vr2;
+    vr2.w = 256;
+    vr2.h = 128;
+    const int cv = g->view_in(canvas, vr2, persp, cam);
+    const int cp = cv ? g->part(cv, lit_fx, PartLook()) : 0;
+    const int oq = g->quad_in(once, glyph_fx, cr);
+    Rect sr;
+    sr.x = 300; sr.y = 300; sr.w = 256; sr.h = 128;
+    const int screen = g->quad(glyph_fx, sr);
+    ok("canvases: made, quads and a view drawn in them",
+       canvas && once && cq1 && cq2 && cv && cp && oq && screen && g->geometry(cp, cube.geometry()) &&
+           g->style(cq1, writes) && g->style(cq2, tests) && g->show(cq1, true) && g->show(cq2, true) &&
+           g->show(cv, true) && g->show(oq, true) && g->order(cq1, 0) && g->order(cv, 4) && g->order(cq2, 8));
+    ok("canvases: sampled on screen", g->texture(screen, "u_atlas", canvas) && g->texture(screen, "u_sprite", once) &&
+                                          g->show(screen, true) && g->flush(8));
+    ok("canvases: one drawn once, drawn again", g->redraw(once) && g->flush(9));
+    CanvasReadback rb, ro;
+    /* A round trip through the library's own tables, not evidence of the
+     * enums (ABI.md has that): the canvas as made, the copy unblended. */
+    ok("canvases: read back as made: colour buffers drawn in and sampled, a depth-stencil one only drawn in; the "
+       "copy writes alpha, unblended",
+       g->read_canvas(canvas, &rb) && rb.color_format == (int)ramses::ERenderBufferFormat_RGBA8 &&
+           rb.color_type == (int)ramses::ERenderBufferType_Color &&
+           rb.color_access == (int)ramses::ERenderBufferAccessMode_ReadWrite &&
+           rb.shown_format == (int)ramses::ERenderBufferFormat_RGBA8 &&
+           rb.shown_type == (int)ramses::ERenderBufferType_Color &&
+           rb.shown_access == (int)ramses::ERenderBufferAccessMode_ReadWrite &&
+           rb.depth_format == (int)ramses::ERenderBufferFormat_Depth24_Stencil8 &&
+           rb.depth_type == (int)ramses::ERenderBufferType_DepthStencil &&
+           rb.depth_access == (int)ramses::ERenderBufferAccessMode_WriteOnly && rb.copy_writes_alpha &&
+           !rb.copy_blends && g->read_canvas(once, &ro) && ro.depth_format == -1 &&
+           ro.first_order > rb.copy_order && rb.copy_order > rb.first_order);
+    ok("canvases: one drawn every frame disabled and enabled again",
+       g->enable_canvas(canvas, false) && g->read_canvas(canvas, &rb) && !rb.enabled && g->flush(9) &&
+           g->enable_canvas(canvas, true) && g->read_canvas(canvas, &rb) && rb.enabled && g->flush(9));
+    /* Every slot of render orders taken: the canvases take the first ones
+     * again, made-before still drawn first. */
+    bool cycled = true;
+    for (int i = 0; i < kCanvasSlots + 2 && cycled; i++) {
+        const int c = g->canvas(os);
+        cycled = c && g->flush(9);
+        g->drop_canvas(c);
+    }
+    const int later = g->canvas(os);
+    CanvasReadback rl;
+    ok("canvases: past every slot of render orders, a canvas made later still drawn after those made before",
+       cycled && later && g->flush(9) && g->read_canvas(canvas, &rb) && g->read_canvas(once, &ro) &&
+           g->read_canvas(later, &rl) && rb.copy_order < ro.first_order && ro.copy_order < rl.first_order &&
+           rl.copy_order < kLowestLayersOrder);
+    g->drop_canvas(later);
+    ok("canvases: a quad in a canvas that is gone is refused", !g->quad_in(9999, glyph_fx, cr));
+#ifndef CRS_RAMSES27
+    ok("canvases: the scene described whole", described("check"));
+#endif
+    g->drop_quad(screen);
+    g->drop_canvas(canvas);
+    g->drop_canvas(once);
+    ok("canvases: dropped with what is drawn in them", g->flush(10));
+#ifndef CRS_RAMSES27
+    ok("canvases: and the scene described whole again", described("check"));
 #endif
     g.reset();
     gpu.drop_effect(glyph_fx);
@@ -606,11 +764,11 @@ int main()
     gp.format = TexFormat::R8;
     gp.w = 256;
     gp.h = 64;
-    gp.sampling = Sampling::Bilinear;
+    gp.sampler.sampling = Sampling::Bilinear;
     const uint32_t glyphs = comp.add_asset(5, 1, gp, &err);
     AssetParams sp;
     sp.w = sp.h = 32;
-    sp.wrap = Wrap::Repeat;
+    sp.sampler.u = sp.sampler.v = Wrap::Repeat;
     const uint32_t sprite = comp.add_asset(5, 1, sp, &err);
     std::vector<uint8_t> gpx(256 * 64), spx(32 * 32 * 4);
     for (size_t i = 0; i < gpx.size(); i++)

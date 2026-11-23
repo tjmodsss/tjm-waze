@@ -245,7 +245,7 @@ test('the cluster map stays while a change runs or fails on the side in effect, 
     await until('busy', () => c.aaStatusText() === 'Status: Patching…');
     assert.strictEqual(c.mapText(), 'Cluster map: Waiting for the phone', 'Android Auto busy');
     send({ state: 'original', aa: Object.assign({}, aaOn, { state: 'error', reason: 'Command failed' }) });
-    await until('failed', () => c.aaStatusText() === 'Status: Failed');
+    await until('failed', () => c.aaStatusText() === 'Status: Failed, Command failed');
     assert.strictEqual(c.mapText(), 'Cluster map: Waiting for the phone', 'Android Auto failed, no status after it');
     /* CarPlay alone */
     send({ state: 'patched', panel: 'high', aa: { state: 'original', density: 180, densities: D } });
@@ -255,8 +255,17 @@ test('the cluster map stays while a change runs or fails on the side in effect, 
     await until('CarPlay busy', () => c.statusText() === 'Status: Patching…');
     assert.strictEqual(c.mapText(), 'Cluster map: Waiting for the phone', 'CarPlay busy');
     send({ state: 'error', reason: 'remount rw: EBUSY', aa: { state: 'original', density: 180, densities: D } });
-    await until('CarPlay failed', () => c.statusText() === 'Status: Failed');
+    await until('CarPlay failed', () => c.statusText() === 'Status: Failed, remount rw: EBUSY');
     assert.strictEqual(c.mapText(), 'Cluster map: Waiting for the phone', 'CarPlay failed');
+    /* a Patch the conflict refused: the conflict, in the words both sections use */
+    send({ state: 'error', reason: 'carplay was modified by something else', conflict: 'carplay was modified by something else',
+        aa: { state: 'original', density: 180, densities: D } });
+    await until('CarPlay refused', () => c.statusText() === 'Status: Changed by another tool');
+    send({ state: 'original', aa: { state: 'error', reason: 'aapd was modified by something else', conflict: 'aapd was modified by something else', density: 180, densities: D } });
+    await until('Android Auto refused', () => c.aaStatusText() === 'Status: Changed by another tool');
+    /* a Patch whose plan failed its own check: refused for this build */
+    send({ state: 'error', reason: 'not patchable: the edited image does not verify (sink)', aa: { state: 'original', density: 180, densities: D } });
+    await until('CarPlay not patchable', () => c.statusText() === 'Status: Not supported on this car');
     send({ state: 'original', aa: { state: 'original', density: 180, densities: D } });
     await until('both off', () => c.mapText() === 'Cluster map: Off');
     c.close();
@@ -862,7 +871,6 @@ test('Android Auto: its line per state; Patch, Remove patch and zoom only where 
         [{ state: 'patched', dpi: 400, diskCard: 'shown', density: 400, densities: D }, 'Status: Patched', [false, true, true, false]],
         [{ state: 'unknown', density: 180, densities: D }, 'Status: Partly patched', [true, true, false, false]],
         [{ state: 'original', density: 180, conflict: 'not supported on this car (KI_KOMBI_VARIANT 9)' }, 'Status: Not supported on this car', [false, false, false, false]],
-        [{ state: 'original', density: 180, conflict: 'untested aapd build' }, 'Status: Untested version', [true, false, false, false]],
         [{ state: 'original', density: 180, conflict: 'not patchable: gate: variant check not found' }, 'Status: Not supported on this car', [false, false, false, false]],
         [{ state: 'original', density: 180, conflict: 'aapd.conf not usable: no number SCREENS/KOMBI_DISPLAY/DIMENSIONS/12.3/SA_WIDTHPIXELS' }, 'Status: Changed by another tool', [false, false, false, false]],
         [{ state: 'original', density: 180, conflict: 'aapd.service starts /opt/other/aapd (/etc/systemd/system/aapd.service.d/x.conf)' }, 'Status: Changed by another tool', [false, false, false, false]],
@@ -871,8 +879,8 @@ test('Android Auto: its line per state; Patch, Remove patch and zoom only where 
         [{ state: 'unknown', pending: 'revert', aapd: 'deferred', density: 180 }, 'Status: Removed after restart', [false, false, false, false]],
         [{ state: 'busy', reason: 'applying', density: 180 }, 'Status: Patching…', [false, false, false, false]],
         [{ state: 'busy', reason: 'reverting', density: 180 }, 'Status: Removing patch…', [false, false, false, false]],
-        [{ state: 'error', reason: 'another change to / is running; try again', density: 180 }, 'Status: Failed', [true, true, false, false]],
-        [{ state: 'patched', dpi: 180, diskCard: 'shown', density: 170, densities: D, error: 'Command failed' }, 'Status: Failed', [false, true, true, true]],
+        [{ state: 'error', reason: 'another change to / is running; try again', density: 180 }, 'Status: Failed, another change to / is running; try again', [true, true, false, false]],
+        [{ state: 'patched', dpi: 180, diskCard: 'shown', density: 170, densities: D, error: 'Command failed' }, 'Status: Failed, Command failed', [false, true, true, true]],
         [{ state: 'original', density: 180, conflict: 'aapd was modified by something else' }, 'Status: Changed by another tool', [false, false, false, false]],
         [{ state: 'unknown', density: 180, conflict: 'aapd status unreadable: Error: Command failed: …' }, 'Status: Unavailable', [false, true, false, false]],
     ];
@@ -1005,7 +1013,7 @@ test('zoom and turn card: the value on disk, "(after restart)" only for the sett
     /* chosen 170, the apply failed: the disk's 180 and the failure */
     assert.deepStrictEqual(await show({ state: 'patched', dpi: 180, diskCard: 'shown', density: 170, card: 'shown', densities: D, error: 'x' }),
         ['Zoom: 180 dpi', "Hide phone's turn card", false]);
-    assert.strictEqual(c.aaStatusText(), 'Status: Failed');
+    assert.strictEqual(c.aaStatusText(), 'Status: Failed, x');
     c.close();
 });
 
@@ -1123,7 +1131,7 @@ test('patchd 0.8.0: an Android Auto refusal and failure, the bare busy of its re
     assert.deepStrictEqual([c.statusText(), c.canRestart()], ['Status: Patched after restart', true]);
     /* an Android Auto change that failed, not a refusal */
     patch._broadcast(old({ aa: { state: 'error', reason: 'saving the choice failed: EROFS', density: 170, densities: D } }));
-    await until('Android Auto failed', () => c.aaStatusText() === 'Status: Failed');
+    await until('Android Auto failed', () => c.aaStatusText() === 'Status: Failed, saving the choice failed: EROFS');
     c.close();
 });
 

@@ -38,7 +38,7 @@ const char *source_name(int s) { return s == kAvb ? "avb" : "udp"; }
 
 VideoProducer::VideoProducer(const VideoConfig &cfg)
     : cfg_(cfg), atlas_bytes_((size_t)cfg.tex_width * atlas_height(cfg.tex_height)),
-      change_(cfg.tex_width, cfg.tex_height), freeze_(cfg.freeze), pace_(cfg.picture_fps)
+      change_(cfg.tex_width, cfg.tex_height), freeze_(cfg.freeze), pace_(cfg.picture_fps), picture_fps_(cfg.picture_fps)
 {
     rtp_sink_ = [this](const uint8_t *d, size_t n, bool end_of_au) { on_nal(d, n, end_of_au); };
     rtp_.on_gap = [this](const RtpH264::Gap &g) { gaps_.gap(g, packet_->source, packet_->dropped); };
@@ -219,7 +219,7 @@ void VideoProducer::decode_loop()
 
 int VideoProducer::late_wait_ms() const
 {
-    if (!cfg_.picture_fps)
+    if (!picture_fps_.load() && !paced_.load())
         return 500;
     std::lock_guard<std::mutex> lock(decode_mutex_);
     return paced_ ? (int)std::min<int64_t>(pace_.late_in_ms(cld::now_ms()), 500) : 500;
@@ -227,7 +227,7 @@ int VideoProducer::late_wait_ms() const
 
 void VideoProducer::picture_paced()
 {
-    if (!cfg_.picture_fps)
+    if (!picture_fps_.load() && !paced_.load())
         return;
     std::lock_guard<std::mutex> lock(decode_mutex_);
     if (!paced_ || pace_.late_in_ms(cld::now_ms()) > 0)
@@ -508,6 +508,20 @@ bool VideoProducer::take(std::vector<uint8_t> *frame, uint64_t *id, bool *same, 
     while (ready_[0] >= 0 && read(ready_[0], drain, sizeof drain) > 0) {
     }
     return true;
+}
+
+void VideoProducer::set_picture_fps(unsigned fps)
+{
+    if (fps == picture_fps_.load())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(decode_mutex_);
+        pace_.set_fps(fps);
+        picture_fps_ = fps;
+    }
+    /* a frame waiting for its late picture gets it at the new rate's slot,
+     * at once without a pace */
+    queue_.wake();
 }
 
 void VideoProducer::set_pictures(bool on)

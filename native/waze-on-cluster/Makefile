@@ -40,7 +40,7 @@ KIT      = $(CR)/kit
 # the unit's toolchain ABI: the shared renderer's build image, by the same tag
 IMAGE   := cluster-render-build:$(shell cksum < $(CR)/docker/Dockerfile | cut -d' ' -f1)
 DOCKER_IMAGE = docker image inspect $(IMAGE) >/dev/null 2>&1 || \
-	docker build -q --platform linux/amd64 -t $(IMAGE) $(CR)/docker
+	docker build --progress=plain --platform linux/amd64 -t $(IMAGE) $(CR)/docker
 CXXFLAGS = -std=c++14 -O2 -g -Wall -Wextra -Werror
 CPPFLAGS = -I. -Isrc -I$(KIT) -I$(CR)/include -Iabi/include -I$(CR)/src
 
@@ -76,67 +76,50 @@ CPP_TESTS += $(LINUX_TESTS)
 all: test
 
 # ---- host tests (no unit libraries) ---------------------------------------
-# The test binaries build in parallel; the tests run one at a time.
+# The test binaries build in parallel, then the tests run at once, each its own
+# target (--output-sync keeps a test's lines together); rollback_test.js, the
+# longest, in parts (its --part I/N), one per entry of ROLLBACK_PART_IDS.
+ROLLBACK_PART_IDS = 0 1 2 3 4 5 6 7 8 9 10 11
+RUN_JOBS ?= $(JOBS)
+
 test:
 	$(MAKE) -j$(JOBS) test-bin
-	$(MAKE) -j1 test-cpp test-node
+	$(MAKE) -j$(RUN_JOBS) --output-sync=target $(CPP_RUNS) $(NODE_RUNS)
 
 test-bin: $(CPP_TESTS)
 	$(MAKE) -C $(CR) test-kit-bin BUILD=$(abspath $(BUILD))/kit
 
 # The patchers, patchd and boot recovery under the umask an installer may
 # set (077): every file they replace keeps the mode its service needs.
+NODE_TESTS = locate permissions file_mode mutation undo rollback_conf patch patchd_patch patchd_activate \
+	patchd_hud patchd_profile patchd_dlt patchd_reboot patchd_wifi wifi_band dlt_capture capture_host recovery \
+	recovery_lock inmem journal_keep logs collect_logs logs_fw units x86_flow aapd_locate aapd head_unit
+NODE_RUNS = $(addprefix node-,$(NODE_TESTS)) $(addprefix node-rollback.,$(ROLLBACK_PART_IDS))
+
 test-node:
-	umask 077 && $(NODE) patch/test/locate_test.js
-	umask 077 && $(NODE) patch/test/permissions_test.js
-	umask 077 && $(NODE) patch/test/file_mode_test.js
-	umask 077 && $(NODE) patch/test/mutation_test.js
-	umask 077 && $(NODE) patch/test/undo_test.js
-	umask 077 && $(NODE) patch/test/rollback_test.js
-	umask 077 && $(NODE) patch/test/rollback_conf_test.js
-	umask 077 && $(NODE) patch/test/patch_test.js
-	umask 077 && $(NODE) patch/test/patchd_patch_test.js
-	umask 077 && $(NODE) patch/test/patchd_activate_test.js
-	umask 077 && $(NODE) patch/test/patchd_hud_test.js
-	umask 077 && $(NODE) patch/test/patchd_profile_test.js
-	umask 077 && $(NODE) patch/test/patchd_dlt_test.js
-	umask 077 && $(NODE) patch/test/patchd_reboot_test.js
-	umask 077 && $(NODE) patch/test/patchd_wifi_test.js
-	umask 077 && $(NODE) patch/test/wifi_band_test.js
-	umask 077 && $(NODE) patch/test/dlt_capture_test.js
-	umask 077 && $(NODE) patch/test/recovery_test.js
-	umask 077 && $(NODE) patch/test/recovery_lock_test.js
-	umask 077 && $(NODE) patch/test/inmem_test.js
-	umask 077 && $(NODE) patch/test/journal_keep_test.js
-	umask 077 && $(NODE) patch/test/logs_test.js
-	umask 077 && $(NODE) patch/test/collect_logs_test.js
-	umask 077 && $(NODE) patch/test/logs_fw_test.js
-	umask 077 && $(NODE) patch/test/units_test.js
-	umask 077 && $(NODE) patch/test/x86_flow_test.js
-	umask 077 && $(NODE) patch/test/aapd_locate_test.js
-	umask 077 && $(NODE) patch/test/aapd_test.js
-	umask 077 && $(NODE) patch/test/head_unit_test.js
+	$(MAKE) -j$(RUN_JOBS) --output-sync=target $(NODE_RUNS)
+
+node-rollback.%:
+	umask 077 && $(NODE) patch/test/rollback_test.js --part $*/$(words $(ROLLBACK_PART_IDS))
+
+node-%:
+	umask 077 && $(NODE) patch/test/$*_test.js
+
+CPP_RUNS = $(patsubst $(BUILD)/host/%_test,run-%,$(filter-out $(LINUX_TESTS),$(CPP_TESTS))) run-linux run-kit
 
 test-cpp: $(CPP_TESTS)
-	$(BUILD)/host/nal_reader_test
+	$(MAKE) -j$(RUN_JOBS) --output-sync=target $(CPP_RUNS)
+
+run-rtp_h264: $(BUILD)/host/rtp_h264_test
 	$(BUILD)/host/rtp_h264_test test/data/stream15_start.rtp
-	$(BUILD)/host/udp_probe_test
-	$(BUILD)/host/map_feed_test
-	$(BUILD)/host/keyframe_wait_test
-	$(BUILD)/host/freeze_watch_test
-	$(BUILD)/host/picture_pace_test
-	$(BUILD)/host/alt_screen_test
-	$(BUILD)/host/packet_queue_test
-	$(BUILD)/host/stream_health_test
-	$(BUILD)/host/source_crop_test
-	$(BUILD)/host/map_rect_test
-	$(BUILD)/host/guide_setting_test
-	$(BUILD)/host/decoder_test
-	$(BUILD)/host/map_state_test
-	$(BUILD)/host/opt_in_test
-	$(BUILD)/host/atlas_scale_test
-	$(BUILD)/host/sps_info_test
+
+run-%: $(BUILD)/host/%_test
+	$(BUILD)/host/$*_test
+
+run-linux: $(LINUX_TESTS)
 	$(if $(LINUX_TESTS),$(foreach t,$(LINUX_TESTS),$(t) &&) true,@echo 'refused_test, video_producer_test: Linux only (make test-x86)')
+
+run-kit:
 	$(MAKE) -C $(CR) test-kit BUILD=$(abspath $(BUILD))/kit
 
 test-x86:

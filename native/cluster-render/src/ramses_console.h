@@ -36,6 +36,21 @@
  * by its context ("other" for another library's), with the time of the
  * last, so the status shows whether the console stays alive while no
  * subscription line comes.
+ *
+ * The console is not always there to read: the car's DLT daemon sets
+ * RAMSES's log levels while it runs (VERIFIED on the car: every context to
+ * OFF as the service registers, each change one ramses.Ramsh line, "RCLI |
+ * ramses.Client | 0 | OFF |  Dlt changed log level from INFO"; INFO again
+ * while the daemon traces). At INFO the client logs its statistics
+ * (ramses.Periodic) every 2 s, so live_since() tells whether a subscription
+ * would have been read: the console is live while RAMSES lines keep coming
+ * kQuietMs apart at most and the last level change for ramses.Client, if
+ * any, is INFO or more, or a ramses.Client line or a break in every RAMSES
+ * line came since. The daemon changes its default level context by context,
+ * in their order; going back to INFO it reaches ramses.Client before
+ * ramses.Ramsh, so that line is never printed (VERIFIED in the emulator with
+ * the car's dlt-daemon). A subscription made while the console was not live
+ * is never read.
  * fd() is readable while something waits to be taken. If the pipe cannot be
  * set up, stdout is left as it was and nothing is ever read; if reading it
  * fails, the original stdout goes back onto fd 1 (so RAMSES never blocks on
@@ -70,8 +85,11 @@ std::string strip_colours(const char *s, size_t n);
 bool parse_console_line(const std::string &line, ConsoleEvent *e);
 /* The line comes from RAMSES's logger. */
 bool ramses_line(const std::string &line);
-/* The line mentions one of scenes (decimal or 0x hex), contains "ubscri" or
- * is the levels the logger starts with. */
+/* A ramses.Ramsh line "Dlt changed log level" for context: its new level,
+ * 0 (OFF) .. 6 (TRACE); -1: not such a line. */
+int level_change(const std::string &line, const char *context);
+/* The line mentions one of scenes (decimal or 0x hex), contains "ubscri",
+ * is the levels the logger starts with, or a level the DLT daemon set. */
 bool console_interesting(const std::string &line, const std::vector<uint64_t> &scenes);
 
 class RamsesConsole {
@@ -79,6 +97,9 @@ public:
     static const unsigned kRawPerMinute = 30;
     static const unsigned kFirstLines = 20;
     static const size_t kMaxContexts = 16;
+    /* RAMSES lines further apart than this: the console was not live in
+     * between (its statistics come every 2 s at INFO). */
+    static const int64_t kQuietMs = 5000;
 
     explicit RamsesConsole(const std::vector<uint64_t> &scenes) : scenes_(scenes) {}
     /* Call once, before any RAMSES object exists. */
@@ -90,6 +111,9 @@ public:
     /* "N lines (context n, ...), the last X s ago", most frequent context
      * first. Any thread. */
     std::string counts_text(int64_t now_ms) const;
+    /* Since when the console has been live without a break (above); -1: not
+     * live at now_ms. Any thread. */
+    int64_t live_since(int64_t now_ms) const;
     /* One line as read at now_ms; forwarded or kept as above (the reader
      * thread's, and tests'). */
     void feed(const char *s, size_t n, int64_t now_ms);
@@ -111,6 +135,9 @@ private:
     std::map<std::string, uint64_t> contexts_;   /* lines read, by context */
     uint64_t lines_ = 0;
     int64_t last_ms_ = -1;
+    int64_t ramses_ms_ = -1;      /* the last RAMSES line read */
+    int64_t live_since_ = -1;     /* the first of the RAMSES lines read without a break since */
+    bool client_off_ = false;     /* the last level change for ramses.Client is below INFO */
 };
 
 }  // namespace crs

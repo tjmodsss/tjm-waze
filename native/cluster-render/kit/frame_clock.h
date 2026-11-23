@@ -41,6 +41,18 @@ struct Spread {
 class FrameClock {
 public:
     void configure(uint32_t fps) { fps_ = fps; }
+    uint32_t fps() const { return fps_; }
+
+    /* Another rate from now_ms on: the deadline due next stays where it
+     * is (now_ms for a clock that had none) and the grid goes on from it at
+     * the new rate, so a change never lets a frame go early or holds one
+     * back. */
+    void retime(uint32_t fps, int64_t now_ms)
+    {
+        start_ms_ = fps_ ? deadline(n_) : now_ms;
+        n_ = 0;
+        fps_ = fps;
+    }
 
     /* Starts the grid at now_ms; the first frame may go at once. */
     void reset(int64_t now_ms)

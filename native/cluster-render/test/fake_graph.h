@@ -27,9 +27,22 @@ struct FakeBuffer {
     TexFormat f;
     uint32_t w, h;
     std::vector<uint8_t> px;
-    Sampling sampling = Sampling::Nearest;
-    Wrap wrap = Wrap::Clamp;
+    Sampler sampler;
+    uint32_t levels = 1;
+    std::vector<std::vector<uint8_t>> mips;   /* levels 1 and up */
+    uint64_t level_writes = 0;                /* write_level() calls past level 0 */
 };
+
+inline FakeBuffer fake_buffer(TexFormat f, uint32_t w, uint32_t h, std::vector<uint8_t> px, const Sampler &s)
+{
+    FakeBuffer b{};
+    b.f = f;
+    b.w = w;
+    b.h = h;
+    b.px = std::move(px);
+    b.sampler = s;
+    return b;
+}
 
 struct FakeQuad {
     int effect = 0;
@@ -40,6 +53,9 @@ struct FakeQuad {
     std::map<std::string, int> textures;
     std::map<std::string, std::vector<float>> uniforms;
     std::map<std::string, UniformType> types;   /* uniforms set as arrays */
+    PartLook look = quad_look();
+    int styles = 0;   /* style() calls */
+    int canvas = 0;   /* the canvas it is drawn in; 0: the target */
 };
 
 struct FakeView {
@@ -48,6 +64,13 @@ struct FakeView {
     Pose camera;
     bool visible = false;
     int32_t order = 0;
+    int canvas = 0;
+};
+
+struct FakeCanvas {
+    CanvasSpec spec;
+    int redraws = 0;   /* redraw() calls */
+    bool enabled = true;   /* enable_canvas() */
 };
 
 struct FakePart {
@@ -74,6 +97,7 @@ struct FakeState {
     std::map<int, FakeView> views;
     std::map<int, FakePart> parts;
     std::map<int, FakeAnimation> animations;
+    std::map<int, FakeCanvas> canvases;
 };
 
 class FakeGraph : public Graph {
@@ -83,12 +107,14 @@ public:
     uint64_t flushes = 0, last_tag = 0;
     size_t written = 0;            /* bytes written since the last flush */
     uint64_t writes = 0;           /* write() calls that went */
+    uint64_t shown_writes = 0;     /* writes as of the last flush that went: what shown's buffers hold */
     uint64_t flushed_bytes = 0;    /* bytes carried by flushes that went */
     int64_t *clock_us = nullptr;   /* advanced by *flush_cost_us at each flush */
     const int64_t *flush_cost_us = nullptr;
     long write_budget = -1;        /* refuse writes once this many bytes went; -1: never */
     bool fail_flush = false;
     bool refuse_textures = false;  /* immutable_texture() refused, as a backend without the format */
+    bool refuse_canvases = false;  /* canvas() refused */
     std::string name;
     std::map<std::string, FakeGraph *> *registry = nullptr;
     const std::map<int, unsigned> *effect_attributes = nullptr;   /* the Gpu's */
@@ -107,17 +133,60 @@ public:
     int buffer(TexFormat f, uint32_t w, uint32_t h, Sampling s) override { return buffer(f, w, h, s, Wrap::Clamp); }
     int buffer(TexFormat f, uint32_t w, uint32_t h, Sampling s, Wrap wrap) override
     {
-        FakeBuffer b{f, w, h, std::vector<uint8_t>((size_t)w * h * (f == TexFormat::R8 ? 1 : 4), 0), s, wrap};
+        Sampler smp;
+        smp.sampling = s;
+        smp.u = smp.v = wrap;
+        return buffer(f, w, h, smp, 1);
+    }
+    int buffer(TexFormat f, uint32_t w, uint32_t h, const Sampler &s, uint32_t levels) override
+    {
+        if (tex_compressed(f) || levels < 1 || levels > mip_levels(w, h))
+            return 0;
+        FakeBuffer b = fake_buffer(f, w, h, std::vector<uint8_t>((size_t)w * h * (f == TexFormat::R8 ? 1 : 4), 0), s);
+        b.levels = levels;
+        for (uint32_t l = 1; l < levels; l++)
+            b.mips.push_back(std::vector<uint8_t>(tex_level_bytes(f, w, h, l), 0));
         pending.buffers[next] = b;
         return next++;
     }
-    int immutable_texture(TexFormat f, uint32_t w, uint32_t h, Sampling s, Wrap wrap, const uint8_t *data,
-                          size_t n) override
+    int immutable_texture(TexFormat f, uint32_t w, uint32_t h, const Sampler &s, uint32_t levels,
+                          const uint8_t *data, size_t n) override
     {
-        if (refuse_textures || !tex_compressed(f) || n != tex_bytes(f, w, h))
+        if (refuse_textures || !tex_compressed(f) || levels < 1 || levels > mip_levels(f, w, h) ||
+            n != tex_chain_bytes(f, w, h, levels))
             return 0;
-        pending.buffers[next] = FakeBuffer{f, w, h, std::vector<uint8_t>(data, data + n), s, wrap};
+        const size_t base = tex_bytes(f, w, h);
+        FakeBuffer b = fake_buffer(f, w, h, std::vector<uint8_t>(data, data + base), s);
+        b.levels = levels;
+        for (uint32_t l = 1; l < levels; l++) {
+            data += tex_level_bytes(f, w, h, l - 1);
+            b.mips.push_back(std::vector<uint8_t>(data, data + tex_level_bytes(f, w, h, l)));
+        }
+        pending.buffers[next] = b;
         return next++;
+    }
+    bool write_level(int buf, uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                     const uint8_t *px) override
+    {
+        if (level == 0)
+            return write(buf, x, y, w, h, px);
+        auto it = pending.buffers.find(buf);
+        if (it == pending.buffers.end() || level >= it->second.levels)
+            return false;
+        FakeBuffer &b = it->second;
+        const uint32_t lw = mip_size(b.w, level), lh = mip_size(b.h, level);
+        const size_t bpp = b.f == TexFormat::R8 ? 1 : 4;
+        if (x + w > lw || y + h > lh)
+            return false;
+        if (write_budget >= 0 && (long)(written + (size_t)w * h * bpp) > write_budget)
+            return false;
+        for (uint32_t row = 0; row < h; row++)
+            std::memcpy(&b.mips[level - 1][((size_t)(y + row) * lw + x) * bpp], px + (size_t)row * w * bpp,
+                        (size_t)w * bpp);
+        written += (size_t)w * h * bpp;
+        writes++;
+        b.level_writes++;
+        return true;
     }
     bool write(int buf, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *px) override
     {
@@ -150,6 +219,16 @@ public:
         return has(quad) && (pending.quads[quad].r = r, true);
     }
     bool turn(int quad, const Turn &t) override { return has(quad) && (pending.quads[quad].turn = t, true); }
+    bool style(int quad, const PartLook &look) override
+    {
+        if (!has(quad))
+            return false;
+        pending.quads[quad].look = look;
+        pending.quads[quad].look.depth = false;
+        pending.quads[quad].look.cull = Cull::None;
+        pending.quads[quad].styles++;
+        return true;
+    }
     bool texture(int quad, const char *u, int buf) override
     {
         if (!pending.buffers.count(buf) || !known_sampler(u))
@@ -283,6 +362,56 @@ public:
     }
     void stop(int anim) override { pending.animations.erase(anim); }
 
+    int canvas(const CanvasSpec &c) override
+    {
+        if (refuse_canvases || !c.w || !c.h || sampling_mips(c.sampler.sampling))
+            return 0;
+        pending.canvases[next].spec = c;
+        pending.buffers[next] = fake_buffer(TexFormat::RGBA8, c.w, c.h, {}, c.sampler);
+        return next++;
+    }
+    void drop_canvas(int c) override
+    {
+        for (auto it = pending.quads.begin(); it != pending.quads.end();)
+            it = it->second.canvas == c ? pending.quads.erase(it) : std::next(it);
+        for (auto it = pending.views.begin(); it != pending.views.end();)
+            it = it->second.canvas == c ? pending.views.erase(it) : std::next(it);
+        pending.canvases.erase(c);
+        pending.buffers.erase(c);
+    }
+    bool redraw(int c) override
+    {
+        auto it = pending.canvases.find(c);
+        if (it == pending.canvases.end())
+            return false;
+        it->second.redraws++;
+        return true;
+    }
+    bool enable_canvas(int c, bool on) override
+    {
+        auto it = pending.canvases.find(c);
+        if (it == pending.canvases.end() || it->second.spec.once)
+            return false;
+        it->second.enabled = on;
+        return true;
+    }
+    int quad_in(int c, int effect, const Rect &r) override
+    {
+        if (c && !pending.canvases.count(c))
+            return 0;
+        const int q = quad(effect, r);
+        pending.quads[q].canvas = c;
+        return q;
+    }
+    int view_in(int c, const Rect &r, const Projection &p, const Pose &camera) override
+    {
+        if (c && !pending.canvases.count(c))
+            return 0;
+        const int v = view(r, p, camera);
+        pending.views[v].canvas = c;
+        return v;
+    }
+
     bool flush(uint64_t tag) override
     {
         if (clock_us && flush_cost_us)
@@ -291,6 +420,7 @@ public:
             return false;
         flushed_bytes += written;
         shown = pending;
+        shown_writes = writes;
         flushes++;
         last_tag = tag;
         written = 0;

@@ -22,14 +22,14 @@
 const assert = require('assert');
 const headUnit = require('./head_unit_env.js');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const tmp = require('./tmp.js');
 const cp = require('child_process');
 const crypto = require('crypto');
 
 /* The mount, /proc/mounts, /proc and the remount lock every restore in this
  * process uses. */
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-rec-'));
+const ROOT = tmp.dir();
 const MOUNTS = path.join(ROOT, 'mounts');
 const MOUNT_LOG = path.join(ROOT, 'mount.log');
 const ROMOUNT = 'echo "$*" >> "' + MOUNT_LOG + '"\ncase "$*" in *remount,rw*) echo "/dev/root / ext4 rw 0 0" > "' + MOUNTS +
@@ -319,7 +319,7 @@ for (const name of ['carplay', 'aapd']) {
 }
 
 test('a process runs a file by its exe, or by mapping it (a translator such as Rosetta); a link to it is held', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-inuse-'));
+    const dir = tmp.dir();
     try {
         const file = path.join(dir, 'carplay'), other = path.join(dir, 'translator'), link = path.join(dir, 'carplay.woc-running');
         fs.writeFileSync(file, 'binary');
@@ -1790,7 +1790,7 @@ test('the units: before their service, never blocking it, timeouts covering the 
     const c = JSON.parse(fs.readFileSync(path.join(PATCH, '..', 'component.json'), 'utf8'));
     ['waze-on-cluster-boot', 'waze-on-cluster-aa-boot', 'waze-on-cluster-recovery'].forEach((n) => assert(c.recmgr.includes(n), n));
     assert(!c.restart.some((u) => /boot/.test(u)), 'they run at boot, not at install');
-    assert(c.dropins.some((d) => d.unit === 'var-opt-ro.service') && c.dropins.some((d) => d.unit === 'carplay.service'));
+    assert(c.dropins.some((d) => d.unit === 'var-opt-ro.service') && c.dropins.some((d) => d.unit === 'carplay.service') && c.dropins.some((d) => d.unit === 'aapd.service'));
     ['shutdown_mark.sh', 'recmgr_list.js', 'patch_record.js', 'remount_lock.js'].forEach((f) => assert(c.files.some((x) => x.path === f), f));
 });
 
@@ -1839,11 +1839,12 @@ function aapdPatcher(w) {
     fs.writeFileSync(path.join(w.dir, 'df'), '#!/bin/sh\necho "F 1 2 99999999 1% /"\n', { mode: 0o755 });
     fs.copyFileSync(AAPD_BIN, w.T.aapd.target);
     fs.copyFileSync(AAPD_CONF, w.T.aapd.files[1]);
-    return (args) => cp.execFileSync(process.execPath, [AAPD_PATCH].concat(args, ['--target', w.T.aapd.target, '--conf', w.T.aapd.files[1], '--coding', coding]),
+    /* an apply is an earlier release's (this version writes no patch) */
+    return (args) => cp.execFileSync(process.execPath, [earlier.aaScriptFor(args, AAPD_PATCH)].concat(args, ['--target', w.T.aapd.target, '--conf', w.T.aapd.files[1], '--coding', coding]),
         { encoding: 'utf8', env: Object.assign({}, process.env, { WOC_DF: path.join(w.dir, 'df') }) });
 }
 
-test('the aapd patcher records each write (only its proven build), and a revert', () => {
+test('an earlier release\'s aapd patch is recorded (its proven build), and this version\'s revert records the put-back', () => {
     if (!fs.existsSync(AAPD_BIN) || !fs.existsSync(AAPD_CONF)) { console.log('     (skipped: AAPD_BIN, AAPD_CONF not set)'); return; }
     const w = makeWorld();
     const patcher = aapdPatcher(w);
@@ -1853,7 +1854,7 @@ test('the aapd patcher records each write (only its proven build), and a revert'
     assert.strictEqual(record.current(w.T.aapd.target).patched, false);
 });
 
-test('the real boot step puts back an earlier release\'s patch of a carplay copy at once and restores a patched aapd copy, in about a second, byte for byte, / read-only', () => {
+test('the real boot step puts back an earlier release\'s patch of a carplay copy and of an aapd copy at once, in about a second, byte for byte, no backup left, / read-only', () => {
     if (!fs.existsSync(CARPLAY_BIN) || !fs.existsSync(AAPD_BIN) || !fs.existsSync(AAPD_CONF)) { console.log('     (skipped: CARPLAY_BIN, AAPD_BIN, AAPD_CONF not set)'); return; }
     const w = makeWorld();
     const cpt = w.T.carplay.target;
@@ -1865,19 +1866,45 @@ test('the real boot step puts back an earlier release\'s patch of a carplay copy
     assert(!fs.readFileSync(w.T.aapd.target).equals(fs.readFileSync(AAPD_BIN)) && !fs.readFileSync(w.T.aapd.files[1]).equals(fs.readFileSync(AAPD_CONF)), 'both patched');
 
     /* carplay's: an earlier release's patch of the file, put back at once. */
+    /* then planned in memory for this start (its arm needs systemd here) */
     const r = runBootStep(w, 'carplay', 'A');
-    assert(/carplay boot check: restored/.test(r.stdout), r.stdout + r.stderr);
+    assert(/restored the original carplay in/.test(r.stdout) && /carplay boot check: (restored|armed)/.test(r.stdout), r.stdout + r.stderr);
     assert(fs.readFileSync(cpt).equals(unpatched), 'the original, byte for byte');
     assert(ro());
     console.log(`     (carplay restore: boot step ${r.ms} ms in all, ${r.own} ms after node started)`);
     assert(r.own < 2000, r.stdout);
 
-    fs.writeFileSync(w.T.aapd.state, JSON.stringify({ fails: 2, unknown: 0, arm: null }));
+    /* aapd's: likewise, whatever the count; neither backup stays. */
     const a = runBootStep(w, 'aapd', 'B');
-    assert(/aapd boot check: restored/.test(a.stdout), a.stdout + a.stderr);
+    assert(/restored the original aapd in/.test(a.stdout) && /aapd boot check: (restored|armed)/.test(a.stdout), a.stdout + a.stderr);
     assert(fs.readFileSync(w.T.aapd.target).equals(fs.readFileSync(AAPD_BIN)) && fs.readFileSync(w.T.aapd.files[1]).equals(fs.readFileSync(AAPD_CONF)));
+    assert(!fs.existsSync(w.T.aapd.target + '.woc-orig') && !fs.existsSync(w.T.aapd.files[1] + '.woc-orig'), 'no backup of ours left');
+    assert(ro());
     console.log(`     (aapd restore: boot step ${a.ms} ms in all, ${a.own} ms after node started)`);
     assert(a.own < 2000, a.stdout);
+});
+
+for (const confLeft of [true, false]) test('the boot step over patchd\'s put-back of an earlier aapd patch cut short (aapd as it ships, ' +
+    (confLeft ? 'aapd.conf still patched' : 'aapd.conf as it ships too') + ', our backups beside them, a record still to plan): put back, no backup left, the patch kept on', () => {
+    if (!fs.existsSync(AAPD_BIN) || !fs.existsSync(AAPD_CONF)) { console.log('     (skipped: AAPD_BIN, AAPD_CONF not set)'); return; }
+    const w = makeWorld();
+    aapdPatcher(w)(['apply', '--dpi', '170', '--yes']);
+    const target = w.T.aapd.target, conf = w.T.aapd.files[1];
+    assert(fs.existsSync(target + '.woc-orig') && fs.existsSync(conf + '.woc-orig'), 'both backups');
+    /* patchd's order: the record to plan first, then the files back */
+    const args = ['--conf', conf, '--dpi', '170', '--card', 'shown', '--unproven'];
+    inmem.planFailed('aapd', args, 'not planned yet: putting aapd back was cut short');
+    fs.writeFileSync(target + '.new', fs.readFileSync(AAPD_BIN), { mode: 0o755 });
+    fs.renameSync(target + '.new', target);
+    if (!confLeft) { fs.writeFileSync(conf + '.new', fs.readFileSync(AAPD_CONF), { mode: 0o644 }); fs.renameSync(conf + '.new', conf); }
+    record.write(target, { patched: false });
+    const r = runBootStep(w, 'aapd', 'C');
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert(!/turned the in-memory patch of aapd off/.test(r.stdout), r.stdout);
+    assert(fs.readFileSync(target).equals(fs.readFileSync(AAPD_BIN)) && fs.readFileSync(conf).equals(fs.readFileSync(AAPD_CONF)), 'both as they ship: ' + r.stdout);
+    assert(!fs.existsSync(target + '.woc-orig') && !fs.existsSync(conf + '.woc-orig') && !fs.existsSync(record.recordPath(target)), 'no backup or record of ours left: ' + r.stdout);
+    assert.deepStrictEqual([inmem.readRecord('aapd').enabled, inmem.readRecord('aapd').args], [true, args], 'the patch stays on, planned as patchd recorded it');
+    assert(ro());
 });
 
 test('the boot step restores what an older release patched where the locator now refuses a site', () => {

@@ -12,14 +12,32 @@
  * layers there waiting, its edit lines kept by key, a malformed one and one
  * changing nothing reported, and dropped; one with layers, the layers drawn
  * over it, hosting the map, shown and hidden, the other client told, and the
- * host ended when it is dropped; close() and connect() in one tick making one
- * connection. */
+ * host ended when it is dropped; a host from a theme's layers (no scene),
+ * kept before the connection and sent after the hello, live while a layer
+ * of it is visible (the hosting event saying so, and why not), refused, a
+ * refused move ending it on both sides, a host sent after a refused move
+ * kept on both, unhosted, kept but not sent to an older service, ended when
+ * the theme closes; a layer's hosted mark; a hidden preload layer keeping its target
+ * loaded, shown when made visible and loaded again after the linger, made
+ * again with preload after the restart, and preload 0 releasing the target;
+ * an effect layer's look set with a preset or none, kept as the service
+ * keeps it and made again so after the restart;
+ * a layer's others_fps holding the other client (fps_cap) and releasing it
+ * when set to 0, dropped, or the held client closes; render state and
+ * samplers: an effect layer's blending set and changed, a part's depth
+ * test, an rgba8 asset whose mip levels the service makes and an etc2rgba
+ * one sent with its chain, and a factor the service lacks refused; a
+ * canvas drawn in with stencil state and sampled on screen; to a service
+ * without canvases (a rollback) nothing of a canvas sent, all of it to one
+ * that takes them;
+ * close() and connect() in one tick making one connection. */
 'use strict';
 
 const assert = require('assert');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const { ClusterRender } = require('../cluster_render_client.js');
 
@@ -139,16 +157,55 @@ async function main() {
     ovl.status();
     ok('the status names the asset', await until(() => status.indexOf('asset') >= 0 && status.indexOf('r8 64x32') >= 0, 1000));
 
+    ok('the hello says the service knows preload', ovl.preload === true);
+    const pre = ovl.image({ target: 'hud', visible: false, preload: true, w: 32, h: 32, iw: 32, ih: 32 });
+    ovl.pixels(pre, null, Buffer.alloc(32 * 32 * 4, 77));
+    ok('a hidden preload layer: its target loaded, the layer hidden',
+        await until(() => eo.target.hud === 'loaded', 2000) && eo.layer[pre] === 'hidden');
+    status = '';
+    ovl.status();
+    ok('the status names the target loaded', await until(() => status.indexOf('target hud') >= 0, 1000) &&
+        /target hud: [^\n]*: loaded/.test(status));
+    ovl.set(pre, { visible: true });
+    ok('made visible: shown', await until(() => eo.layer[pre] === 'shown' && eo.target.hud === 'shown', 3000));
+    ovl.set(pre, { visible: false });
+    ok('hidden again: loaded after the linger', await until(() => eo.target.hud === 'loaded', 5000));
+
+    /* An effect layer's look kept as the service keeps it: a preset sent
+     * with set replaces custom factors, blend none drops them; both made
+     * again so after the restart below. */
+    const plain = 'precision mediump float;void main(){gl_FragColor=vec4(1.0);}';
+    const custom = { target: 'panel', klass: 'overlay', y: 600, w: 8, h: 8, fs: plain, blend_src: 'one', blend_dst: 'one' };
+    const toPre = ovl.effect(Object.assign({ x: 10 }, custom));
+    const toNone = ovl.effect(Object.assign({ x: 30 }, custom));
+    ovl.set(toPre, { blend: 'premultiplied' });
+    ovl.set(toNone, { blend: 'none' });
+    const kept = (ref) => ovl._layerMsg(ref, ovl.layers.get(ref));
+    ok('look: a preset sent with set drops the custom factors the client keeps',
+        kept(toPre).blend === 'premultiplied' && kept(toPre).blend_src === undefined && kept(toPre).blend_dst === undefined);
+    ok('look: so does blend none', kept(toNone).blend === 'none' && kept(toNone).blend_src === undefined &&
+        kept(toNone).blend_dst === undefined);
+
     svc.kill();
     await new Promise((r) => svc.once('exit', r));
     ok('the service gone: both clients notice', await until(() => eo.gone === 1 && ew.gone === 1, 1000));
     eo.layer = {};
     ew.layer = {};
+    eo.target = {};
     svc = await startService();
     ok('it comes back: both clients reconnect and their layers are shown again',
         await until(() => eo.layer[badge] === 'shown' && ew.layer[map] === 'shown', 5000) && eo.ready >= 2);
     ok('the asset, its effect, the mesh part and its geometry are made again',
         await until(() => eo.layer[label] === 'shown' && eo.layer[car] === 'shown', 2000));
+    ok('look: both layers made again with the look set last, shown, neither refused',
+        await until(() => eo.layer[toPre] === 'shown' && eo.layer[toNone] === 'shown', 3000) &&
+        !eo.refused.some((r) => r.indexOf('blend none takes no') >= 0));
+    ovl.drop(toPre);
+    ovl.drop(toNone);
+    ok('the preload layer is made again with preload: its target loaded',
+        await until(() => eo.target.hud === 'loaded', 3000) && eo.layer[pre] === 'hidden');
+    ovl.set(pre, { preload: false });
+    ok('preload 0: the target released', await until(() => eo.target.hud === 'idle', 2000));
 
     const file = path.join(scenes, 'gauge.scene');
     fs.writeFileSync(file, GAUGE);
@@ -206,6 +263,231 @@ async function main() {
     ok('hosted again', await until(() => hosted[hosted.length - 1] === 'map:panel:1:560', 2000));
     ovl.drop(over);
     ok('dropped: the map not hosted any more', await until(() => hosted[hosted.length - 1] === 'map:-', 2000));
+
+    /* A host from layers: a theme drawing the panel with layers only. */
+    const thm = new ClusterRender('theme', sock), et = track(thm);
+    const hostingThm = [];
+    thm.on('hosting', (t, ev) => hostingThm.push(t + ':' + ev.state + (ev.reason ? ':' + ev.reason : '')));
+    const sentByThm = [];
+    const send = thm._send.bind(thm);
+    thm._send = (m) => { sentByThm.push(m); send(m); };
+    ok('layer host: kept before the connection, nothing sent yet',
+        thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400 }) && sentByThm.length === 0);
+    thm.connect();
+    ok('layer host: needs a target other than its own', !thm.host('panel', {}) && !thm.host('panel', { target: 'panel' }));
+    ok('layer host: the hello says the service takes it; sent after the hello, with into and no ref',
+        await until(() => et.ready === 1, 2000) && thm.hostLayers === true &&
+        sentByThm.some((m) => m.op === 'host' && m.into === 'panel' && !('ref' in m)));
+    ok('layer host: no visible layer of the theme on the panel yet: the map not hosted',
+        hosted[hosted.length - 1] === 'map:-');
+    /* an effect: the overlay's assets above leave no pixel memory for a whole-panel image */
+    const art = thm.effect({ target: 'panel', fs: '#version 100\nvoid main(){gl_FragColor=vec4(0.0);}' });
+    ok('layer host: its layer shown: the map hosted in the panel, the other client told, the theme told it is live',
+        await until(() => et.layer[art] === 'shown' && hosted[hosted.length - 1] === 'map:panel:1:560', 3000) &&
+        await until(() => hostingThm[hostingThm.length - 1] === 'map:live', 2000));
+    thm.set(art, { visible: false });
+    ok('layer host: its only layer hidden: not hosted, the theme told why',
+        await until(() => hosted[hosted.length - 1] === 'map:-', 2000) &&
+        await until(() => hostingThm[hostingThm.length - 1] === 'map:waiting:no layer of the client is drawn over its rect on panel', 2000));
+    thm.set(art, { visible: true });
+    ok('layer host: shown again: hosted again',
+        await until(() => hosted[hosted.length - 1] === 'map:panel:1:560', 2000));
+    thm.host('panel', { target: 'map', x: 1800, y: 160, w: 560, h: 400 });
+    ok('layer host: refused: the client forgets it, the service ends it', await until(() =>
+        !thm.layerHosts.has('map') && hosted[hosted.length - 1] === 'map:-' &&
+        et.refused.some((r) => r.indexOf('host: x, y, w, h must lie inside panel') === 0), 2000));
+    thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400, edge_top: 30 });
+    ok('layer host: hosted again, with an edge',
+        await until(() => hosted[hosted.length - 1] === 'map:panel:1:560', 2000) &&
+        thm.layerHosts.get('map').msg.edge_top === 30);
+    thm.host('nowhere', { target: 'map', x: 700, y: 160, w: 560, h: 400 });
+    ok('layer host: a move to an unknown target refused: the service ends the host, the client forgets it', await until(() =>
+        !thm.layerHosts.has('map') && hosted[hosted.length - 1] === 'map:-' &&
+        et.refused.some((r) => r.indexOf('host: unknown target nowhere') === 0), 2000));
+    thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400 });
+    await until(() => hosted[hosted.length - 1] === 'map:panel:1:560', 2000);
+    /* a refused move and, before its refusal comes, a host into the panel
+     * again: the service ends the first and takes the second; the client
+     * keeps the second */
+    const refusedMove = et.refused.length;
+    thm.host('nowhere', { target: 'map', x: 700, y: 160, w: 560, h: 400 });
+    thm.host('panel', { target: 'map', x: 704, y: 160, w: 560, h: 400 });
+    ok('layer host: a host sent after a refused move is kept by the client and taken by the service', await until(() =>
+        et.refused.length > refusedMove && hosted[hosted.length - 1] === 'map:panel:1:560', 2000) &&
+        thm.layerHosts.has('map') && thm.layerHosts.get('map').into === 'panel' &&
+        thm.layerHosts.get('map').msg.x === 704);
+    const marked = thm.video({ target: 'panel', hosted: 'map', vw: 64, vh: 32 });
+    ok('layer host: a layer\'s hosted mark is sent', sentByThm.some((m) => m.op === 'layer' && m.ref === marked &&
+        m.hosted === 'map'));
+    thm.drop(marked);
+    thm.unhost('map');
+    ok('layer host: unhost: not hosted, forgotten', await until(() => hosted[hosted.length - 1] === 'map:-', 2000) &&
+        !thm.layerHosts.has('map') && sentByThm.some((m) => m.op === 'unhost' && m.into === 'panel' && m.target === 'map'));
+    const liveBefore = hostingThm.length;
+    thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400 });
+    ok('layer host: hosted again after unhost: told it is live again', await until(() =>
+        hosted[hosted.length - 1] === 'map:panel:1:560' && hostingThm.length > liveBefore &&
+        hostingThm[hostingThm.length - 1] === 'map:live', 2000));
+    /* An older service (its hello without host_layers): kept, nothing sent. */
+    const n = sentByThm.length;
+    thm._event({ ev: 'hello', proto: 1, backend: 'id7', targets: 'map:1088x480,panel:1920x720' });
+    thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400, shown: false });
+    thm.unhost('hud');
+    ok('layer host: to an older service nothing is sent, the host kept',
+        thm.hostLayers === false && sentByThm.length === n && thm.layerHosts.has('map'));
+    thm._event({ ev: 'hello', proto: 1, backend: 'id7', targets: 'map:1088x480,panel:1920x720', host_layers: 1 });
+    ok('layer host: a service that takes it: the kept host sent',
+        sentByThm.length === n + 1 && sentByThm[n].op === 'host' && sentByThm[n].shown === 0);
+    await until(() => hosted[hosted.length - 1] === 'map:panel:0:560', 2000);
+    thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400 });
+    ok('layer host: shown', await until(() => hosted[hosted.length - 1] === 'map:panel:1:560', 2000));
+    thm.close();
+    ok('layer host: the theme closed: the map not hosted', await until(() => hosted[hosted.length - 1] === 'map:-', 2000));
+
+    /* others_fps: the overlay's layer asks for the others' bandwidth. */
+    const caps = [];
+    waze.on('fps_cap', (fps, app) => caps.push(fps + ':' + app));
+    ok('the hello says the service knows others_fps', ovl.othersFps === true && waze.othersFps === true);
+    const ask = ovl.image({ target: 'panel', klass: 'overlay', others_fps: 20, w: 16, h: 16, iw: 16, ih: 16 });
+    ovl.pixels(ask, null, Buffer.alloc(16 * 16 * 4, 255));
+    ok('shown with others_fps 20: the other client told who asks, the asking one nothing',
+        await until(() => waze.fpsCap === 20, 3000) && waze.fpsCapApp === 'overlay' && ovl.fpsCap === 0 &&
+        caps.join() === '20:overlay');
+    ovl.set(ask, { others_fps: 0 });
+    ok('others_fps 0: released', await until(() => waze.fpsCap === 0, 2000) && caps.join() === '20:overlay,0:');
+    ovl.set(ask, { others_fps: 20 });
+    const held = await until(() => waze.fpsCap === 20, 2000);
+    ovl.drop(ask);
+    ok('dropped: released', held && await until(() => waze.fpsCap === 0, 2000));
+    const ask2 = ovl.image({ target: 'panel', klass: 'overlay', others_fps: 20, w: 16, h: 16, iw: 16, ih: 16 });
+    ovl.pixels(ask2, null, Buffer.alloc(16 * 16 * 4, 255));
+    const again = await until(() => waze.fpsCap === 20, 3000);
+    const before = caps.length;
+    waze.close();
+    ok('the held client closing: released here, told 0', again && waze.fpsCap === 0 && caps.length === before + 1 &&
+        caps[caps.length - 1] === '0:');
+    waze.connect();
+    ok('connected again: held again', await until(() => waze.fpsCap === 20, 3000));
+    ovl.drop(ask2);
+    ok('the request dropped: released', await until(() => waze.fpsCap === 0, 2000));
+
+    /* Render state and samplers (PROTOCOL.md "Render state", "Mipmaps"). */
+    const refusedBefore = eo.refused.length;
+    ok('render state: the hello says the service takes render state and samplers',
+        ovl.renderState === true && ovl.samplers === true);
+    const dial = ovl.asset({ target: 'panel', w: 64, h: 32, sampling: 'trilinear', wrap: 'repeat', wrap_u: 'mirror',
+        anisotropy: 4 });
+    ovl.pixels(dial, null, Buffer.alloc(64 * 32 * 4, 200));
+    const sheet = ovl.asset({ target: 'panel', format: 'etc2rgba', w: 16, h: 8, sampling: 'bilinear_mips' });
+    const chain = (8 + 2) * 16;   /* 16x8 and 8x4: the levels of whole blocks */
+    ovl.pixels(sheet, null, Buffer.alloc(chain, 7));
+    const glow = ovl.effect({ target: 'panel', klass: 'overlay', x: 0, y: 0, w: 64, h: 32, blend: 'premultiplied',
+        color_mask: 'rgb', fs: 'precision mediump float;uniform sampler2D u_dial;varying vec2 v_uv;' +
+            'void main(){gl_FragColor=texture2D(u_dial,v_uv);}' });
+    ovl.bind(glow, 'u_dial', dial);
+    const gear = ovl.mesh({ target: 'panel', x: 100, y: 0, w: 200, h: 200, cz: 5 });
+    ovl.part(gear, 1, { vs: 'attribute vec3 a_position;uniform mat4 u_mvp;void main(){gl_Position=u_mvp*vec4(a_position,1.0);}',
+        fs: 'void main(){gl_FragColor=vec4(1.0);}', depth_func: 'greater', depth_write: false, blend: 'max' });
+    ovl.geometry(gear, 1, { positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] });
+    ok('render state: the effect layer and the part shown', await until(() => eo.layer[glow] === 'shown' &&
+        eo.layer[gear] === 'shown', 3000));
+    ovl.set(glow, { blend: 'subtract', color_mask: 'rgba' });
+    const a1 = ovl.animate(glow, { property: 'rotate', keys: '0:0 1000:90' });
+    const a2 = ovl.animate(glow, { property: 'rotate', keys: '0:90 1000:45', anim: a1 });
+    const a3 = ovl.animate(glow, { property: 'rotate', keys: '0:0 1000:45', anim: 99 });
+    ok('render state: an animation replaced by its number, an unknown number a new one',
+        a1 > 0 && a2 === a1 && a3 !== a1 && ovl.layers.get(glow).anims.size === 2 &&
+        ovl.layers.get(glow).anims.get(a1).keys === '0:90 1000:45');
+    status = '';
+    ovl.status();
+    ok('render state: the assets with their mip levels', await until(() => status.indexOf('64x32 (7 mip levels)') >= 0, 1000) &&
+        status.indexOf('etc2rgba 16x8 (2 mip levels)') >= 0);
+    ok('render state: nothing refused', eo.refused.length === refusedBefore);
+    const bad = ovl.effect({ target: 'panel', fs: 'void main(){}', blend_dst: 'one_minus_src_color' });
+    ok('render state: a factor the service lacks refused',
+        await until(() => eo.refused.some((r) => r.indexOf('layer: blend_dst must be') === 0), 1000));
+    /* Canvases (PROTOCOL.md "Canvases"). */
+    ok('canvas: the hello says the service takes canvases', ovl.canvases === true);
+    const cv = ovl.canvas({ target: 'panel', w: 128, h: 64, depth: true, clear: [0, 0, 0, 1], once: true });
+    const inCv = ovl.effect({ target: 'panel', canvas: cv, w: 128, h: 64, stencil_func: 'always', stencil_ref: 1,
+        stencil_pass: 'replace', fs: 'precision mediump float;void main(){gl_FragColor=vec4(1.0,0.5,0.0,1.0);}' });
+    const onScreen = ovl.effect({ target: 'panel', klass: 'overlay', x: 300, y: 300, w: 128, h: 64,
+        fs: 'precision mediump float;uniform sampler2D u_cv;varying vec2 v_uv;void main(){gl_FragColor=texture2D(u_cv,v_uv);}' });
+    ovl.bind(onScreen, 'u_cv', cv);
+    ok('canvas: a layer drawn in it and one sampling it, both shown',
+        await until(() => eo.layer[inCv] === 'shown' && eo.layer[onScreen] === 'shown', 3000));
+    status = '';
+    ovl.status();
+    ok('canvas: the status names it', await until(() => /canvas \d+ 128x64 depth once of overlay on panel: made/.test(status), 1000));
+    ok('canvas: nothing refused', eo.refused.length === refusedBefore + 1);
+    ovl.drop(cv);
+    ok('canvas: dropping it with a layer in it refused, kept here',
+        await until(() => eo.refused.some((r) => r.indexOf('drop: canvas in use') === 0), 1000) && ovl.layers.has(cv));
+    [inCv, onScreen, cv].forEach((r) => ovl.drop(r));
+    [glow, gear, bad, dial, sheet].forEach((r) => ovl.drop(r));
+    eo.refused.length = refusedBefore;   /* the bad one's and the drop's refusals, expected */
+
+    /* Rolled back to a service without canvases: none of a canvas sent to
+     * it (it would draw a layer drawn in one on screen), made before its
+     * hello or after; all of it to a service that takes them. */
+    const got = [];
+    let peer = null;
+    const old = net.createServer((s) => {
+        peer = s;
+        let buf = Buffer.alloc(0);
+        s.on('data', (d) => {
+            buf = Buffer.concat([buf, d]);
+            while (buf.length >= 5 && buf.length >= 4 + buf.readUInt32LE(0)) {
+                const len = buf.readUInt32LE(0);
+                got.push(buf[4] === 0x4a ? JSON.parse(buf.slice(5, 4 + len).toString('utf8')) : { binary: true });
+                buf = buf.slice(4 + len);
+            }
+        });
+        s.on('error', () => {});
+    });
+    const oldSock = sock + '.old';
+    await new Promise((r) => old.listen(oldSock, r));
+    const hello = (extra) => {
+        const body = Buffer.from(JSON.stringify(Object.assign({ ev: 'hello', proto: 1, backend: 'id7',
+            targets: 'map:1088x480,panel:1920x720' }, extra)));
+        const head = Buffer.alloc(5);
+        head.writeUInt32LE(body.length + 1, 0);
+        head[4] = 0x4a;
+        peer.write(Buffer.concat([head, body]));
+    };
+    const rc = new ClusterRender('rolled', oldSock);
+    rc.connect();
+    const rcv = rc.canvas({ target: 'panel', w: 32, h: 32 });
+    const rin = rc.effect({ target: 'panel', canvas: rcv, w: 32, h: 32, fs: 'void main(){}' });
+    const rout = rc.effect({ target: 'panel', w: 32, h: 32, fs: 'void main(){}' });
+    rc.bind(rout, 'u_cv', rcv);
+    await until(() => peer !== null, 2000);
+    await sleep(100);
+    hello({});
+    await until(() => rc.ready, 2000);
+    rc.uniform(rin, 'u_level', [0.5]);
+    rc.set(rin, { x: 4 });
+    const rmesh = rc.mesh({ target: 'panel', canvas: rcv, w: 32, h: 32 });
+    rc.part(rmesh, 1, { vs: 'void main(){}', fs: 'void main(){}' });
+    rc.geometry(rmesh, 1, { positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] });
+    await sleep(100);
+    ok('older service: no canvas, nothing drawn in one, no bind of one sent, before or after its hello',
+        rc.canvases === false && got.some((m) => m.op === 'layer' && m.ref === rout) &&
+        got.every((m) => !m.binary && m.op !== 'canvas' && m.canvas === undefined && m.op !== 'bind' &&
+            m.ref !== rin && m.ref !== rmesh));
+    got.length = 0;
+    peer.destroy();
+    peer = null;
+    await until(() => peer !== null, 3000);
+    await sleep(100);
+    hello({ canvas: 1 });
+    ok('a service that takes canvases: the canvas, the layers in it, a part, its geometry and the bind sent ' +
+        'after its hello', await until(() => got.some((m) => m.op === 'bind' && m.ref === rout), 2000) &&
+        got.some((m) => m.op === 'canvas' && m.ref === rcv) && got.some((m) => m.op === 'layer' && m.ref === rin &&
+        m.canvas === rcv && m.x === 4) && got.some((m) => m.op === 'part' && m.ref === rmesh) &&
+        got.some((m) => m.binary) && got.some((m) => m.op === 'uniform' && m.ref === rin));
+    rc.close();
+    old.close();
 
     clearInterval(feed);
     ok('frames stopping: the video is stalled after its stall time',

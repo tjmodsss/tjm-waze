@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Robert Nisipeanu
 #include "map_feeds.h"
 
+#include <algorithm>
+
 #include "log.h"
 
 namespace woc {
@@ -133,7 +135,8 @@ void MapFeeds::feed_hud(int64_t now_ms)
 
 int64_t MapFeeds::wake_in_ms(int64_t now_ms) const
 {
-    return hud_ ? hud_->wake_in_ms(now_ms) : -1;
+    const int64_t c = cluster_ ? cluster_->wake_in_ms(now_ms) : -1, h = hud_ ? hud_->wake_in_ms(now_ms) : -1;
+    return c < 0 ? h : h < 0 ? c : std::min(c, h);
 }
 
 /* The cluster's without a copy. The HUD's copy of a new picture is made

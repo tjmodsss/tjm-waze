@@ -120,6 +120,42 @@ namespace ramses
         ETextureSamplingMethod_MinNearestMagLinear = 6
     };
 
+    // Render buffers (VERIFIED, ABI.md "Evidence per item": the checks of
+    // SceneImpl::createRenderBuffer at 0x111e57, the tables 0x69edb8 and
+    // 0x69ed80 RenderBufferImpl maps them by and 0x69ed00 getBufferFormat
+    // maps back by). Unlike RAMSES 27
+    // there is no RGBA4: the colour formats start at R8.
+    enum ERenderBufferType
+    {
+        ERenderBufferType_Color = 0,
+        ERenderBufferType_Depth = 1,
+        ERenderBufferType_DepthStencil = 2
+    };
+
+    enum ERenderBufferFormat
+    {
+        ERenderBufferFormat_R8 = 0,
+        ERenderBufferFormat_RG8 = 1,
+        ERenderBufferFormat_RGB8 = 2,
+        ERenderBufferFormat_RGBA8 = 3,
+        ERenderBufferFormat_R16F = 4,
+        ERenderBufferFormat_R32F = 5,
+        ERenderBufferFormat_RG16F = 6,
+        ERenderBufferFormat_RG32F = 7,
+        ERenderBufferFormat_RGB16F = 8,
+        ERenderBufferFormat_RGB32F = 9,
+        ERenderBufferFormat_RGBA16F = 10,
+        ERenderBufferFormat_RGBA32F = 11,
+        ERenderBufferFormat_Depth24 = 12,
+        ERenderBufferFormat_Depth24_Stencil8 = 13
+    };
+
+    enum ERenderBufferAccessMode
+    {
+        ERenderBufferAccessMode_WriteOnly = 0,
+        ERenderBufferAccessMode_ReadWrite = 1
+    };
+
     enum EBlendFactor
     {
         EBlendFactor_Zero = 0,

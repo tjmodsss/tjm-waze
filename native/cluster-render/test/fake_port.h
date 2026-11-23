@@ -9,11 +9,14 @@
  * a take-over unmaps the HMI's content, which the HMI maps again (parked).
  * Every change of the table is reported, as the KOMBI reports every slot on
  * each arbitration. A release is confirmed confirm_ms after it (the car:
- * about 35 ms). */
+ * about 35 ms). A load (preload) is fetched after grant_ms and kept
+ * unmapped; an unmap keeps the fetch; a remap maps a kept fetch after
+ * grant_ms. */
 #ifndef CRS_FAKE_PORT_H
 #define CRS_FAKE_PORT_H
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -27,7 +30,9 @@ public:
     bool up = true;
     int64_t grant_ms = 50;
     int64_t confirm_ms = 35;
-    int requests = 0, releases = 0;
+    int requests = 0, releases = 0, loads = 0, remaps = 0;
+    std::map<uint64_t, int64_t> loading;   /* scene -> when its load is fetched */
+    std::set<uint64_t> fetched;            /* scenes loaded or unmapped, kept fetched */
     int64_t last_request_ms = -1, last_release_ms = -1;
     std::map<uint64_t, int64_t> releasing;   /* scene -> when its release is confirmed */
     std::vector<uint64_t> taken_over;      /* contents a take-over unmapped, in order */
@@ -56,8 +61,35 @@ public:
         last_release_ms = now;
         releasing[t.scene_id] = now + confirm_ms;
         pending.erase(t.scene_id);
+        loading.erase(t.scene_id);
+        fetched.erase(t.scene_id);
         if (unmap(t.slot, t.scene_id))
             report();
+    }
+    bool preloads() const override { return true; }
+    void load(const TargetSpec &t) override
+    {
+        loads++;
+        last_request_ms = now;
+        releasing.erase(t.scene_id);
+        loading[t.scene_id] = now + grant_ms;
+        slot_of[t.scene_id] = t.slot;
+    }
+    bool unmap(const TargetSpec &t) override
+    {
+        pending.erase(t.scene_id);
+        fetched.insert(t.scene_id);
+        if (unmap(t.slot, t.scene_id))
+            report();
+        return true;
+    }
+    bool remap(const TargetSpec &t, int64_t) override
+    {
+        if (!fetched.erase(t.scene_id))
+            return false;
+        remaps++;
+        pending[t.scene_id] = now + grant_ms;
+        return true;
     }
     void take_over(const TargetSpec &t, uint64_t content) override
     {
@@ -76,6 +108,16 @@ public:
         shown.swap(promoted);
         for (uint64_t scene : shown)
             m->on_shown(scene, t);
+        for (auto it = loading.begin(); it != loading.end();) {
+            if (t >= it->second) {
+                const uint64_t scene = it->first;
+                it = loading.erase(it);
+                fetched.insert(scene);
+                m->on_fetched(scene, t);
+            } else {
+                ++it;
+            }
+        }
         for (auto it = pending.begin(); it != pending.end();) {
             if (t >= it->second) {
                 const uint64_t scene = it->first;
@@ -125,6 +167,8 @@ public:
     {
         pending.clear();
         promoted.clear();
+        loading.clear();
+        fetched.clear();
         std::vector<SlotInfo> rows = table;
         for (const SlotInfo &s : rows)
             if (slot_of.count(s.content))
@@ -134,6 +178,8 @@ public:
     {
         up = on;
         pending.clear();
+        loading.clear();
+        fetched.clear();
         m->on_availability(on, now);
     }
     /* The row of content in slot; null: none. */

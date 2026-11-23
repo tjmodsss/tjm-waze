@@ -33,9 +33,9 @@ var carplayProc = require('./carplay_proc.js');
 var earlier = require('./earlier_patcher.js');
 
 var fs = require('fs');
-var os = require('os');
 var net = require('net');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
 
 var PATCHD = path.join(__dirname, '..', 'patchd.js');
@@ -53,12 +53,7 @@ function ok(name, cond, detail) {
 if (!fs.existsSync(SRC)) { process.stdout.write('SKIP: set CARPLAY_BIN to a copy of the unit\'s /usr/bin/carplay (carplay 22.28.3)\n'); process.exit(0); }
 var SRCBUF = fs.readFileSync(SRC);
 
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-patchd-'));
-var children = [];
-process.on('exit', function () {
-    children.forEach(function (c) { try { c.kill('SIGKILL'); } catch (e) {} });
-    try { cp.execFileSync('rm', ['-rf', dir]); } catch (e) {}
-});
+var dir = tmp.dir();
 
 var TGT = path.join(dir, 'carplay');
 var DROPIN = path.join(dir, 'carplay.service.d', '50-waze-on-cluster.conf');
@@ -151,7 +146,6 @@ fs.chmodSync(MOUNT, 0o755);
 /* A dummy carplay main process; resolves .died to the signal that ended it. */
 function dummyCarplay() {
     var c = cp.spawn(process.execPath, ['-e', 'setInterval(function () {}, 1e6)'], { stdio: 'ignore' });
-    children.push(c);
     c.died = new Promise(function (r) { c.on('exit', function (code, signal) { r(signal || code); }); });
     return c;
 }
@@ -249,7 +243,6 @@ var patchd = cp.spawn(process.execPath, [PATCHD], {
     }),
     stdio: ['ignore', 'ignore', 'inherit'],
 });
-children.push(patchd);
 
 function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 

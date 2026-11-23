@@ -19,8 +19,8 @@
 require('./head_unit_env.js');   /* a HIGH head unit for every patcher and patchd this runs */
 
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
 var crypto = require('crypto');
 
@@ -57,7 +57,7 @@ function stage(tgt, f, meta) {
         buildId: locator.buildId(f.original), sha256_original: sha256(f.original), savedAt: '2026-10-01T00:00:00.000Z' }, meta || {})) + '\n');
 }
 
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-undo-'));
+var dir = tmp.dir();
 try {
     var tgt = path.join(dir, 'carplay'), r;
     fixtures.forEach(function (f) {
@@ -115,7 +115,7 @@ try {
     r = run(['status', '--target', tgt]);
     ok('the proven build patched, no backup: restorable', /^restorable: yes$/m.test(r.out) && /^backup:\s+none$/m.test(r.out), r.out);
     r = run(['revert', '--target', tgt, '--yes']);
-    ok('the proven build patched, no backup: revert writes its shipped bytes, byte-exact', r.code === 0 && /the proven build's shipped bytes/.test(r.out) &&
+    ok('the proven build patched, no backup: revert writes its shipped bytes, byte-exact', r.code === 0 && /the build's shipped bytes/.test(r.out) &&
         fs.readFileSync(tgt).equals(REF) && (fs.statSync(tgt).mode & 0o7777) === 0o755, r.out);
     pr = patchedRef();
     var bk = fs.readFileSync(tgt + '.woc-orig');

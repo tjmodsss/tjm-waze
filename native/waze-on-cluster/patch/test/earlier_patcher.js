@@ -1,51 +1,51 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Robert Nisipeanu
-/* An earlier release's carplay patcher, for the tests that need carplay as
+/* Earlier releases' patchers, for the tests that need carplay or aapd as
  * an earlier release patched it in the file: waze-on-cluster 0.10.12, the
- * last release whose carplay_patch.js has `apply`. Its patch folder comes
- * from the release tag (fetched when missing) into a temporary folder, once
- * per process, removed at exit.
+ * last release whose carplay_patch.js has `apply`, and 0.12.1, the last
+ * whose aapd_patch.js has it. Each patch folder comes from its release tag
+ * (fetched when missing) into a temporary folder, once per process, removed
+ * at exit.
  *
  *   var earlier = require('./earlier_patcher.js');
- *   earlier.script()            its carplay_patch.js
+ *   earlier.script()             0.10.12's carplay_patch.js
  *   earlier.scriptFor(args, cur) its carplay_patch.js for an `apply`, else cur
- *   earlier.run(args, env)      {code, out} of its carplay_patch.js
+ *   earlier.run(args, env)       {code, out} of its carplay_patch.js
+ *   earlier.aaScript()           0.12.1's aapd_patch.js
+ *   earlier.aaScriptFor(args, cur) its aapd_patch.js for an `apply`, else cur
+ *   earlier.dir(tag)             a release's patch folder (default 0.10.12)
  */
 'use strict';
 
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
 
+var tags = require('./release_tags.js');
+
 var TAG = 'waze-on-cluster@0.10.12';
-var REPO = path.join(__dirname, '..', '..', '..', '..');
-var dir = null;
+var AA_TAG = 'waze-on-cluster@0.12.1';
+var REPO = tags.REPO;
+var dirs = {};
 
-function git(args) { return cp.execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
-
-function hasTag() {
-    try { return git(['tag', '-l', TAG]).trim() === TAG; } catch (e) { return false; }
-}
-
-/* The release's patch folder. */
-function patchDir() {
-    if (dir) return dir;
-    if (!hasTag()) {
-        /* a shallow checkout (CI) fetches it shallow; a full clone stays full */
-        var shallow = false;
-        try { shallow = git(['rev-parse', '--is-shallow-repository']).trim() === 'true'; } catch (e) {}
-        try { git(['fetch', '--no-tags'].concat(shallow ? ['--depth=1'] : [], ['origin', '+refs/tags/' + TAG + ':refs/tags/' + TAG])); } catch (e) {}
-        if (!hasTag()) throw new Error('earlier_patcher: no ' + TAG + ' tag, and fetching it failed');
+/* A release's patch folder. */
+function patchDir(tag) {
+    tag = tag || TAG;
+    if (dirs[tag]) return dirs[tag];
+    if (!tags.has(tag)) {
+        var why = tags.fetch(tag);
+        if (!tags.has(tag)) throw new Error('earlier_patcher: no ' + tag + ' tag, and fetching it failed' + (why ? ': ' + why : ''));
     }
-    var d = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-earlier-'));
-    process.on('exit', function () { try { cp.execFileSync('rm', ['-rf', d]); } catch (e) {} });
-    cp.execSync('git archive "' + TAG + '" native/waze-on-cluster/patch | tar -x -C "' + d + '" --strip-components=3', { cwd: REPO });
-    dir = d;
-    return dir;
+    var d = tmp.dir();
+    cp.execSync('git archive "' + tag + '" native/waze-on-cluster/patch | tar -x -C "' + d + '" --strip-components=3', { cwd: REPO });
+    dirs[tag] = d;
+    return d;
 }
 
 function script() { return path.join(patchDir(), 'carplay_patch.js'); }
+function aaScript() { return path.join(patchDir(AA_TAG), 'aapd_patch.js'); }
+function aaScriptFor(args, cur) { return args[0] === 'apply' ? aaScript() : cur; }
 
 /* The patcher that runs args: the release's for an apply (this version has
  * none), cur for every other command. */
@@ -56,4 +56,4 @@ function run(args, env) {
     return { code: r.status, out: (r.stdout || '') + (r.stderr || '') };
 }
 
-module.exports = { TAG: TAG, dir: patchDir, script: script, scriptFor: scriptFor, run: run };
+module.exports = { TAG: TAG, AA_TAG: AA_TAG, dir: patchDir, script: script, scriptFor: scriptFor, run: run, aaScript: aaScript, aaScriptFor: aaScriptFor };

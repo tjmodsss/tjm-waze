@@ -59,6 +59,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -260,7 +261,58 @@ struct Look {
     int frames = 0;   /* how many different frames were seen (1: consistent) */
 };
 
+static Look look_whole(const FakeGraph *g, uint32_t tw, uint32_t th, uint32_t vw, uint32_t vh);
+
+/* What look() reads of g's shown state: the buffers (their pixels change only by writes, which
+ * shown_writes counts, and by buffers made or dropped, which their ids show) and every quad with a
+ * picture. An effect's quad, whose uniforms (a clock) change at every flush, is not read. */
+static std::string look_key(const FakeGraph *g, uint32_t tw, uint32_t th, uint32_t vw, uint32_t vh)
+{
+    std::string k = std::to_string(g->shown_writes) + " " + std::to_string(tw) + "x" + std::to_string(th) + " " +
+                    std::to_string(vw) + "x" + std::to_string(vh) + " b";
+    for (const auto &kv : g->shown.buffers)
+        k += " " + std::to_string(kv.first);
+    for (const auto &kv : g->shown.quads) {
+        const FakeQuad &q = kv.second;
+        auto t = q.textures.find("u_image");
+        if (t == q.textures.end())
+            continue;
+        char b[200];
+        std::snprintf(b, sizeof b, " q%d:%d %g %d %d,%d,%u,%u %d t%d", kv.first, q.visible, opacity_of(q), q.order,
+                      q.r.x, q.r.y, q.r.w, q.r.h, unturned_quad(q), t->second);
+        k += b;
+        for (const char *u : {"u_view", "u_size"}) {
+            auto it = q.uniforms.find(u);
+            if (it != q.uniforms.end())
+                for (float f : it->second) {
+                    std::snprintf(b, sizeof b, " %g", f);
+                    k += b;
+                }
+            k += ";";
+        }
+    }
+    return k;
+}
+
+/* look() of the shown state, worked out again only when something it reads changed: a panel with an
+ * effect flushes every tick, and those flushes change nothing look() sees. */
 static Look look(const FakeGraph *g, uint32_t tw, uint32_t th, uint32_t vw, uint32_t vh)
+{
+    static const FakeGraph *last_g = nullptr;
+    static uint64_t last_flushes = 0;
+    static std::string last_key;
+    static Look last;
+    std::string k = look_key(g, tw, th, vw, vh);
+    if (g == last_g && g->flushes >= last_flushes && k == last_key)
+        return last;
+    last = look_whole(g, tw, th, vw, vh);
+    last_g = g;
+    last_flushes = g->flushes;
+    last_key.swap(k);
+    return last;
+}
+
+static Look look_whole(const FakeGraph *g, uint32_t tw, uint32_t th, uint32_t vw, uint32_t vh)
 {
     Look out;
     const FakeQuad *q = nullptr;
@@ -1981,12 +2033,12 @@ static void unchanged()
 
 /* ---- what it saves ---------------------------------------------------------- */
 
-static void minute()
+static void minute(int kind)
 {
     const char *names[] = {"an opaque 320x240 camera", "a 320x240 camera at 0.9",
                            "an opaque 320x240 camera sliding 4 px a frame", "an opaque camera as large as the map",
                            "an opaque 800x480 camera at 0,0"};
-    for (int kind = 0; kind < 5; kind++) {
+    {
         const Trace t = camera_minute_trace(kind);
         const uint64_t *b = kBaseMinute[kind];
         const unsigned long long cp = count_of(t.camera_stats, " packed"), up = count_of(t.video_stats, " uncovered");
@@ -2079,43 +2131,63 @@ static void cost()
     ok(name, any == 3u * n);
 }
 
-int main()
+/* With --part I/N, only every Nth unit from the Ith (make test runs the parts at once); none: all. */
+int main(int argc, char **argv)
 {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    cells();
-    skipped();
-    opaque_rules();
-    never_stale(Over::Camera);
-    never_stale(Over::Image);
-    never_stale(Over::Blocks);
-    never_stale(Over::Fade);
-    composite_occluded();
-    composite_occluding();
-    uncover_waits(false);
-    uncover_waits(true);
-    quiet_hidden_reattach();
-    full_slot();
-    camera_800();
-    exclusive_dismissal(true);
-    exclusive_dismissal(false);
-    exclusive_dismissal(true, true);
-    alert_removed_with_moves();
-    alert_behind_busy_map();
-    animate_toggle();
-    removal_forced();
-    refused_composite();
-    held_opacity_fade();
-    fair_uncovers(Slide::Slide);
-    fair_uncovers(Slide::Jump);
-    fair_uncovers(Slide::JumpBusy);
-    source_held();
-    forced_skipped();
-    full_slot_disconnect(false);
-    full_slot_disconnect(true);
-    transparent_pixels();
-    unchanged();
-    minute();
-    cost();
+    int part = 0, parts = 1;
+    if (argc == 3 && std::strcmp(argv[1], "--part") == 0) {
+        if (std::sscanf(argv[2], "%d/%d", &part, &parts) != 2 || parts < 1 || part < 0 || part >= parts) {
+            std::fprintf(stderr, "usage: %s [--part I/N]\n", argv[0]);
+            return 2;
+        }
+    } else if (argc != 1) {
+        std::fprintf(stderr, "usage: %s [--part I/N]\n", argv[0]);
+        return 2;
+    }
+    const std::vector<std::function<void()>> units = {
+        [] { cells(); },
+        [] { skipped(); },
+        [] { opaque_rules(); },
+        [] { never_stale(Over::Camera); },
+        [] { never_stale(Over::Image); },
+        [] { never_stale(Over::Blocks); },
+        [] { never_stale(Over::Fade); },
+        [] { composite_occluded(); },
+        [] { composite_occluding(); },
+        [] { uncover_waits(false); },
+        [] { uncover_waits(true); },
+        [] { quiet_hidden_reattach(); },
+        [] { full_slot(); },
+        [] { camera_800(); },
+        [] { exclusive_dismissal(true); },
+        [] { exclusive_dismissal(false); },
+        [] { exclusive_dismissal(true, true); },
+        [] { alert_removed_with_moves(); },
+        [] { alert_behind_busy_map(); },
+        [] { animate_toggle(); },
+        [] { removal_forced(); },
+        [] { refused_composite(); },
+        [] { held_opacity_fade(); },
+        [] { fair_uncovers(Slide::Slide); },
+        [] { fair_uncovers(Slide::Jump); },
+        [] { fair_uncovers(Slide::JumpBusy); },
+        [] { source_held(); },
+        [] { forced_skipped(); },
+        [] { full_slot_disconnect(false); },
+        [] { full_slot_disconnect(true); },
+        [] { transparent_pixels(); },
+        [] { unchanged(); },
+        [] { minute(0); },
+        [] { minute(1); },
+        [] { minute(2); },
+        [] { minute(3); },
+        [] { minute(4); },
+        [] { cost(); },
+    };
+    for (size_t i = 0; i < units.size(); i++)
+        if ((int)(i % (size_t)parts) == part)
+            units[i]();
     std::printf(failures ? "%d FAILED\n" : "all ok\n", failures);
     return failures ? 1 : 0;
 }

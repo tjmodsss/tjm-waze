@@ -39,7 +39,7 @@ JOBS    ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 # The unit's toolchain ABI (docker/Dockerfile), tagged with the Dockerfile's
 # checksum: built when no image has that tag.
 IMAGE   := cluster-render-build:$(shell cksum < docker/Dockerfile | cut -d' ' -f1)
-DOCKER_IMAGE = docker image inspect $(IMAGE) >/dev/null 2>&1 || docker build -q --platform linux/amd64 -t $(IMAGE) docker
+DOCKER_IMAGE = docker image inspect $(IMAGE) >/dev/null 2>&1 || docker build --progress=plain --platform linux/amd64 -t $(IMAGE) docker
 
 CXXFLAGS = -std=c++14 -O2 -g -Wall -Wextra -Werror
 HOSTINC  = -Ikit -Iinclude -I. -Isrc -isystem dcsm/third_party/vsomeip/interface
@@ -56,7 +56,7 @@ H = $(BUILD)/host
 
 KIT_SRC  = kit/dirty_tiles.cpp kit/yuv_atlas.cpp kit/block_pack.cpp
 CORE_SRC = src/slots.cpp src/governor.cpp src/stack.cpp src/recv_buffer.cpp src/layer.cpp src/video_layer.cpp \
-           src/video_composite.cpp src/mesh_layer.cpp src/occlusion.cpp src/asset.cpp src/compositor.cpp src/scene_file.cpp \
+           src/video_composite.cpp src/mesh_layer.cpp src/occlusion.cpp src/asset.cpp src/canvas.cpp src/compositor.cpp src/scene_file.cpp \
            src/scene_edit.cpp \
            src/server.cpp src/service.cpp src/dcsm2_port.cpp src/dcsm27_port.cpp src/ramses_console.cpp \
            src/ceiling_memory.cpp src/link_trace.cpp client/protocol.cpp src/log.cpp
@@ -78,30 +78,32 @@ CPP_TESTS = $(H)/log_test $(H)/slots_test $(H)/governor_test $(H)/ceiling_test $
 
 all: test
 
-# The test binaries build in parallel; the tests run one at a time.
+# The test binaries build in parallel, then the tests run at once, each its own
+# target (--output-sync keeps a test's lines together); occlusion_test, the
+# longest, in parts (its --part I/N), one per entry of OCC_PART_IDS.
+OCC_PART_IDS = 0 1 2 3 4 5 6 7
+CPP_RUNS = $(patsubst $(H)/%_test,run-%,$(filter-out $(H)/occlusion_test,$(CPP_TESTS))) \
+	$(addprefix run-occlusion.,$(OCC_PART_IDS))
+RUN_JOBS ?= $(JOBS)
+
 test:
 	$(MAKE) -j$(JOBS) $(KIT_TESTS) $(CPP_TESTS) $(H)/host_service
-	$(MAKE) -j1 test-kit test-cpp test-js
+	$(MAKE) -j$(RUN_JOBS) --output-sync=target test-kit $(CPP_RUNS) test-js
 
 test-cpp: $(CPP_TESTS)
-	$(H)/log_test
-	$(H)/slots_test
-	$(H)/ramses_console_test
-	$(H)/governor_test
-	$(H)/ceiling_test
-	$(H)/compositor_test
-	$(H)/video_composite_test
-	$(H)/occlusion_test
-	$(H)/dcsm2_port_test
-	$(H)/dcsm27_port_test
-	$(H)/generation_test
-	$(H)/holds_test
+	$(MAKE) -j$(RUN_JOBS) --output-sync=target $(CPP_RUNS)
+
+run-%: $(H)/%_test
+	$(H)/$*_test
+
+run-occlusion.%: $(H)/occlusion_test
+	$(H)/occlusion_test --part $*/$(words $(OCC_PART_IDS))
+
+run-head_unit: $(H)/head_unit_test
 	$(H)/head_unit_test test/head_unit_cases.jsonl
+
+run-refused: $(H)/refused_test
 	$(H)/refused_test $(H)/cluster-render
-	$(H)/recv_buffer_test
-	$(H)/scene_test
-	$(H)/settings_test
-	$(H)/service_test
 
 test-js: $(H)/host_service
 	$(NODE) js/test/client_test.js $(H)/host_service
@@ -121,7 +123,8 @@ test-x86:
 
 test-x86-in-docker:
 	$(MAKE) -j$(JOBS) $(KIT_TESTS) $(CPP_TESTS)
-	$(MAKE) -j1 test-kit test-cpp
+	$(MAKE) -j1 test-kit
+	$(MAKE) test-cpp
 
 test-kit-x86:
 	$(DOCKER_IMAGE)

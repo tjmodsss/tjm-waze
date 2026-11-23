@@ -19,9 +19,9 @@
 require('./head_unit_env.js');   /* a HIGH head unit for every patcher and patchd this runs */
 
 var fs = require('fs');
-var os = require('os');
 var net = require('net');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
 
 var PATCHD = path.join(__dirname, '..', 'patchd.js');
@@ -34,16 +34,9 @@ function ok(name, cond, detail) {
     if (!cond) fails++;
 }
 
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-dlt-'));
-
-/* However the test ends (passing, failing, an exception, an uncaught one), every
- * patchd it started is SIGKILLed and the directory removed, which ends any fake
- * dlt-receive a patchd left running. */
-var patchds = [];
-process.on('exit', function () {
-    patchds.forEach(function (c) { try { c.kill('SIGKILL'); } catch (e) {} });
-    try { cp.execFileSync('rm', ['-rf', dir]); } catch (e) {}
-});
+/* However the test ends, every patchd it started is SIGKILLed and the folder
+ * removed (tmp.js), which ends any fake dlt-receive a patchd left running. */
+var dir = tmp.dir();
 
 var MODE = path.join(dir, 'mode');
 function setMode(m) { fs.writeFileSync(MODE, m); }
@@ -100,7 +93,6 @@ function startPatchd(name, dltReceive, extraEnv) {
         WOC_DLT_RETRY_MAX_MS: String(RETRY_MS),
     }, extraEnv || {});
     var child = cp.spawn(process.execPath, [PATCHD], { env: env, stdio: ['ignore', 'ignore', 'inherit'] });
-    patchds.push(child);
     if (FAULT) process.stdout.write('patchd pid ' + child.pid + '\n');
     return { sock: sock, child: child };
 }

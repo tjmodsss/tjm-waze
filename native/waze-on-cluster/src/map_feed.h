@@ -26,8 +26,9 @@
  * visible, so the renderer never draws an older picture first. A new
  * layer (a host taking or dropping the map, a new size) starts from a copy
  * of the old one's newest. A layer that scales (the HUD's) keeps the
- * newest picture whole, scales it once, at most video.fps a second, and
- * sends a repeat as a repeat of its last scaled frame.
+ * newest picture whole, scales it once, at most video.fps a second (the
+ * renderer's fps_cap when lower), and sends a repeat as a repeat of its
+ * last scaled frame.
  *
  * The app's status line follows the stream, the layer and its target: idle
  * until the first frame or while the stream is not live, idle with kWaiting
@@ -235,13 +236,22 @@ public:
      * asked for again once the last request is answered. */
     void request_report();
     const std::string &report() const { return report_; }
+    /* Another app's layer on the cluster asks for the other videos' upload
+     * bandwidth (cluster-render PROTOCOL.md "Bandwidth for a layer"): the renderer
+     * writes this feed's layer at most this many times a second, and a
+     * layer that scales scales no more often; 0: not held, and while the
+     * renderer is not reachable. */
+    unsigned fps_cap() const { return client_.fps_cap; }
+    const std::string &fps_cap_app() const { return client_.fps_cap_app; }
 
 private:
     void make_layer();
     /* The host of the feed's target from now on (into empty: none): the
      * layer made again where it goes, or none while hidden. */
     void set_host(const cr::Host &h);
-    bool hosted() const { return !host_.into.empty(); }
+    /* Hosted, and the host's place can be drawn (else on the feed's own
+     * target until the host changes: the map is never nowhere). */
+    bool hosted() const { return !host_.into.empty() && !host_unusable_; }
     /* The target the layer is on: the host's, or the feed's own. */
     const std::string &drawn_target() const { return hosted() ? host_.into : cfg_.target; }
     /* A layer that scales: the scaled frame to the renderer, and the newest
@@ -263,6 +273,14 @@ private:
     FeedConfig cfg_;
     cr::Client client_;
     cr::Host host_;   /* the feed's target's host, from the renderer's events */
+    bool host_unusable_ = false;
+    bool remake_ = false;          /* the renderer refused the hosted layer: make it again, unhosted */
+    /* The host's place cannot be drawn (why): the layer on the feed's own
+     * target instead, until the host changes. */
+    void fall_back(const std::string &why);
+    /* The layer made again, its newest picture kept for the new one: now
+     * while connected, else at the next connection (on_ready). */
+    void remake_layer();
     uint32_t layer_ = 0;
     cr::LayerOptions lo_;   /* the layer's options as last sent */
     bool show_due_ = false;   /* visible once the frame waiting has gone */

@@ -66,8 +66,10 @@ private:
         std::map<std::string, std::string> target_sent;
         std::map<std::string, std::string> host_sent;   /* by hosted target: its host event last sent */
         uint64_t host_gen = 0;                          /* the Server's hosts_gen_ it was compared with */
+        std::map<std::string, std::string> hosting_sent;   /* by target: its last hosting event (its host from layers) */
         std::map<uint32_t, std::string> frame_error;  /* by ref: the last frame error sent */
         std::string budget_sent;
+        uint32_t fps_cap_sent = 0;   /* the fps of its last fps_cap event; 0: none or none sent */
         bool closing = false;
     };
 
@@ -87,15 +89,25 @@ private:
     std::string scene_reason(const Client &c, uint32_t layer) const;
     void op_layer(Client &c, const cr::Json &j, int64_t now_ms);
     void op_asset(Client &c, const cr::Json &j);
+    void op_canvas(Client &c, const cr::Json &j);
+    /* A layer in a canvas with a depth-stencil buffer may test the stencil. */
+    bool stencil_ok(const LayerParams &p) const;
     /* A scene file on a target (PROTOCOL.md "Scene files"), and its edits. */
     void op_scene(Client &c, const cr::Json &j);
     void op_edit(Client &c, uint32_t ref, const cr::Json &j);
-    /* The scene ref hosts a target (PROTOCOL.md "host"). */
+    /* The scene ref, or with into the client's layers there, hosts a target
+     * (PROTOCOL.md "host", "Hosting from layers"). */
     void op_host(Client &c, uint32_t ref, const cr::Json &j);
+    void op_unhost(Client &c, uint32_t ref, const cr::Json &j);
+    /* For the status and the log: owner's host from layers of target
+     * hosted, and whether it is live or why not. */
+    std::string layer_host_text(int hosted, uint64_t owner) const;
     /* set, uniform, bind, part, transform, animate and stop. */
     void op_on_layer(Client &c, const std::string &op, uint32_t ref, Layer *l, const cr::Json &j);
     void op_uniform(Client &c, uint32_t ref, Layer *l, const cr::Json &j);
     bool apply(Layer *l, const cr::Json &j, std::string *err);
+    /* The app name of the client with this id; "?" for none. */
+    std::string app_of(uint64_t id) const;
 
     Compositor *comp_;
     SlotManager *slots_;
@@ -111,6 +123,8 @@ private:
      * counts each time they were made again (report()). */
     std::map<std::string, std::string> hosts_;
     uint64_t hosts_serial_ = 0, hosts_gen_ = 0;
+    /* The others_fps requests as last logged (report()). */
+    std::string fps_requests_;
 };
 
 }  // namespace crs

@@ -250,8 +250,20 @@ function headUnitRefused(conflict) {
 function conflictText(conflict) {
     return /^not supported|^not patchable|^no Android Auto/.test(conflict) ? t('Not supported on this car')
         : /unreadable/.test(conflict) ? t('Unavailable')
-        : /^untested/.test(conflict) ? t('Untested version')
         : t('Changed by another tool');
+}
+
+/* A change that failed, with its reason: the conflict that refused it in
+ * the words both sections use, else patchd's own words. */
+function failedText(st) {
+    const why = st.error || st.reason;
+    if (st.conflict && why && why.indexOf(st.conflict) >= 0) {
+        return conflictText(st.conflict);
+    }
+    if (why && /^(not supported|not patchable)/.test(why)) {
+        return conflictText(why);
+    }
+    return why ? t('Failed, {0}', why) : t('Failed');
 }
 
 /* Where a render status shows the map: 'cluster', 'hud', 'both', 'off'
@@ -635,7 +647,7 @@ class WazeClusterControl extends EventEmitter {
             return this._lastPatchCmd === 'revert' ? t('Removing patch…') : t('Patching…');
         }
         if (ps.state === 'error') {
-            return t('Failed');
+            return failedText(ps);
         }
         if (ps.recovered && ps.state !== 'patched' && !headUnitRefused(ps.conflict)) {
             return t('Removed — head unit kept restarting');
@@ -731,11 +743,9 @@ class WazeClusterControl extends EventEmitter {
         return !!aa && aa.changeAt > Date.now();
     }
 
-    /* A conflict patchd refuses Patch, Zoom and the turn card for: any but
-     * an untested aapd build, which only Patch patches. */
     _aaBlocked() {
         const aa = this.aa();
-        return !!aa && !!aa.conflict && !/^untested/.test(aa.conflict);
+        return !!aa && !!aa.conflict;
     }
 
     canEnableAa() {
@@ -831,7 +841,7 @@ class WazeClusterControl extends EventEmitter {
             return aa.reason === 'reverting' ? t('Removing patch…') : t('Patching…');
         }
         if (aa.state === 'error' || aa.error) {
-            return t('Failed');
+            return failedText(aa);
         }
         if (aa.pending && !(aa.pending === 'apply' && headUnitRefused(aa.conflict))) {
             return aa.pending === 'revert' ? t('Removed after restart') : t('Patched after restart');

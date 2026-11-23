@@ -11,7 +11,7 @@ var assert = require('assert'), fs = require('fs'), os = require('os'), net = re
 var http = require('http'), path = require('path'), cp = require('child_process');
 var logs = require('../logs.js');
 
-var tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wlg-'));
+var tmp = require('./tmp.js').dir();
 var LO = Object.keys(os.networkInterfaces()).filter(function (n) {
     return os.networkInterfaces()[n].some(function (a) { return a.address === '127.0.0.1'; });
 })[0];

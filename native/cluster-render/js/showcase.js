@@ -9,7 +9,15 @@
  *   needle  a needle image sweeping about its pivot over a dial image;
  *   plasma  an effect on the renderer's clock;
  *   alert   an exclusive alert for 4 s, every 30 s;
- *   video   moving bars as a video layer, turned 5 degrees and narrowed.
+ *   video   moving bars as a video layer, turned 5 degrees and narrowed;
+ *   glow    render state and mipmaps (a service whose hello has
+ *           render_state and samplers): a mirrored, mipmapped tile pattern
+ *           the renderer shrinks and grows, three glows added over each
+ *           other at max, and a shadow subtracted, its alpha not written;
+ *   canvas  off-screen canvases (a service whose hello has canvas): plasma
+ *           drawn only inside a ring written to a canvas's stencil, shown
+ *           on screen; a lit cube drawn once in a canvas drawn once, shown
+ *           twice, one of them turned by the renderer.
  * Every animation runs in the renderer; the client sends only the text once
  * a second and the video's frames. Every layer, target, budget and refused
  * event is printed with its time.
@@ -17,7 +25,7 @@
  * On the unit (Node 8): copy this file and cluster_render_client.js into one
  * directory and run it as a user that may open the service's socket (group
  * tm_oap_app, or root); Ctrl-C ends it and its layers go with it.
- *   node showcase.js [--socket PATH] [all|cube|text|needle|plasma|alert|video]
+ *   node showcase.js [--socket PATH] [all|cube|text|needle|plasma|alert|video|glow|canvas]
  *                    [--target panel|map|hud|guide|widget|popup] [--size WxH]
  * The sizes are iDrive 7's targets' and iDrive 8's guide, widget and popup
  * canvases; --size gives another (iDrive 8: map 874x749, hud 353x203).
@@ -26,7 +34,7 @@
 
 const { ClusterRender, DEFAULT_PATH } = require('./cluster_render_client.js');
 
-const PAGES = ['cube', 'text', 'needle', 'plasma', 'alert', 'video'];
+const PAGES = ['cube', 'text', 'needle', 'plasma', 'alert', 'video', 'glow', 'canvas'];
 const SIZES = { panel: [1920, 720], map: [1088, 480], hud: [800, 480], guide: [702, 213], widget: [2240, 896], popup: [2240, 896] };
 
 const HIGHP = '#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n';
@@ -94,6 +102,45 @@ void main() {
     float pulse = 0.55 + 0.45 * sin(u_time * 9.0);
     vec3 inner = vec3(0.75, 0.0, 0.0) * pulse;
     gl_FragColor = vec4(mix(inner, mix(vec3(0.1), vec3(1.0, 0.8, 0.0), stripe), border), 1.0);
+}`;
+
+/* A ring: kept between two radii, discarded elsewhere (it writes the
+ * stencil where it is kept). */
+const RING_FS = `#version 100
+precision mediump float;
+varying vec2 v_uv;
+void main() {
+    float r = length((v_uv - 0.5) * vec2(2.0, 1.0));
+    if (r < 0.28 || r > 0.48) discard;
+    gl_FragColor = vec4(1.0);
+}`;
+
+/* A canvas sampled, as it was drawn. */
+const SAMPLE_FS = `#version 100
+precision mediump float;
+uniform sampler2D u_canvas;
+varying vec2 v_uv;
+void main() {
+    gl_FragColor = texture2D(u_canvas, v_uv);
+}`;
+
+/* The tile pattern four times across, mirrored at each edge. */
+const TILES_FS = `#version 100
+precision mediump float;
+uniform sampler2D u_tiles;
+varying vec2 v_uv;
+void main() {
+    gl_FragColor = texture2D(u_tiles, v_uv * 4.0);
+}`;
+
+/* A soft disc of colour u_color, premultiplied by its alpha. */
+const GLOW_FS = `#version 100
+precision mediump float;
+uniform vec4 u_color;
+varying vec2 v_uv;
+void main() {
+    float a = u_color.a * smoothstep(0.5, 0.0, length(v_uv - 0.5));
+    gl_FragColor = vec4(u_color.rgb * a, a);
 }`;
 
 /* Seven-segment glyphs, 16x32 each, in one 512x32 R8 atlas. */
@@ -170,6 +217,16 @@ function needle(w, l) {
     return paint(w, l, (x, y) => {
         const half = (w / 2) * (0.3 + 0.7 * Math.min(y / (l - w / 2), 1));
         return Math.abs(x - w / 2) < half ? [255, 90, 20, 255] : null;
+    });
+}
+
+/* A 128x128 tile: thin rings and spokes, fine enough to shimmer when drawn
+ * small without mipmaps. */
+function tiles() {
+    return paint(128, 128, (x, y) => {
+        const [r, a] = polar(x, y, 0);
+        const ring = Math.abs((r % 12) - 6) < 1.2, spoke = Math.abs((a + 360) % 15 - 7.5) < 1;
+        return ring ? [255, 200, 40, 255] : spoke ? [40, 160, 255, 255] : [10, 14, 24, 255];
     });
 }
 
@@ -301,6 +358,62 @@ function main() {
         };
         show();
         setInterval(show, 1000);
+    }
+
+    if (on('glow')) {
+        /* Trilinear and mirrored: the renderer shrinks it to a fifth and
+         * back, every level made by the service from the one picture. */
+        const t = Math.round(H * 0.5), tx = Math.round(W * 0.04), ty = Math.round(H * 0.1);
+        const pattern = name(cr.asset({ target: target, w: 128, h: 128, sampling: 'trilinear', wrap: 'mirror',
+            anisotropy: 4 }), 'tiles');
+        cr.pixels(pattern, null, tiles());
+        const tile = name(cr.effect({ target: target, x: tx, y: ty, w: t, h: t, fs: TILES_FS, blend: 'none' }), 'tile');
+        cr.bind(tile, 'u_tiles', pattern);
+        cr.animate(tile, { property: 'scale', keys: '0:1,1,1 4000:0.2,0.2,1 8000:1,1,1', loop: true });
+        /* Three glows over each other: each channel the brightest. */
+        const g = Math.round(H * 0.42), gx = Math.round(W * 0.6), gy = Math.round(H * 0.08);
+        [[1, 0.2, 0.1, 1, 0, 0], [0.1, 1, 0.3, 1, g * 0.45, 0], [0.2, 0.4, 1, 1, g * 0.22, g * 0.4]].forEach((c, k) => {
+            const glow = name(cr.effect({ target: target, klass: 'overlay', z: k, x: gx + c[4], y: gy + c[5], w: g, h: g,
+                fs: GLOW_FS, blend: 'max' }), 'glow');
+            cr.uniform(glow, 'u_color', c.slice(0, 4));
+        });
+        /* A shadow taken away from what is below, its alpha left as it is. */
+        const shadow = name(cr.effect({ target: target, klass: 'overlay', z: 5, x: Math.round(gx - g * 0.1),
+            y: Math.round(gy + g * 0.35), w: Math.round(g * 1.65), h: Math.round(g * 0.4), fs: GLOW_FS,
+            blend: 'subtract', color_mask: 'rgb' }), 'shadow');
+        cr.uniform(shadow, 'u_color', [0.6, 0.6, 0.6, 1]);
+    }
+
+    if (on('canvas')) {
+        /* A ring in the stencil, plasma only inside it: the canvas's own
+         * depth-stencil buffer, never the display's. */
+        const cw = 512, ch = 256, x0 = Math.round(W * 0.05), y0 = Math.round(H * 0.15);
+        const ring = name(cr.canvas({ target: target, w: cw, h: ch, depth: true, clear: [0.05, 0.07, 0.12, 1],
+            sampling: 'bilinear' }), 'ring canvas');
+        name(cr.effect({ target: target, canvas: ring, w: cw, h: ch, fs: RING_FS, color_mask: 'none',
+            stencil_func: 'always', stencil_ref: 1, stencil_pass: 'replace' }), 'ring mask');
+        name(cr.effect({ target: target, canvas: ring, z: 1, w: cw, h: ch, fs: PLASMA_FS, time: true,
+            stencil_func: 'equal', stencil_ref: 1 }), 'ring plasma');
+        /* a canvas's pixels are premultiplied: sampled as such */
+        const shown = name(cr.effect({ target: target, x: x0, y: y0, w: cw, h: ch, fs: SAMPLE_FS,
+            blend: 'premultiplied' }), 'ring');
+        cr.bind(shown, 'u_canvas', ring);
+        /* A cube drawn once, in a canvas drawn once, shown twice. */
+        const cs = 256, cx = Math.round(W * 0.45);
+        const still = name(cr.canvas({ target: target, w: cs, h: cs, depth: true, once: true, clear: [0, 0, 0, 0],
+            sampling: 'bilinear' }), 'cube canvas');
+        const box = name(cr.mesh({ target: target, canvas: still, w: cs, h: cs, fov: 30, cz: 7 }), 'cube in canvas');
+        cr.part(box, 1, { vs: LIT_VS, fs: LIT_FS, depth: true, cull: 'back' });
+        cr.geometry(box, 1, cube());
+        cr.uniform(box, 'u_color', [0.2, 0.7, 1, 1], { part: 1 });
+        cr.transform(box, 1, { rx: 25, ry: 35 });
+        const a = name(cr.effect({ target: target, x: cx, y: y0, w: cs, h: cs, fs: SAMPLE_FS,
+            blend: 'premultiplied' }), 'cube copy');
+        const b = name(cr.effect({ target: target, x: cx + cs + 40, y: y0, w: cs, h: cs, fs: SAMPLE_FS,
+            blend: 'premultiplied' }), 'cube turned');
+        cr.bind(a, 'u_canvas', still);
+        cr.bind(b, 'u_canvas', still);
+        cr.animate(b, { property: 'rotate', keys: '0:0 6000:360', loop: true });
     }
 
     if (on('alert')) {

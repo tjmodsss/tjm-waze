@@ -13,6 +13,7 @@ ROOTFS=$(cd "$1" && pwd)
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
+trap 'exit 1' INT TERM HUP
 docker run --rm --platform linux/amd64 --network none -v "$ROOTFS:/rootfs:ro" -v "$HERE:/src:ro" -v "$W:/out" \
     node:8.16.2-stretch sh -c 'cp /usr/local/bin/node /out/node && cp /rootfs/usr/lib/libdlt.so.2.15.0 /out/libdlt.so && \
         gcc /src/client.c -o /out/client -L/out -ldlt -Wl,--allow-shlib-undefined'

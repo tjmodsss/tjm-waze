@@ -22,6 +22,11 @@
  * E_DCSM_OK reply or FETCHING came is accepted until FETCHED: one that
  * stays so 5 s is a stall. Dcsm2 coming back: no fetch until the stock
  * HMI's content is mapped (our own id not counting), then one at once.
+ * Preload: a load is a fetch alone, FETCHED loads the target and maps
+ * nothing; wanted, it is a map alone; the linger over, or parked with
+ * nothing wanting it, an unmap alone, whose map statuses are no loss; a
+ * loaded fetch the KOMBI removes is released and fetched again on the
+ * ladder; with no preload layer, the usual unmap and unfetch.
  *
  * The field-log diagnostics: an undecoded notification is logged with its
  * start in hex at most every 10 s per event id, with the number not logged
@@ -770,6 +775,78 @@ static void stalled_fetch()
     ok("boot hold: the HMI's content mapped: fetched at once", calls_are("fetch 0x10004f0"));
 }
 
+/* Preload: the panel's scene fetched alone, mapped and unmapped with its
+ * fetch kept. */
+static void preload()
+{
+    Rig r;
+    const std::string map = "map " + hex(kPanel) + " class 3 slot 0x203";
+    r.m.want(1, false, false, true, true, true);
+    r.tick();
+    ok("preload: a load is a fetch alone", calls_are("fetch " + hex(kPanel)) &&
+                                           r.m.status(1).state == TargetState::Loading);
+    r.port.on_reply(dcsm::kReqFetchContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", r.now);
+    r.port.on_fetch_status(kPanel, dcsm::E_FETCH_STATUS_FETCHING, r.now);
+    r.port.on_fetch_status(kPanel, dcsm::E_FETCH_STATUS_FETCHED, r.now);
+    ok("preload: FETCHED: no map, the target loaded", calls_are("") && r.m.status(1).state == TargetState::Loaded);
+    for (int k = 0; k < 1000; k++) r.tick();
+    ok("preload: loaded 10 s: nothing sent", calls_are("") && r.m.status(1).state == TargetState::Loaded);
+    r.m.want(1, true, false, true, true, true);
+    r.tick();
+    ok("preload: wanted: a map alone, no fetch", calls_are(map));
+    r.port.on_reply(dcsm::kReqMapContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", r.now);
+    r.port.on_map_status(kPanel, 0, dcsm::E_MAP_STATUS_MAPPED_FOREGROUND, r.now);
+    ok("preload: shown", r.m.status(1).state == TargetState::Shown);
+    r.m.want(1, false, false, true, true, true);
+    for (int k = 0; k < 210; k++) r.tick();
+    ok("preload: its linger over: an unmap alone, no unfetch", calls_are("unmap " + hex(kPanel)) &&
+                                                                r.m.status(1).state == TargetState::Loaded);
+    r.port.on_reply(dcsm::kReqUnmapContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", r.now);
+    r.port.on_map_status(kPanel, dcsm::E_MAP_STATUS_MAPPED_FOREGROUND, dcsm::E_MAP_STATUS_UNMAPPED, r.now);
+    for (int k = 0; k < 10; k++) r.tick();
+    ok("preload: the unmap's map status is no loss", calls_are("") && r.m.status(1).state == TargetState::Loaded &&
+                                                     r.evidence.empty());
+    r.m.want(1, true, false, true, true, true);
+    r.tick();
+    ok("preload: wanted again: a map alone", calls_are(map));
+    r.port.on_reply(dcsm::kReqMapContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", r.now);
+    r.port.on_map_status(kPanel, 0, dcsm::E_MAP_STATUS_MAPPED_FOREGROUND, r.now);
+    r.m.want(1, false, false);
+    for (int k = 0; k < 210; k++) r.tick();
+    ok("preload: no preload layer left: released after its linger, unmap then unfetch",
+       calls_are("unmap " + hex(kPanel) + "; unfetch " + hex(kPanel)) && r.m.status(1).state == TargetState::Idle);
+
+    Rig d;   /* the KOMBI removes the loaded fetch */
+    d.m.want(1, false, false, true, true, true);
+    d.tick();
+    d.port.on_reply(dcsm::kReqFetchContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", d.now);
+    d.port.on_fetch_status(kPanel, dcsm::E_FETCH_STATUS_FETCHED, d.now);
+    calls.clear();
+    d.port.on_fetch_status(kPanel, dcsm::E_FETCH_STATUS_REMOVED, d.now);
+    ok("preload: a loaded fetch removed: released (an unfetch alone), waiting on the ladder",
+       calls_are("unfetch " + hex(kPanel)) && d.m.status(1).state == TargetState::Waiting && d.evidence.empty());
+    d.port.on_reply(dcsm::kReqUnfetchContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", d.now);
+    for (int k = 0; k < 195; k++) d.tick();
+    ok("preload: nothing before the 2 s step", calls_are(""));
+    for (int k = 0; k < 10; k++) d.tick();
+    ok("preload: fetched again at 2 s", calls_are("fetch " + hex(kPanel)));
+
+    Rig u;   /* an unmap while the map is outstanding */
+    u.m.want(1, true, false, true, true, true);
+    u.tick();
+    u.port.on_reply(dcsm::kReqFetchContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", u.now);
+    u.port.on_fetch_status(kPanel, dcsm::E_FETCH_STATUS_FETCHED, u.now);
+    u.port.on_reply(dcsm::kReqMapContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", u.now);
+    u.port.on_map_status(kPanel, 0, dcsm::E_MAP_STATUS_MAPPED_INVISIBLE, u.now);
+    calls.clear();
+    u.m.want(1, false, false, true, true, true);
+    u.tick();
+    ok("preload: parked and not wanted: an unmap alone", calls_are("unmap " + hex(kPanel)) &&
+                                                          u.m.status(1).state == TargetState::Loaded);
+    u.port.on_map_status(kPanel, dcsm::E_MAP_STATUS_MAPPED_INVISIBLE, dcsm::E_MAP_STATUS_MAPPED_FOREGROUND, u.now);
+    ok("preload: a showing after the unmap is ignored", u.m.status(1).state == TargetState::Loaded && calls_are(""));
+}
+
 int main()
 {
     basics();
@@ -781,6 +858,7 @@ int main()
     map_again();
     kept_through_lock();
     stalled_fetch();
+    preload();
     std::printf(failures ? "%d FAILED\n" : "all ok\n", failures);
     return failures ? 1 : 0;
 }

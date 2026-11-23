@@ -13,8 +13,8 @@
 'use strict';
 var assert = require('assert');
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 var w = require('../wifi_band.js');
 
 var HDR = 'Inter-|   Receive                                                |  Transmit\n' +
@@ -118,7 +118,7 @@ function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 /* A sampler over fake files: files[path] = text. */
 function sampler(files, run, extra) {
     var t = { now: 1000000, logs: [], changes: 0 };
-    var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-wifi-'));
+    var dir = tmp.dir();
     t.file = path.join(dir, 'wifi-band.json');
     t.s = new w.Sampler(Object.assign({
         log: function (l) { t.logs.push(l); }, onChange: function () { t.changes++; }, file: t.file, busctl: run,
@@ -127,7 +127,26 @@ function sampler(files, run, extra) {
         pollMs: 15000, windowMs: 1, resampleMs: 120000, now: function () { return t.now; }
     }, extra || {}));
     t.state = function () { return JSON.parse(fs.readFileSync(t.file, 'utf8')); };
+    t.samples = 0;
+    t.waited = 0;
+    var take = t.s.sample;
+    t.s.sample = function () { t.samples++; return take.apply(this, arguments); };
     return t;
+}
+
+/* Resolves once a sample newer than the last one waited for is done: taken,
+ * and its frequency read, when it makes one, answered. The fake busctl
+ * answers each call on its own turn of the event loop, so how long a read
+ * takes depends on the machine's load. */
+function sampled(t) {
+    return new Promise(function (resolve, reject) {
+        var end = Date.now() + 5000;
+        (function check() {
+            if (t.samples > t.waited && !t.s.reading) { t.waited = t.samples; resolve(); }
+            else if (Date.now() > end) reject(new Error('no sample done within 5 s'));
+            else setTimeout(check, 1);
+        })();
+    });
 }
 
 /* The phone on iface, receiving rx bytes/s, after secs seconds. */
@@ -163,7 +182,7 @@ async function main() {
     t.s.tick();
     await sleep(10);
     assert.strictEqual(t.s.current(), null);
-    assert.deepStrictEqual([t.logs, run.calls, t.changes], [[], [], 0]);
+    assert.deepStrictEqual([t.logs, run.calls, t.changes, t.samples], [[], [], 0, 0]);
     assert.deepStrictEqual(t.state(), { at: t.state().at, carplay: false, band: null, iface: null, freq: null, rate: null,
         reason: 'no CarPlay session', rates: {} });
     console.log('ok   no CarPlay: band unknown, no D-Bus call, nothing logged, the state file says why');
@@ -176,7 +195,7 @@ async function main() {
     t.s.tick();
     t.now += 5000;
     traffic(files, ['p2p-wlan0-0', 'p2p-wlan0-1'], 'p2p-wlan0-1', 1200 * 1024, 5);
-    await sleep(20);
+    await sampled(t);
     assert.deepStrictEqual(t.s.current(), { band: '2.4', iface: 'p2p-wlan0-1', freq: 2462 });
     assert.deepStrictEqual(t.logs, ['CarPlay Wi-Fi: 2.4 GHz (p2p-wlan0-1, 2462 MHz, 1201 KB/s)']);
     assert.strictEqual(t.changes, 1);
@@ -193,7 +212,7 @@ async function main() {
     t.now += 120000;
     traffic(files, ['p2p-wlan0-0', 'p2p-wlan0-1'], 'p2p-wlan0-1', 900 * 1024, 140);
     t.s.tick();
-    await sleep(10);
+    await sampled(t);
     assert(run.calls.length > n, 'resampled after RESAMPLE_MS');
     assert.deepStrictEqual([t.logs.length, t.changes], [1, 1]);
 
@@ -202,7 +221,7 @@ async function main() {
     t.now += 120000;
     files['/proc/net/dev'] = dev({ 'p2p-wlan0-0': [10 * 260, 600 * 260], 'p2p-wlan0-1': [900 * 1024 * 140 + 200 * 120, 600 * 260] });
     t.s.tick();
-    await sleep(10);
+    await sampled(t);
     assert.deepStrictEqual(t.s.current(), { band: '2.4', iface: 'p2p-wlan0-1', freq: 2462 });
     assert.deepStrictEqual([t.s.reason, t.logs.length, t.changes], [null, 1, 1]);
     console.log('ok   resampled every 2 minutes; the same band logs nothing more; a still screen keeps the band known');
@@ -211,7 +230,7 @@ async function main() {
     t.now += 120000;
     files['/proc/net/dev'] = dev({ 'p2p-wlan0-0': [9e8, 9e7], 'p2p-wlan0-1': [900 * 1024 * 140, 600 * 140] });
     t.s.tick();
-    await sleep(10);
+    await sampled(t);
     assert.deepStrictEqual(t.s.current(), { band: '5', iface: 'p2p-wlan0-0', freq: 5785 });
     assert.strictEqual(t.logs[1].indexOf('CarPlay Wi-Fi: 5 GHz (p2p-wlan0-0, 5785 MHz, '), 0, t.logs[1]);
     assert.strictEqual(t.changes, 2);
@@ -219,13 +238,13 @@ async function main() {
     /* The phone gone from Wi-Fi while carplay holds a connection: unknown. */
     t.now += 120000;
     t.s.tick();
-    await sleep(10);
+    await sampled(t);
     assert.strictEqual(t.s.current(), null);
     assert.deepStrictEqual([t.logs[2], t.changes], ['CarPlay Wi-Fi: unknown (no CarPlay traffic over Wi-Fi)', 3]);
     files['/proc/net/dev'] = dev({ 'p2p-wlan0-0': [9e8 + 9e7, 9e7], 'p2p-wlan0-1': [900 * 1024 * 140, 600 * 140] });
     t.now += 120000;
     t.s.tick();
-    await sleep(10);
+    await sampled(t);
     assert.deepStrictEqual(t.s.current(), { band: '5', iface: 'p2p-wlan0-0', freq: 5785 });
 
     /* CarPlay ends. */
@@ -244,7 +263,7 @@ async function main() {
     t.s.tick();
     t.now += 5000;
     traffic(files, ['p2p-wlan0-0', 'p2p-wlan0-1'], null, 0, 5);
-    await sleep(10);
+    await sampled(t);
     assert.deepStrictEqual([t.s.current(), t.logs, run.calls, t.changes, t.state().reason],
         [null, [], [], 0, 'no CarPlay traffic over Wi-Fi']);
     console.log('ok   CarPlay over USB: band unknown, no D-Bus call, nothing logged');
@@ -260,7 +279,7 @@ async function main() {
     t.s.tick();
     t.now += 5000;
     traffic(files, ['p2p-wfd0-0', 'p2p-wfd0-1'], 'p2p-wfd0-1', 300 * 1024, 5);
-    await sleep(10);
+    await sampled(t);
     assert.deepStrictEqual(t.s.current(), { band: '5', iface: 'p2p-wfd0-1', freq: 5180 });
     assert.deepStrictEqual(t.logs, ['CarPlay Wi-Fi: 5 GHz (p2p-wfd0-1, 5180 MHz, 301 KB/s)']);
     console.log('ok   NXP\'s p2p-wfd0-N: the band from its group\'s frequency');
@@ -274,7 +293,7 @@ async function main() {
     t.s.tick();
     t.now += 5000;
     traffic(files, ['p2p-wlan0-0', 'p2p-wlan0-1'], 'p2p-wlan0-0', 500 * 1024, 5);
-    await sleep(10);
+    await sampled(t);
     assert.deepStrictEqual(t.s.current(), { band: '2.4', iface: 'p2p-wlan0-0', freq: 2412 });
     console.log('ok   p2p-wlan0-0 on 2.4 GHz: the band from the frequency, never the interface\'s order');
 
@@ -285,11 +304,11 @@ async function main() {
     t.s.tick();
     t.now += 5000;
     traffic(files, ['p2p-wlan0-0', 'p2p-wlan0-1'], 'p2p-wlan0-1', 500 * 1024, 5);
-    await sleep(10);
+    await sampled(t);
     t.now += 120000;
     traffic(files, ['p2p-wlan0-0', 'p2p-wlan0-1'], 'p2p-wlan0-1', 500 * 1024, 125);
     t.s.tick();
-    await sleep(10);
+    await sampled(t);
     assert.strictEqual(t.s.current(), null);
     assert.strictEqual(t.logs.length, 1, t.logs.join('\n'));
     assert(/^CarPlay Wi-Fi: unknown \(p2p-wlan0-1: frequency unreadable: Interfaces of \/fi\/w1\/wpa_supplicant1 unreadable/.test(t.logs[0]), t.logs[0]);
@@ -303,7 +322,7 @@ async function main() {
     t.s.tick();
     t.now += 5000;
     traffic(files, ['p2p-wlan0-0'], 'p2p-wlan0-0', 500 * 1024, 5);
-    await sleep(10);
+    await sampled(t);
     assert.strictEqual(t.s.current(), null);
     assert.deepStrictEqual(t.logs, ['CarPlay Wi-Fi: unknown (p2p-wlan0-0: frequency 5955 MHz in no band)']);
     console.log('ok   a frequency that cannot be read, or in no band: unknown, logged once');
@@ -317,7 +336,7 @@ async function main() {
     files['/proc/net/tcp6'] = TCP6_HDR;
     t.s.tick();
     await sleep(60);
-    assert.deepStrictEqual([run.calls, t.logs, t.s.current()], [[], [], null]);
+    assert.deepStrictEqual([run.calls, t.logs, t.s.current(), t.samples], [[], [], null, 0]);
     console.log('ok   CarPlay gone before the first sample: no sample');
 }
 

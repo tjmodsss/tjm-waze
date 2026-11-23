@@ -67,8 +67,88 @@ inline size_t tex_bytes(TexFormat f, uint32_t w, uint32_t h)
         return (size_t)(w / 4) * (h / 4) * (f == TexFormat::ETC2RGB ? 8 : 16);
     return (size_t)w * h * (f == TexFormat::R8 ? 1 : 4);
 }
-enum class Sampling { Nearest, Bilinear };
-enum class Wrap { Clamp, Repeat };
+/* How a texture is sampled: nearest or bilinear within its picture, or from
+ * its mip levels (Mips: the nearest level; Trilinear: between two), or
+ * linear one way and nearest the other (minified, magnified). */
+enum class Sampling {
+    Nearest,
+    Bilinear,
+    NearestMips,
+    BilinearMips,
+    Trilinear,
+    MinLinearMagNearest,
+    MinNearestMagLinear
+};
+inline bool sampling_mips(Sampling s)
+{
+    return s == Sampling::NearestMips || s == Sampling::BilinearMips || s == Sampling::Trilinear;
+}
+enum class Wrap { Clamp, Repeat, Mirror };
+/* A texture's sampler: its sampling, its wrap along u and v, and its
+ * anisotropy (1: isotropic; up to 16, as far as the display's GPU goes). */
+struct Sampler {
+    Sampling sampling = Sampling::Nearest;
+    Wrap u = Wrap::Clamp, v = Wrap::Clamp;
+    uint32_t anisotropy = 1;
+};
+inline bool operator==(const Sampler &a, const Sampler &b)
+{
+    return a.sampling == b.sampling && a.u == b.u && a.v == b.v && a.anisotropy == b.anisotropy;
+}
+/* What buffer(f, w, h, Sampling, Wrap) takes: nearest or bilinear, one wrap
+ * for both axes, isotropic. */
+inline bool sampler_plain(const Sampler &s)
+{
+    return (s.sampling == Sampling::Nearest || s.sampling == Sampling::Bilinear) && s.u == s.v &&
+           s.u != Wrap::Mirror && s.anisotropy == 1;
+}
+
+/* Mip levels: level l of a w x h texture is max(1, w >> l) x max(1, h >> l),
+ * down to 1x1 (mip_levels() of them in all). A compressed texture's go down
+ * to the last level whose sides are both multiples of 4 (mip_levels(f, w,
+ * h)): RAMSES 27 warns that a smaller ETC2 level may fail to upload
+ * (VERIFIED, make test-ramses27). A shorter chain samples whole because the
+ * renderers allocate a texture with exactly the levels given, as immutable
+ * GLES 3 storage, whose levels past those given do not count:
+ * - RAMSES 27.0.116 (its source): Device_GL::allocateTexture2D takes
+ *   glTexStorage2D(target, mipLevelCount, ...), compressed levels go by
+ *   glCompressedTexSubImage2D; glTexImage2D only for stream textures, and
+ *   GL_TEXTURE_MAX_LEVEL is never set.
+ * - The head unit's RAMSES 19 (its binary, ../abi/ABI.md): the same calls
+ *   (four glTexStorage2D sites, compressed uploads only by
+ *   glCompressedTexSubImage2D, one glTexImage2D at level 0, no 0x813D), and
+ *   a 64x32 etc2rgba chain stopping at 8x4, sampled trilinear, drawn by its
+ *   renderer with each level's colour at its size (VERIFIED by running).
+ * The KOMBI's own renderer build is not checked (only a car can). */
+inline uint32_t mip_levels(uint32_t w, uint32_t h)
+{
+    uint32_t n = 1;
+    for (uint32_t d = w > h ? w : h; d > 1; d >>= 1)
+        n++;
+    return n;
+}
+inline uint32_t mip_levels(TexFormat f, uint32_t w, uint32_t h)
+{
+    if (!tex_compressed(f))
+        return mip_levels(w, h);
+    uint32_t n = 1;
+    while (n < 32 && (w >> n) && (h >> n) && (w >> n) % 4 == 0 && (h >> n) % 4 == 0)
+        n++;
+    return n;
+}
+inline uint32_t mip_size(uint32_t d, uint32_t level) { return d >> level ? d >> level : 1; }
+inline size_t tex_level_bytes(TexFormat f, uint32_t w, uint32_t h, uint32_t level)
+{
+    return tex_bytes(f, mip_size(w, level), mip_size(h, level));
+}
+/* Bytes of levels 0 to levels - 1, one after another. */
+inline size_t tex_chain_bytes(TexFormat f, uint32_t w, uint32_t h, uint32_t levels)
+{
+    size_t n = 0;
+    for (uint32_t l = 0; l < levels; l++)
+        n += tex_level_bytes(f, w, h, l);
+    return n;
+}
 
 enum class UniformType { Float, Vec2, Vec3, Vec4, Mat4 };
 /* Floats in one element of t (a mat4 is 16, in GLSL's column order). */
@@ -109,14 +189,102 @@ struct Pose {
 };
 
 enum class Cull { None, Back, Front };
-enum class Blend { Alpha, Add, None };
-/* How a part is drawn: depth tested (less or equal) and written, which faces
- * are culled, and how it blends over what is below. */
+/* Blending presets: Alpha, source alpha over what is below; Add, added at
+ * source alpha; None, replaced; Premultiplied, a colour already multiplied
+ * by its alpha over what is below; Max and Min, the larger or smaller of
+ * each channel; Subtract, taken away at source alpha. */
+enum class Blend { Alpha, Add, None, Premultiplied, Max, Min, Subtract };
+/* The blend factors and operations every display takes (RAMSES 19 has no
+ * colour or constant factors). */
+enum class BlendFactor { Zero, One, SrcAlpha, OneMinusSrcAlpha, DstAlpha, OneMinusDstAlpha };
+enum class BlendOp { Add, Subtract, ReverseSubtract, Min, Max };
+/* colour = op(src * colour_src, dst * colour_dst), and alpha the same with
+ * the alpha factors and op; off: written over what is below. */
+struct BlendState {
+    bool on = true;
+    BlendFactor src = BlendFactor::SrcAlpha, dst = BlendFactor::OneMinusSrcAlpha;
+    BlendFactor src_alpha = BlendFactor::One, dst_alpha = BlendFactor::OneMinusSrcAlpha;
+    BlendOp op = BlendOp::Add, op_alpha = BlendOp::Add;
+};
+inline bool operator==(const BlendState &a, const BlendState &b)
+{
+    return a.on == b.on && (!a.on || (a.src == b.src && a.dst == b.dst && a.src_alpha == b.src_alpha &&
+                                      a.dst_alpha == b.dst_alpha && a.op == b.op && a.op_alpha == b.op_alpha));
+}
+inline BlendState blend_state(Blend b)
+{
+    BlendState s;
+    switch (b) {
+    case Blend::Add: s.dst = BlendFactor::One; break;
+    case Blend::None: s.on = false; break;
+    case Blend::Premultiplied: s.src = BlendFactor::One; break;
+    case Blend::Max:
+    case Blend::Min:
+        s.src = s.dst = s.src_alpha = s.dst_alpha = BlendFactor::One;
+        s.op = s.op_alpha = b == Blend::Max ? BlendOp::Max : BlendOp::Min;
+        break;
+    case Blend::Subtract:
+        s.dst = BlendFactor::One;
+        s.op = BlendOp::ReverseSubtract;
+        break;
+    default: break;
+    }
+    return s;
+}
+/* Depth tests; Off: neither tested nor written. */
+enum class DepthFunc { Off, Less, LessEqual, Equal, NotEqual, Greater, GreaterEqual, Always, Never };
+/* Stencil tests and operations; a part or quad tests the stencil only in
+ * a canvas with a depth-stencil buffer (its own, never the display's). */
+enum class StencilFunc { Off, Never, Always, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual };
+enum class StencilOp { Keep, Zero, Replace, Increment, IncrementWrap, Decrement, DecrementWrap, Invert };
+struct StencilState {
+    StencilFunc func = StencilFunc::Off;
+    uint8_t ref = 0, mask = 0xff;
+    StencilOp fail = StencilOp::Keep, depth_fail = StencilOp::Keep, pass = StencilOp::Keep;
+};
+/* Every field, also while off: fields set while the stencil is off are kept
+ * for when stencil_func turns it on. */
+inline bool operator==(const StencilState &a, const StencilState &b)
+{
+    return a.func == b.func && a.ref == b.ref && a.mask == b.mask && a.fail == b.fail &&
+           a.depth_fail == b.depth_fail && a.pass == b.pass;
+}
+/* Colour channels written, as bits. */
+const uint8_t kMaskR = 1, kMaskG = 2, kMaskB = 4, kMaskA = 8, kMaskRGBA = 15;
+/* How a part (or a quad, with style()) is drawn: depth tested with
+ * depth_func and written when depth_write (depth false: neither), which
+ * faces are culled, how it blends over what is below (the blend preset, or
+ * custom when has_custom), and the colour channels it writes. */
 struct PartLook {
     bool depth = true;
+    DepthFunc depth_func = DepthFunc::LessEqual;
+    bool depth_write = true;
     Cull cull = Cull::Back;
     Blend blend = Blend::Alpha;
+    bool has_custom = false;
+    BlendState custom;
+    uint8_t color_mask = kMaskRGBA;
+    StencilState stencil;
+
+    BlendState blending() const { return has_custom ? custom : blend_state(blend); }
+    DepthFunc depth_test() const { return depth ? depth_func : DepthFunc::Off; }
+    bool depth_writes() const { return depth && depth_write; }
 };
+inline bool operator==(const PartLook &a, const PartLook &b)
+{
+    return a.depth_test() == b.depth_test() && a.depth_writes() == b.depth_writes() && a.cull == b.cull &&
+           a.blending() == b.blending() && a.color_mask == b.color_mask && a.stencil == b.stencil;
+}
+inline bool operator!=(const PartLook &a, const PartLook &b) { return !(a == b); }
+/* A quad's look unless styled: blended at source alpha, no depth, no
+ * culling, every channel. */
+inline PartLook quad_look()
+{
+    PartLook l;
+    l.depth = false;
+    l.cull = Cull::None;
+    return l;
+}
 
 /* Vertex attributes, as bits of a mask: what a part's geometry carries and
  * what its vertex shader reads (a_position, a_normal, a_texcoord, a_color). */
@@ -144,6 +312,38 @@ struct Animation {
     std::vector<float> v;
 };
 
+/* An off-screen canvas (Graph::canvas): w x h RGBA8 the scene's own passes
+ * draw into before the target's, with a depth-stencil buffer when depth,
+ * cleared to clear (RGBA) at the start of each frame it is drawn, and
+ * sampled through sampler (no mipmaps). once: drawn once, and again only
+ * on redraw(). */
+struct CanvasSpec {
+    uint32_t w = 0, h = 0;
+    bool depth = false;
+    float clear[4] = {0, 0, 0, 0};
+    Sampler sampler;
+    bool once = false;
+};
+
+/* Canvases' render orders (Graph::canvas): a block of kCanvasSpan each,
+ * from kCanvasBase up, kCanvasSlots blocks, below every render order of a
+ * target's own passes (a scene file's layers_order is at least
+ * kLowestLayersOrder). */
+const int32_t kCanvasBase = -1000000000, kCanvasSpan = 4096, kCanvasSlots = 64;
+const int32_t kLowestLayersOrder = kCanvasBase + kCanvasSlots * kCanvasSpan;
+
+/* A canvas as the library holds it (Graph::read_canvas, for tests): its
+ * buffers' formats, types and access modes as the library's enums give
+ * them (-1: no such buffer), whether its copy pass writes alpha unblended,
+ * and the render order of its first pass and its copy pass. */
+struct CanvasReadback {
+    int color_format = -1, color_type = -1, color_access = -1;
+    int shown_format = -1, shown_type = -1, shown_access = -1;
+    int depth_format = -1, depth_type = -1, depth_access = -1;
+    bool copy_writes_alpha = false, copy_blends = true, enabled = false;
+    int32_t first_order = 0, copy_order = 0;
+};
+
 /* One target's scene. */
 class Graph {
 public:
@@ -153,16 +353,36 @@ public:
     /* Likewise, with the sampler's wrap. */
     virtual int buffer(TexFormat f, uint32_t w, uint32_t h, Sampling s, Wrap wrap) = 0;
     virtual bool write(int buf, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *px) = 0;
-    /* An immutable texture of n bytes (one mip level) and its sampler,
-     * handled as a buffer (texture(), drop_buffer()) but never written.
-     * Only a compressed format, only where the backend takes it: 0 otherwise. */
-    virtual int immutable_texture(TexFormat, uint32_t, uint32_t, Sampling, Wrap, const uint8_t *, size_t) { return 0; }
+    /* A persistent texture buffer of levels mip levels (1 to
+     * mip_levels(w, h)) and its sampler s. write() writes level 0,
+     * write_level() any. 0 where the backend has no such sampler. */
+    virtual int buffer(TexFormat f, uint32_t w, uint32_t h, const Sampler &s, uint32_t levels)
+    {
+        return levels == 1 && sampler_plain(s) ? buffer(f, w, h, s.sampling, s.u) : 0;
+    }
+    virtual bool write_level(int buf, uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             const uint8_t *px)
+    {
+        return level == 0 && write(buf, x, y, w, h, px);
+    }
+    /* An immutable texture of levels mip levels, data their n bytes one
+     * level after another (tex_chain_bytes), and its sampler, handled as a
+     * buffer (texture(), drop_buffer()) but never written. Only a compressed
+     * format, only where the backend takes it: 0 otherwise. */
+    virtual int immutable_texture(TexFormat, uint32_t, uint32_t, const Sampler &, uint32_t, const uint8_t *, size_t)
+    {
+        return 0;
+    }
     /* A quad over r drawn by effect, hidden until show(). Blended over what
      * is below (source alpha), no depth test. */
     virtual int quad(int effect, const Rect &r) = 0;
     virtual bool place(int quad, const Rect &r) = 0;
     /* Turns and scales the quad within its rect's place. */
     virtual bool turn(int quad, const Turn &t) = 0;
+    /* Draws the quad with look's blending and colour mask (its depth and
+     * culling are not used: a quad tests no depth and culls nothing). False
+     * where the backend has no such state. */
+    virtual bool style(int, const PartLook &) { return false; }
     /* texture(), uniform() and uniform_array() take a quad or a part. */
     virtual bool texture(int quad, const char *uniform, int buf) = 0;
     /* A float, vec2, vec3 or vec4 uniform (n 1-4). */
@@ -208,6 +428,27 @@ public:
 
     /* Sends everything changed since the last flush as one update, tagged. */
     virtual bool flush(uint64_t tag) = 0;
+
+    /* A canvas: its handle is a buffer handle too (texture(), not
+     * drop_buffer()). 0 where the backend has none. Quads and views drawn
+     * into it come from quad_in() and view_in(), and are ordered among
+     * themselves (order()) in passes of the canvas's own, its first clearing
+     * it; a canvas's passes go before the target's and before a canvas made
+     * later. Canvas 0 is the target itself. drop_canvas() takes a canvas
+     * whose quads and views are dropped. */
+    virtual int canvas(const CanvasSpec &) { return 0; }
+    virtual void drop_canvas(int) {}
+    virtual bool redraw(int) { return false; }
+    /* A canvas not drawn once: drawn each frame while enabled (as it is
+     * made), not drawn at all while not, keeping its last picture. */
+    virtual bool enable_canvas(int, bool) { return false; }
+    /* What the library holds for the canvas; false where it cannot say. */
+    virtual bool read_canvas(int, CanvasReadback *) const { return false; }
+    virtual int quad_in(int canvas, int effect, const Rect &r) { return canvas ? 0 : quad(effect, r); }
+    virtual int view_in(int canvas, const Rect &r, const Projection &p, const Pose &camera)
+    {
+        return canvas ? 0 : view(r, p, camera);
+    }
 };
 
 /* A target's scene loaded from a scene file (Gpu::load): drawn as the file

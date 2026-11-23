@@ -2,6 +2,7 @@
  * Copyright (C) 2026 Robert Nisipeanu */
 #include "asset.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -11,12 +12,20 @@
 namespace crs {
 
 Asset::Asset(uint32_t id, int target, crk::UploadPacer &pacer, const AssetParams &p)
-    : id_(id), target_(target), pacer_(pacer), p_(p), px_(tex_bytes(p.format, p.w, p.h), 0)
+    : id_(id), target_(target), pacer_(pacer), p_(p),
+      px_(tex_compressed(p.format) ? tex_chain_bytes(p.format, p.w, p.h, p.levels()) : tex_bytes(p.format, p.w, p.h), 0)
 {
+    if (!compressed())
+        for (uint32_t l = 1; l < p_.levels(); l++) {
+            mips_.push_back(std::vector<uint8_t>(tex_level_bytes(p_.format, p_.w, p_.h, l), 0));
+            mip_dirty_.push_back({});
+        }
 }
 
-const char *Asset::size_error(TexFormat f, uint32_t w, uint32_t h)
+const char *Asset::size_error(const AssetParams &p)
 {
+    const TexFormat f = p.format;
+    const uint32_t w = p.w, h = p.h;
     if (w < 1 || h < 1)
         return "an asset is at least 1x1";
     if (w > 2048 || h > 2048)
@@ -26,6 +35,10 @@ const char *Asset::size_error(TexFormat f, uint32_t w, uint32_t h)
                                        : "an etc2rgba asset's w and h are multiples of 4";
     if (tex_bytes(f, w, h) + 64 > cr::kMaxMessage)
         return "an asset's pixels must fit one frame message (5,529,600 bytes)";
+    if (tex_compressed(f) && tex_chain_bytes(f, w, h, p.levels()) + 64 > cr::kMaxMessage)
+        return "an asset's pixels and mip levels must fit one frame message (5,529,600 bytes)";
+    if (p.sampler.anisotropy < 1 || p.sampler.anisotropy > 16)
+        return "anisotropy is 1 to 16";
     return nullptr;
 }
 
@@ -49,6 +62,8 @@ bool Asset::update(const std::vector<crk::PixelRect> &rects, const uint8_t *data
         whole_ = true;
         dirty_.clear();
         have_ = true;
+        mips_stale_all_ = p_.levels() > 1;
+        mips_stale_.clear();
         return true;
     }
     size_t need = 0;
@@ -77,7 +92,99 @@ bool Asset::update(const std::vector<crk::PixelRect> &rects, const uint8_t *data
         }
     }
     have_ = true;
+    if (p_.levels() > 1 && !mips_stale_all_) {
+        if (mips_stale_.size() + rects.size() > kMaxRects) {
+            mips_stale_all_ = true;
+            mips_stale_.clear();
+        } else {
+            mips_stale_.insert(mips_stale_.end(), rects.begin(), rects.end());
+        }
+    }
     return true;
+}
+
+namespace {
+
+/* Level l's pixels under level l - 1's rect r: half its size, rounded
+ * out, within the level. */
+crk::PixelRect halved(const crk::PixelRect &r, uint32_t lw, uint32_t lh)
+{
+    crk::PixelRect o;
+    o.x = std::min(r.x / 2, lw - 1);
+    o.y = std::min(r.y / 2, lh - 1);
+    o.w = std::min((r.x + r.w - 1) / 2, lw - 1) - o.x + 1;
+    o.h = std::min((r.y + r.h - 1) / 2, lh - 1) - o.y + 1;
+    return o;
+}
+
+/* (n + a / 2) / a for the alpha sums a of four pixels (1-1020) and
+ * n < 2^19: n times ceil(2^32 / a), the top 32 bits. Exact: the product's
+ * error, under n / 2^32 < 2^-13, is less than the 1 / a a quotient's
+ * fraction is from the next whole number. */
+struct Reciprocals {
+    uint64_t r[1021];
+    Reciprocals()
+    {
+        r[0] = 0;
+        for (uint32_t a = 1; a < 1021; a++)
+            r[a] = ((1ull << 32) + a - 1) / a;
+    }
+};
+const Reciprocals kRecip;
+inline uint8_t divide(uint32_t n, uint32_t a) { return (uint8_t)(((uint64_t)n * kRecip.r[a]) >> 32); }
+
+/* dst's rect r (dw wide) from src (sw x sh): each pixel the mean of the
+ * 2x2 above it, clamped to src. RGBA weights colour by alpha. */
+void reduce(const uint8_t *src, uint32_t sw, uint32_t sh, uint8_t *dst, uint32_t dw, uint32_t bpp,
+            const crk::PixelRect &r)
+{
+    for (uint32_t y = r.y; y < r.y + r.h; y++)
+        for (uint32_t x = r.x; x < r.x + r.w; x++) {
+            const uint32_t x0 = std::min(2 * x, sw - 1), x1 = std::min(2 * x + 1, sw - 1);
+            const uint32_t y0 = std::min(2 * y, sh - 1), y1 = std::min(2 * y + 1, sh - 1);
+            const uint8_t *p[4] = {src + ((size_t)y0 * sw + x0) * bpp, src + ((size_t)y0 * sw + x1) * bpp,
+                                   src + ((size_t)y1 * sw + x0) * bpp, src + ((size_t)y1 * sw + x1) * bpp};
+            uint8_t *o = dst + ((size_t)y * dw + x) * bpp;
+            if (bpp == 1) {
+                o[0] = (uint8_t)((p[0][0] + p[1][0] + p[2][0] + p[3][0] + 2) / 4);
+                continue;
+            }
+            const uint32_t a = p[0][3] + p[1][3] + p[2][3] + p[3][3];
+            for (int ch = 0; ch < 3; ch++) {
+                if (a) {
+                    const uint32_t sum = p[0][ch] * p[0][3] + p[1][ch] * p[1][3] + p[2][ch] * p[2][3] + p[3][ch] * p[3][3];
+                    o[ch] = divide(sum + a / 2, a);
+                } else {
+                    o[ch] = (uint8_t)((p[0][ch] + p[1][ch] + p[2][ch] + p[3][ch] + 2) / 4);
+                }
+            }
+            o[3] = (uint8_t)((a + 2) / 4);
+        }
+}
+
+}  // namespace
+
+void Asset::make_mips(const std::vector<crk::PixelRect> &rects)
+{
+    std::vector<crk::PixelRect> above = rects;
+    if (above.empty())
+        above.push_back(crk::PixelRect{0, 0, p_.w, p_.h});
+    const uint32_t b = bpp();
+    for (uint32_t l = 1; l < p_.levels(); l++) {
+        const uint32_t sw = mip_size(p_.w, l - 1), sh = mip_size(p_.h, l - 1);
+        const uint32_t lw = mip_size(p_.w, l), lh = mip_size(p_.h, l);
+        const uint8_t *src = l == 1 ? px_.data() : mips_[l - 2].data();
+        std::vector<crk::PixelRect> here;
+        for (const crk::PixelRect &r : above) {
+            here.push_back(halved(r, lw, lh));
+            reduce(src, sw, sh, mips_[l - 1].data(), lw, b, here.back());
+        }
+        if (!whole_) {
+            std::vector<crk::PixelRect> &d = mip_dirty_[l - 1];
+            d.insert(d.end(), here.begin(), here.end());
+        }
+        above = here;
+    }
 }
 
 bool Asset::attach(Graph *g)
@@ -89,15 +196,17 @@ bool Asset::attach(Graph *g)
         return true;
     }
     g_ = g;
-    buf_ = g->buffer(p_.format, p_.w, p_.h, p_.sampling, p_.wrap);
+    buf_ = g->buffer(p_.format, p_.w, p_.h, p_.sampler, p_.levels());
     if (!buf_) {
         g_ = nullptr;
-        log_error("asset %u: %ux%u buffer refused", id_, p_.w, p_.h);
+        log_error("asset %u: %ux%u buffer of %u levels refused", id_, p_.w, p_.h, p_.levels());
         return false;
     }
     whole_ = true;   /* a new buffer holds nothing yet */
     clean_ = false;
     dirty_.clear();
+    for (auto &d : mip_dirty_)
+        d.clear();
     return true;
 }
 
@@ -110,6 +219,8 @@ void Asset::detach(bool drop)
     clean_ = false;
     whole_ = true;
     dirty_.clear();
+    for (auto &d : mip_dirty_)
+        d.clear();
     staged_ = 0;
 }
 
@@ -121,10 +232,12 @@ Stage Asset::stage(int64_t now_ms)
         if (!g_ || !have_ || clean_ || !refused_.empty() || !pacer_.ready(now_ms))
             return Stage::Idle;
         if (!buf_) {
-            buf_ = g_->immutable_texture(p_.format, p_.w, p_.h, p_.sampling, p_.wrap, px_.data(), px_.size());
+            buf_ = g_->immutable_texture(p_.format, p_.w, p_.h, p_.sampler, p_.levels(), px_.data(), px_.size());
             if (!buf_) {
                 refused_ = "the renderer refused its " + std::to_string(p_.w) + "x" + std::to_string(p_.h) + " " +
                            tex_format_name(p_.format) + " texture";
+                if (p_.levels() > 1)
+                    refused_ += " of " + std::to_string(p_.levels()) + " mip levels";
                 log_error("asset %u: %s", id_, refused_.c_str());
                 return Stage::Idle;
             }
@@ -138,6 +251,11 @@ Stage Asset::stage(int64_t now_ms)
     }
     if (!g_ || !have_ || (!whole_ && dirty_.empty()) || !pacer_.ready(now_ms))
         return Stage::Idle;
+    if (mips_stale_all_ || !mips_stale_.empty()) {
+        make_mips(mips_stale_all_ ? std::vector<crk::PixelRect>() : mips_stale_);
+        mips_stale_all_ = false;
+        mips_stale_.clear();
+    }
     const std::vector<crk::PixelRect> all{crk::PixelRect{0, 0, p_.w, p_.h}};
     bool written = true;
     staged_whole_ = whole_;
@@ -145,6 +263,16 @@ Stage Asset::stage(int64_t now_ms)
         px_.data(), p_.w, bpp(), whole_ ? all : dirty_, &scratch_,
         [this](const uint8_t *px, const crk::PixelRect &r) { return g_->write(buf_, r.x, r.y, r.w, r.h, px); },
         &written);
+    for (uint32_t l = 1; written && l < p_.levels(); l++) {
+        const uint32_t lw = mip_size(p_.w, l), lh = mip_size(p_.h, l);
+        const std::vector<crk::PixelRect> level{crk::PixelRect{0, 0, lw, lh}};
+        staged_ += crk::write_rects(
+            mips_[l - 1].data(), lw, bpp(), whole_ ? level : mip_dirty_[l - 1], &scratch_,
+            [this, l](const uint8_t *px, const crk::PixelRect &r) {
+                return g_->write_level(buf_, l, r.x, r.y, r.w, r.h, px);
+            },
+            &written);
+    }
     /* Charged at once: the layers staged after it see what is left. */
     pacer_.spend(staged_);
     if (!written)
@@ -177,6 +305,8 @@ void Asset::committed(bool ok)
         clean_ = false;
     }
     dirty_.clear();
+    for (auto &d : mip_dirty_)
+        d.clear();
     staged_ = 0;
 }
 

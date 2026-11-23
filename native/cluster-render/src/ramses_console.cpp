@@ -164,13 +164,42 @@ bool ramses_line(const std::string &line)
     return ctx != std::string::npos && (bar == std::string::npos || ctx < bar);
 }
 
+int level_change(const std::string &line, const char *context)
+{
+    /* "... ramses.Ramsh | RCLI | ramses.Client | 0 | OFF |  Dlt changed log level from INFO" */
+    if (line.find("Dlt changed log level") == std::string::npos)
+        return -1;
+    static const char *const kLevels[] = {"OFF", "FATAL", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"};
+    std::vector<std::string> fields;
+    size_t from = 0;
+    for (;;) {
+        const size_t bar = line.find('|', from);
+        std::string f = line.substr(from, bar == std::string::npos ? std::string::npos : bar - from);
+        const size_t a = f.find_first_not_of(' '), b = f.find_last_not_of(' ');
+        fields.push_back(a == std::string::npos ? std::string() : f.substr(a, b - a + 1));
+        if (bar == std::string::npos)
+            break;
+        from = bar + 1;
+    }
+    for (size_t i = 0; i < fields.size(); i++) {
+        if (fields[i] != context)
+            continue;
+        for (size_t k = i + 1; k < fields.size(); k++)
+            for (int l = 0; l < 7; l++)
+                if (fields[k] == kLevels[l])
+                    return l;
+    }
+    return -1;
+}
+
 bool console_interesting(const std::string &line, const std::vector<uint64_t> &scenes)
 {
     /* Every 2 s the client's scenes and their flush statistics; their
      * states are in the subscription lines. */
     if (line.find(" ramses.Periodic ") != std::string::npos)
         return false;
-    if (line.find("ubscri") != std::string::npos || line.find("Ramses log levels") != std::string::npos)
+    if (line.find("ubscri") != std::string::npos || line.find("Ramses log levels") != std::string::npos ||
+        line.find("Dlt changed log level") != std::string::npos)
         return true;
     char b[32];
     for (uint64_t id : scenes) {
@@ -277,6 +306,22 @@ void RamsesConsole::feed(const char *s, size_t n, int64_t now_ms)
     last_ms_ = now_ms;
     if (!ramses)
         return;
+    if (ramses_ms_ < 0 || now_ms - ramses_ms_ > kQuietMs) {
+        /* Every context was quiet: the DLT daemon's default level, which
+         * set ramses.Client off with the others, set it on again (its line
+         * is never printed: ramses.Ramsh, which prints them, gets the new
+         * level after ramses.Client). */
+        live_since_ = now_ms;
+        client_off_ = false;
+    }
+    ramses_ms_ = now_ms;
+    const int level = level_change(line, "ramses.Client");
+    if (level >= 0 || (context == "ramses.Client" && client_off_)) {
+        const bool off = level >= 0 && level < 4;   /* below INFO */
+        if (client_off_ && !off)
+            live_since_ = now_ms;
+        client_off_ = off;
+    }
     bool raw = console_interesting(line, scenes_);
     if (context != "ramses.Periodic" && first_ < kFirstLines) {
         first_++;
@@ -321,6 +366,14 @@ void RamsesConsole::take(std::vector<ConsoleEvent> *events, std::vector<std::str
     raw_.clear();
     *raw_dropped = raw_dropped_;
     raw_dropped_ = 0;
+}
+
+int64_t RamsesConsole::live_since(int64_t now_ms) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (client_off_ || ramses_ms_ < 0 || now_ms - ramses_ms_ > kQuietMs)
+        return -1;
+    return live_since_;
 }
 
 std::string RamsesConsole::counts_text(int64_t now_ms) const

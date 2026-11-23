@@ -7,7 +7,9 @@
  * pictures included, and a picture for every frame when it is not. A frame
  * a quarter of an interval early takes its slot; a skipped frame's late
  * picture is due at its slot and the lead after it, and takes that slot;
- * slots that passed are not made up; reset starts the grid again. */
+ * slots that passed are not made up; reset starts the grid again. The
+ * rate held by the renderer's fps_cap (picture_rate), and a rate changed
+ * at run time (set_fps). */
 #include <algorithm>
 #include <cstdio>
 #include <vector>
@@ -65,6 +67,38 @@ int main()
 {
     {
         ok("off: every frame", simulate(0, phone(30, 10, 0)) == 300);
+    }
+    {
+        /* picture_rate: picture_fps, target_fps 30, floor 10 (the HUD's) */
+        ok("picture_rate: not held: picture_fps as loaded",
+           picture_rate(0, 0, 30, 10) == 0 && picture_rate(30, 0, 30, 10) == 30);
+        ok("picture_rate: held at target_fps or more: as loaded",
+           picture_rate(0, 30, 30, 10) == 0 && picture_rate(0, 45, 30, 10) == 0);
+        ok("picture_rate: held at 20: 20, or picture_fps when lower",
+           picture_rate(0, 20, 30, 10) == 20 && picture_rate(30, 20, 30, 10) == 20 &&
+               picture_rate(15, 20, 15, 10) == 15);
+        ok("picture_rate: never below the floor", picture_rate(0, 15, 30, 20) == 20);
+        ok("picture_rate: target_fps 0 (no clock): any cap holds", picture_rate(0, 20, 0, 3) == 20);
+    }
+    {
+        /* set_fps: at 20 then back to every frame, a picture for each */
+        PicturePace p(0);
+        p.set_fps(20);
+        int pictures = 0;
+        for (int64_t t = 0; t < 1000; t += 10)
+            if (p.due(t)) {
+                p.took(t);
+                pictures++;
+            }
+        const bool held = pictures >= 19 && pictures <= 21 && p.fps() == 20;
+        p.set_fps(0);
+        bool every = true;
+        for (int64_t t = 1000; t < 1100; t += 10)
+            every = every && p.due(t);
+        p.set_fps(15);
+        const bool restarts = p.due(1100) && p.late_in_ms(1100) == 0;
+        ok("set_fps: 20 a second from 100, every frame once released, the grid started again at a new rate",
+           held && every && restarts);
     }
     {
         /* picture_fps a second from a faster phone, fewer from a slower one,

@@ -233,6 +233,13 @@ int serve(Config cfg)
             }
         log_info("waze: pictures at most %u a second (picture_fps); the frames between are decoded without one", vc.picture_fps);
     }
+    /* While another app's layer holds the map's rate (others_fps), the
+     * pictures follow it, never below what the HUD and the freeze watch
+     * take (picture_rate). */
+    const unsigned target_fps = (unsigned)cfg.num("target_fps");
+    const unsigned picture_floor = std::max((unsigned)cfg.num("hud_fps"),
+                                            cfg.num("freeze_ms") ? (unsigned)cfg.num("freeze_min_fps") : 0u);
+    unsigned fps_cap = 0;
     vc.freeze.ms = (unsigned)cfg.num("freeze_ms");
     vc.freeze.min_fps = (unsigned)cfg.num("freeze_min_fps");
     vc.freeze.blank_ms = (unsigned)cfg.num("blank_ms");
@@ -308,11 +315,12 @@ int serve(Config cfg)
                                  {producer.ready_fd(), POLLIN, 0}};
         feed.poll_fds(&p);   /* one per target's renderer connection */
         /* A decoded frame wakes it (the producer's ready fd), and so does the
-         * renderer's socket, and the HUD's next frame when one is due; four
-         * times a second otherwise, so the client retries its connection, a
-         * source that is down is retried and the status files stay current. */
-        const int64_t hud_wake = feed.wake_in_ms(now_ms());
-        int n = poll(p.data(), p.size(), hud_wake >= 0 && hud_wake < 250 ? (int)hud_wake : 250);
+         * renderer's socket, and a scaled frame to take or the next one due
+         * (the HUD's, or a hosted map's); four times a second otherwise, so
+         * the client retries its connection, a source that is down is
+         * retried and the status files stay current. */
+        const int64_t wake = feed.wake_in_ms(now_ms());
+        int n = poll(p.data(), p.size(), wake >= 0 && wake < 250 ? (int)wake : 250);
         if (n < 0 && errno != EINTR)
             break;
         if (p[0].revents & POLLIN)
@@ -346,6 +354,20 @@ int serve(Config cfg)
         producer.set_pictures(feed.wants_frames());
         feed.set_stream(live, producer.frozen(now), producer.picture(now));
         feed.poll(now);
+        if (feed.fps_cap() != fps_cap) {
+            fps_cap = feed.fps_cap();
+            const unsigned rate = picture_rate(vc.picture_fps, fps_cap, target_fps, picture_floor);
+            char pictures[48] = "a picture for every frame";
+            if (rate)
+                std::snprintf(pictures, sizeof pictures, "pictures at most %u a second", rate);
+            if (fps_cap)
+                log_info("render: %s asks for the other videos' upload (others_fps): the map at most %u updates a "
+                         "second, %s",
+                         feed.fps_cap_app().c_str(), target_fps ? std::min(fps_cap, target_fps) : fps_cap, pictures);
+            else
+                log_info("render: the map back at %u updates a second, pictures as configured", target_fps);
+            producer.set_picture_fps(rate);
+        }
         if (fc.vpp_scale)
             producer.set_part(feed.part());
         producer.retry_sources(now);
@@ -366,7 +388,7 @@ int serve(Config cfg)
             if (producer.minute(now, &m, &sm, &bm, &tm, &overflows)) {
                 const unsigned paced = (unsigned)producer.take_paced();
                 char paced_text[48] = "";
-                if (vc.picture_fps)
+                if (vc.picture_fps || paced)
                     std::snprintf(paced_text, sizeof paced_text, ", %u without one for picture_fps", paced);
                 log_info("waze: %u frames decoded in the last minute, %u without a picture to catch up%s, %u changed, "
                          "%u corrupted; the last picture is %s; %u losses (%u packets), %llu dropped by the receive "

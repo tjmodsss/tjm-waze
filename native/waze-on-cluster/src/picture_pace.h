@@ -23,7 +23,12 @@
  * (late_in_ms): the map is never left on an older picture than the phone's
  * last. That picture takes the slot too.
  *
- * picture_fps 0: every frame gets a picture. Not thread-safe. */
+ * picture_fps 0: every frame gets a picture. Not thread-safe.
+ *
+ * While another app's layer on the cluster asks for the other videos'
+ * upload bandwidth (cluster-render's others_fps), the renderer writes the
+ * map at most at its fps_cap, so the pictures follow it (picture_rate),
+ * and go back to picture_fps when it is released. */
 #ifndef WOC_PICTURE_PACE_H
 #define WOC_PICTURE_PACE_H
 
@@ -38,6 +43,18 @@ public:
     static const int64_t kLeadDiv = 4;
 
     explicit PicturePace(unsigned fps) : fps_(fps) { clock_.configure(fps); }
+
+    /* Another rate from the next picture on, which comes whatever the time
+     * and starts the grid again. */
+    void set_fps(unsigned fps)
+    {
+        if (fps == fps_)
+            return;
+        fps_ = fps;
+        clock_.configure(fps);
+        started_ = false;
+    }
+    unsigned fps() const { return fps_; }
 
     /* Whether a frame decoded at now_ms gets its picture. */
     bool due(int64_t now_ms) const { return !fps_ || !started_ || clock_.due(now_ms + lead_ms()); }
@@ -72,6 +89,20 @@ private:
     bool started_ = false;
     crk::FrameClock clock_;
 };
+
+/* The pictures a second (0: every frame) for picture_fps (as loaded, 0 or
+ * at least target_fps and floor) while the renderer holds the map to cap
+ * updates a second (its fps_cap event; 0: not held): picture_fps when not
+ * held, or held at target_fps or more (target_fps 0: no clock, so any cap
+ * holds it); else the cap, or picture_fps when lower, and never below
+ * floor (what the HUD and the freeze watch take). */
+inline unsigned picture_rate(unsigned picture_fps, unsigned cap, unsigned target_fps, unsigned floor)
+{
+    if (!cap || (target_fps && cap >= target_fps))
+        return picture_fps;
+    const unsigned r = picture_fps && picture_fps < cap ? picture_fps : cap;
+    return r < floor ? floor : r;
+}
 
 }  // namespace woc
 

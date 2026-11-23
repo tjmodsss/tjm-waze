@@ -6,7 +6,8 @@
  * the watch puts it back after a ruleset load and removes it at SIGTERM;
  * close removes every tagged rule and nothing else; a unit without the chain
  * gets nothing; an nft failure is an error. The folder helper. */
-var assert = require('assert'), fs = require('fs'), os = require('os'), path = require('path'), cp = require('child_process');
+var assert = require('assert'), fs = require('fs'), path = require('path'), cp = require('child_process');
+var tmp = require('./tmp.js');
 var EventEmitter = require('events');
 process.env.WOC_FW_CHECK_MS = '50';
 var fw = require('../logs_fw.js');
@@ -106,7 +107,7 @@ var RULE = 'iifname "wlan_bridge" tcp dport 8475 accept comment "waze-on-cluster
     console.log('ok   watch: with the logs service gone, the rule is removed and the watch ends');
 
     /* is-active: active, activating and reloading count as running */
-    var sc = path.join(os.tmpdir(), 'wfw-systemctl-' + process.pid);
+    var sc = path.join(tmp.root(), 'wfw-systemctl');
     var states = { active: true, activating: true, reloading: true, inactive: false, failed: false };
     for (var st in states) {
         fs.writeFileSync(sc, '#!/bin/sh\necho ' + st + '\n[ ' + st + ' = active ]\n');
@@ -118,7 +119,7 @@ var RULE = 'iifname "wlan_bridge" tcp dport 8475 accept comment "waze-on-cluster
     console.log('ok   the logs service counts as running while active, activating or reloading');
 
     /* the folder: root and the group, 2770; something else in its place refused */
-    var gdir = fs.mkdtempSync(path.join(os.tmpdir(), 'wgd-')), groups = path.join(gdir, 'group');
+    var gdir = tmp.dir(), groups = path.join(gdir, 'group');
     var mygid = process.getgid();
     fs.writeFileSync(groups, 'root:x:0:\nsystemd-journal:x:' + mygid + ':sin_dltsys\n');
     gd.groupDir(path.join(gdir, 'saved'), 'systemd-journal', { groupFile: groups, uid: process.getuid() });
@@ -132,7 +133,7 @@ var RULE = 'iifname "wlan_bridge" tcp dport 8475 accept comment "waze-on-cluster
     console.log('ok   the folder: made, the group\'s, 2770; a file in its place refused');
 
     /* the command line, with nft as a script */
-    var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wfw-')), script = path.join(dir, 'nft'), log = path.join(dir, 'log');
+    var dir = tmp.dir(), script = path.join(dir, 'nft'), log = path.join(dir, 'log');
     fs.writeFileSync(script, '#!/bin/sh\necho "$@" >> ' + log + '\n' +
         'case "$*" in "-a list chain ip filter input") echo \'\t\t' + RULE + ' # handle 9\';; esac\n');
     fs.chmodSync(script, 0o755);

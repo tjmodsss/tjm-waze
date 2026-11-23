@@ -70,7 +70,9 @@ public:
     /* For poll(): one entry per feed, appended. */
     size_t poll_fds(std::vector<pollfd> *fds) const;
     void poll(int64_t now_ms);
-    /* Until poll() has HUD work to do (-1: none). */
+    /* Until poll() has work for a feed that scales (the HUD's, or the
+     * cluster's while hosted): a scaled frame to take, or the next one due
+     * (-1: none). */
     int64_t wake_in_ms(int64_t now_ms) const;
 
     void offer(std::vector<uint8_t> *atlas, uint64_t id, int64_t now_ms);
@@ -85,6 +87,13 @@ public:
     FeedStatus status(const std::string &decode, const std::string &stream = std::string()) const;
     void request_report();
     std::string report() const;
+
+    /* The cluster's renderer holds its map layer to this many updates a
+     * second for another app (MapFeed::fps_cap); 0: not held, or no
+     * cluster feed. The HUD's pictures come from the same decode at
+     * hud_fps, which picture_rate keeps as a floor. */
+    unsigned fps_cap() const { return cluster_ ? cluster_->fps_cap() : 0; }
+    std::string fps_cap_app() const { return cluster_ ? cluster_->fps_cap_app() : std::string(); }
 
     /* The cluster's feed while there is one, else null. */
     MapFeed *cluster() { return cluster_.get(); }

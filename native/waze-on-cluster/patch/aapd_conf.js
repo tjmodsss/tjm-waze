@@ -175,9 +175,9 @@ function transform(text, dpi, card) {
 }
 
 /* /etc/aapd.conf of MGU P18_23w44.2-1-3, aapd 22.39.3's: its SHA-256 and
- * the shipped text of every number any version of this tool sets, for a
- * revert without the backup. */
-var PROVEN = {
+ * the shipped text of every number any version of this tool sets, to put
+ * back an earlier release's edit of it without the backup. */
+var SHIPPED = {
     sha256: '9584c540f287bb79744e79cf973795208719ca798f13d881c4dac582656b0f16',
     codec: { CODEC_WIDTH: '1920', CODEC_HEIGHT: '1080', REPORTED_SCREEN_DENSITY: '200', REAL_SCREEN_DENSITY: '208', HORIZONTAL_MARGIN_SIZE: '0',
              VERTICAL_MARGIN_SIZE: '184', OFFSET_LEFT_TARGET_VIEWPORT: '0', OFFSET_TOP_TARGET_VIEWPORT: '4', WIDTH_TARGET_VIEWPORT: '1920',
@@ -186,18 +186,18 @@ var PROVEN = {
             SA_WIDTH: '74.60', SA_HEIGHT: '64.11' },
 };
 
-/* The proven aapd.conf `text` is a copy of, rebuilt from it: the shipped
+/* The shipped aapd.conf (SHIPPED) `text` is a copy of, rebuilt from it: the shipped
  * values set again, when the result is the shipped file whole and `text` is
  * that file or its edit at one of DENSITIES and CARDS (a geometry this tool
  * writes); else null. */
 function stockOriginal(text) {
     var l = layout(text), w = {};
     if (l.err) return null;
-    Object.keys(PROVEN.codec).forEach(function (k) { w[l.codec + k] = PROVEN.codec[k]; });
-    Object.keys(PROVEN.dims).forEach(function (k) { w[DIMS + k] = PROVEN.dims[k]; });
+    Object.keys(SHIPPED.codec).forEach(function (k) { w[l.codec + k] = SHIPPED.codec[k]; });
+    Object.keys(SHIPPED.dims).forEach(function (k) { w[DIMS + k] = SHIPPED.dims[k]; });
     var out;
     try { out = setNumbers(text, l.spans, w); } catch (e) { return null; }
-    if (require('crypto').createHash('sha256').update(out, 'utf8').digest('hex') !== PROVEN.sha256) return null;
+    if (require('crypto').createHash('sha256').update(out, 'utf8').digest('hex') !== SHIPPED.sha256) return null;
     return out === text || edited(out, text) ? out : null;
 }
 
@@ -244,5 +244,5 @@ function otherFile(cur, orig) {
 module.exports = {
     GEOMETRY: GEOMETRY, DENSITIES: DENSITIES, DEFAULT_DPI: DEFAULT_DPI,
     DENSITY_MIN: DENSITY_MIN, DENSITY_MAX: DENSITY_MAX, DENSITY_STEP: DENSITY_STEP, CARDS: CARDS, DEFAULT_CARD: DEFAULT_CARD,
-    PROVEN: PROVEN, check: check, transform: transform, edited: edited, stockOriginal: stockOriginal, otherFile: otherFile, srcCrop: srcCrop,
+    SHIPPED: SHIPPED, check: check, transform: transform, edited: edited, stockOriginal: stockOriginal, otherFile: otherFile, srcCrop: srcCrop,
 };

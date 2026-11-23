@@ -34,7 +34,9 @@ Arrangement arrange(std::vector<StackItem> items)
             return a.klass < b.klass;
         if (a.z != b.z)
             return a.z < b.z;
-        return a.seq < b.seq;
+        if (a.seq != b.seq)
+            return a.seq < b.seq;
+        return a.under > b.under;
     });
     Arrangement r;
     /* The topmost drawable exclusive layer whose pixels are on the display;
@@ -48,6 +50,7 @@ Arrangement arrange(std::vector<StackItem> items)
     for (size_t i = 0; i < items.size(); i++) {
         const StackItem &it = items[i];
         r.order.push_back(it.id);
+        r.preload = r.preload || it.preload;
         if (it.visible && it.ready)
             (i < floor ? r.suspended : r.drawn).push_back(it.id);
         if (it.visible && (it.ready || it.prewarm)) {

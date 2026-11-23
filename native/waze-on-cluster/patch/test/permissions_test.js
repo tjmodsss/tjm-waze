@@ -7,14 +7,14 @@
 
 var assert = require('assert');
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
 require('./head_unit_env.js');
 var synthetic = require('./synthetic_carplay.js');
 var earlier = require('./earlier_patcher.js');
 var script = path.join(__dirname, '..', 'carplay_patch.js');
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-permissions-'));
+var dir = tmp.dir();
 var target = path.join(dir, 'carplay');
 var preload = path.join(dir, 'preload.js');
 var original = synthetic.build().buf;

@@ -143,6 +143,9 @@ public:
      * first picture after it is wanted again comes whole, even when it is
      * the last one again, and counts as a change. */
     void set_pictures(bool on);
+    /* Pictures at most fps a second from now on (picture_rate; 0: every
+     * frame), in place of VideoConfig::picture_fps. Main thread. */
+    void set_picture_fps(unsigned fps);
     /* Frames decoded without a picture for picture_fps since the last
      * call (main thread). */
     uint64_t take_paced()
@@ -287,9 +290,11 @@ private:
     std::atomic<bool> resumed_{false};   /* the next picture is the first since pictures were off */
     bool catching_up_ = false;           /* the last feed decoded without a picture to catch up (decode_mutex_) */
     PicturePace pace_;                   /* decode_mutex_ */
+    std::atomic<unsigned> picture_fps_;  /* pace_'s rate (set_picture_fps), read without the lock */
     /* The newest frame came out without a picture for the pace, and may
-     * still get it late (decode_mutex_). */
-    bool paced_ = false;
+     * still get it late (written under decode_mutex_; read without it to
+     * skip the lock when nothing is paced). */
+    std::atomic<bool> paced_{false};
     bool pace_skip_ = false;             /* this feed's frames go without a picture for the pace (decode_mutex_) */
     /* Frames the pace left without a picture for good: a newer frame came,
      * or no late picture was made. */

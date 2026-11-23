@@ -140,6 +140,14 @@ public:
 
     const VideoParams &video() const { return p_; }
 
+    /* Another client's layer asks for this one's bandwidth (PROTOCOL.md
+     * "Bandwidth for a layer"): updates at most cap a second while cap is
+     * below its own fps (or it has none), at its own fps with cap 0. Its
+     * params stay as the client set them. */
+    void cap_fps(uint32_t cap, int64_t now_ms);
+    /* The updates a second its clock allows now; 0: no clock. */
+    uint32_t clock_fps() const { return clock_.fps(); }
+
     /* Its edge (none by default), within its target (the caller clamps
      * it), drawn by these effects of the edge shaders above: two quads a
      * kind, over the picture, shown with the atlas or the packed one. True

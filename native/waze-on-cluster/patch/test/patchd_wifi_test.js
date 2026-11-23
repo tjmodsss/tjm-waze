@@ -11,11 +11,11 @@
 var cp = require('child_process');
 var fs = require('fs');
 var net = require('net');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 
 var PATCHD = path.join(__dirname, '..', 'patchd.js');
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-wifi-'));
+var dir = tmp.dir();
 var SOCK = path.join(dir, 'sock', 'patch.sock');
 var DEV = path.join(dir, 'net-dev');
 var TCP6 = path.join(dir, 'tcp6');

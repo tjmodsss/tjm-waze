@@ -31,6 +31,12 @@
  *   REMOVED meanwhile makes remap send nothing (the slot manager then
  *   releases it and asks for it in full); a refused re-map, or a REMOVED
  *   before it shows, is a refusal as for any map;
+ * - a load is a fetch alone: FETCHED is told on_fetched and the scene kept
+ *   fetched, not mapped, for remap; an unmap (Port::unmap) is an unmap
+ *   alone, the scene kept so too. A REMOVED of a scene kept so, loaded or
+ *   kept through a lock, is lost (the slot manager acts on it for a loaded
+ *   target only), and remap sends nothing for it. How long the KOMBI
+ *   keeps a fetch that is not mapped is CAR-ONLY;
  * - a fetch the KOMBI accepted (its E_DCSM_OK reply, or FETCHING) is
  *   fetch_accepted until FETCHED (told on_fetched), FAILED or REMOVED;
  * - the slot table names the stock HMI's content (slot_table);
@@ -95,6 +101,9 @@ public:
     void request(const TargetSpec &t) override;
     void release(const TargetSpec &t) override;
     bool keep(const TargetSpec &t) override;
+    bool preloads() const override { return true; }
+    void load(const TargetSpec &t) override;
+    bool unmap(const TargetSpec &t) override;
     bool remap(const TargetSpec &t, int64_t now_ms) override;
     bool confirmed(const TargetSpec &t) const override { return !pending_.count(t.scene_id); }
     void take_over(const TargetSpec &t, uint64_t content) override;
@@ -144,6 +153,7 @@ private:
         bool map_asked = false;   /* a map went out and was not refused */
         bool fetched = false;     /* FETCHED, and not removed since */
         bool fetch_accepted = false;   /* the fetch's E_DCSM_OK reply, or FETCHING, came */
+        bool load = false;        /* a load: no map at FETCHED */
         /* The map's first E_DCSM_OK reply came then (-1: none) and no map
          * status has come: the map is asked again every kMapAgainMs
          * (remind), until a map status comes or a repeat is refused. */

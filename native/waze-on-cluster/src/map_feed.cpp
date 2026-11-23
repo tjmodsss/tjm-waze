@@ -53,10 +53,7 @@ MapFeed::MapFeed(const FeedConfig &cfg)
                    (unpacked_why_ == nullptr) != client_.takes_always_packed()) {
             /* a cluster-render that takes always_packed now, or no longer:
              * the layer made again for it, its next write whole */
-            keep_newest();
-            client_.drop(layer_);
-            layer_ = 0;
-            make_layer();
+            remake_layer();
         }
     };
     client_.on_layer = [this](uint32_t ref, const std::string &state, const std::string &reason) {
@@ -83,10 +80,15 @@ MapFeed::MapFeed(const FeedConfig &cfg)
         max_kb_ = max;
         budget_reason_ = reason;
     };
-    client_.on_error = [this](const std::string &op, uint32_t, const std::string &reason) {
+    client_.on_error = [this](const std::string &op, uint32_t ref, const std::string &reason) {
         log_error("render: %s refused: %s", op.c_str(), reason.c_str());
         if (op == "layer") {
             refused_ = reason;
+            /* the hosted layer refused: on the feed's own target (poll) */
+            if (hosted() && ref == layer_) {
+                host_unusable_ = true;
+                remake_ = true;
+            }
         }
     };
     client_.on_status = [this](const std::string &text) {
@@ -136,14 +138,12 @@ void MapFeed::make_layer()
         if (!host_crop(MapRect{q.x, q.y, q.w, q.h}, cfg_.video.w, cfg_.video.h,
                        MapRect{(uint32_t)host_.src_x, (uint32_t)host_.src_y, host_.src_w, host_.src_h},
                        MapRect{(uint32_t)host_.x, (uint32_t)host_.y, host_.w, host_.h}, &crop, &place)) {
-            refused_ = "the host's part of " + cfg_.target + " misses the map";
-            log_error("render: %s", refused_.c_str());
+            fall_back("the host's part of " + cfg_.target + " misses the map");
             return;
         }
         const uint32_t dw = (crop.w < place.w ? crop.w : place.w) & ~3u, dh = (crop.h < place.h ? crop.h : place.h) & ~1u;
         if (dw < 64 || dh < 32) {
-            refused_ = "the map's part in the host's rect is smaller than 64x32";
-            log_error("render: %s", refused_.c_str());
+            fall_back("the map's part in the host's rect is smaller than 64x32");
             return;
         }
         q = crk::QuadRect{place.x, place.y, place.w, place.h};
@@ -162,7 +162,7 @@ void MapFeed::make_layer()
         shape_.level_bits = cfg_.video.level_bits;
         if (cfg_.vpp_scale)
             part_ = OutputPart{crop.x, crop.y, crop.w, crop.h, dw, dh};
-        log_info("render: hosted by a scene on %s: the map's %ux%u at %u,%u, as %ux%u%s", host_.into.c_str(), crop.w,
+        log_info("render: hosted on %s: the map's %ux%u at %u,%u, as %ux%u%s", host_.into.c_str(), crop.w,
                  crop.h, crop.x, crop.y, dw, dh, part_.set() ? ", made by VPP (hosted_vpp_scale)" : "");
     } else if (cfg_.target == "hud" && cfg_.scale_down && (sw < cfg_.video.w || sh < cfg_.video.h) && sw >= 64 &&
                sh >= 32 && sw <= cfg_.video.w && sh <= cfg_.video.h) {
@@ -206,6 +206,9 @@ void MapFeed::make_layer()
     lo_.contend = !hosted();
     lo_.guide_hold = cfg_.guide_hold;
     lo_.yield = hosted() || cfg_.target != "hud" || !cfg_.hud_keep_shown;
+    /* marked as the hosted map, so a theme hosting it from its layers draws
+     * it under them (an older renderer ignores the field) */
+    lo_.hosted = hosted() ? cfg_.target : std::string();
     lo_.x = (int)q.x;
     lo_.y = (int)q.y;
     lo_.w = q.w;
@@ -221,17 +224,30 @@ void MapFeed::make_layer()
              vo.always_packed ? ", every update packed (always_packed)" : "");
 }
 
+void MapFeed::fall_back(const std::string &why)
+{
+    log_warn("render: %s: the map on %s instead, until the host changes", why.c_str(), cfg_.target.c_str());
+    host_unusable_ = true;
+    make_layer();
+}
+
 void MapFeed::set_host(const cr::Host &h)
 {
     if (h == host_)
         return;
     host_ = h;
+    host_unusable_ = remake_ = false;
     part_ = OutputPart();   /* the next layer's, if any */
     if (!hosted())
         log_info("render: %s is not hosted any more: the map on its own target", cfg_.target.c_str());
     else
-        log_info("render: %s hosted by a scene on %s at %ux%u+%d+%d%s", cfg_.target.c_str(), h.into.c_str(), h.w, h.h,
+        log_info("render: %s hosted on %s at %ux%u+%d+%d%s", cfg_.target.c_str(), h.into.c_str(), h.w, h.h,
                  h.x, h.y, h.shown ? "" : ", hidden there: nothing sent");
+    remake_layer();
+}
+
+void MapFeed::remake_layer()
+{
     if (layer_) {
         keep_newest();
         client_.drop(layer_);
@@ -311,10 +327,7 @@ void MapFeed::set_hud_width(unsigned pct)
         return;
     /* the texture's size changes with it: a new layer at the new size */
     log_info("render: HUD map %u%% wide", pct);
-    keep_newest();
-    client_.drop(layer_);
-    layer_ = 0;
-    make_layer();
+    remake_layer();
 }
 
 void MapFeed::set_guide_hold(bool hold)
@@ -329,6 +342,11 @@ void MapFeed::set_guide_hold(bool hold)
 void MapFeed::poll(int64_t now_ms)
 {
     client_.poll(now_ms);
+    if (remake_) {
+        remake_ = false;
+        log_warn("render: the hosted layer refused: the map on %s instead, until the host changes", cfg_.target.c_str());
+        remake_layer();
+    }
     send_pending(now_ms);
     if (connected_ && !client_.connected()) {
         connected_ = false;
@@ -431,7 +449,10 @@ void MapFeed::send_pending(int64_t now_ms)
     if (worker_.submit(&held_, id_, shape_)) {
         held_new_ = false;
         in_worker_ = true;
-        next_send_ms_ = now_ms + (cfg_.video.fps ? 1000 / (int64_t)cfg_.video.fps : 0);
+        unsigned fps = cfg_.video.fps;
+        if (fps_cap() && (!fps || fps_cap() < fps))
+            fps = fps_cap();
+        next_send_ms_ = now_ms + (fps ? 1000 / (int64_t)fps : 0);
     }
 }
 

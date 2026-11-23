@@ -21,8 +21,8 @@ var car = require('./head_unit_env.js');   /* a HIGH head unit, coded KI_KOMBI_V
 var record = require('../patch_record.js');
 
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 var crypto = require('crypto');
 var cp = require('child_process');
 
@@ -117,7 +117,7 @@ function inRegion(d, off, len) { return d.every(function (x) { return x >= off &
 if (!fs.existsSync(SRC)) { process.stdout.write('SKIP: set CARPLAY_BIN to a copy of the unit\'s /usr/bin/carplay (carplay 22.28.3)\n'); process.exit(0); }
 ok('source is the known pristine build', sha256(SRC) === ORIG_SHA, sha256(SRC));
 
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-patch-'));
+var dir = tmp.dir();
 var tgt = path.join(dir, 'carplay');
 fs.writeFileSync(tgt, fs.readFileSync(SRC));
 var SRCBUF = fs.readFileSync(SRC);
@@ -151,7 +151,7 @@ try {
         /^showui:\s+ORIGINAL \(ShowUI asks the phone for maps:\/car\/instrumentcluster\)$/m.test(r.out) && /pristine/.test(r.out), r.out);
     ok('stock map URL bytes are the proven ones', mapUrlIs(SRCBUF, 1), JSON.stringify(mapUrlBytes(SRCBUF)));
     ok('stock ShowUI URL bytes are the proven ones', showUiIs(SRCBUF, 1), JSON.stringify(rangeBytes(SHOWUI, SRCBUF)));
-    ok('status: proven, version 22.28.3', /proven:\s+yes/.test(r.out) && /version:\s+22\.28\.3/.test(r.out), r.out);
+    ok('status: version 22.28.3, no list of builds named', !/proven:/.test(r.out) && /version:\s+22\.28\.3/.test(r.out), r.out);
     ok('stock res immediates are the proven ones', JSON.stringify(resImmediates(SRCBUF)) === JSON.stringify(RES_STOCK), JSON.stringify(resImmediates(SRCBUF)));
 
     r = run(['verify', '--target', tgt]);
@@ -261,11 +261,53 @@ try {
     run(['revert', '--target', tgt, '--yes']);
     ok('revert after udp mode restores original', sha256(tgt) === ORIG_SHA);
 
-    /* a tampered build is refused for a plan */
-    var tampered = Buffer.from(SRCBUF); tampered[0x1000] ^= 0xff;
-    var tt = path.join(dir, 'carplay_tampered'); fs.writeFileSync(tt, tampered);
-    r = plan(tt, ['--panel', 'high']);
-    ok('tampered build: plan refused', r.code !== 0 && /pristine build/.test(r.out) && !r.plan, r.out);
+    /* carplay 22.28.3's build-id with other bytes than the shipped file: the
+     * locator's checks at the sites decide, not the whole file's SHA-256;
+     * probe names the part that differs. */
+    var other = path.join(dir, 'other');
+    function otherFile(edit) { var b = Buffer.from(SRCBUF); edit(b); fs.writeFileSync(other, b); return sha256(other); }
+    [['another .gnu_debuglink CRC, which no segment loads', function (b) { b[0x352448] ^= 0x5a; }, 'the bytes no segment loads'],
+     ['a code byte away from the sites', function (b) { b[0x1000] ^= 0xff; }, 'loaded segment 1 (r-x, file 0x0-0x338d21)']].forEach(function (m) {
+        var oSha = otherFile(m[1]);
+        r = run(['status', '--target', other]);
+        ok(m[0] + ': status pristine', /known:\s+yes, pristine/.test(r.out), r.out);
+        r = run(['probe', other]);
+        ok(m[0] + ': probe names the part that differs, patchable', new RegExp('^differs:\\s+' + m[2].replace(/[()]/g, '\\$&') + '$', 'm').test(r.out) &&
+            /^patchable:\s+yes$/m.test(r.out), r.out);
+        r = plan(other, ['--panel', 'high']);
+        ok(m[0] + ': planned in memory, the file untouched', r.code === 0 && !!r.plan && sha256(other) === oSha, r.out);
+    });
+    /* geometry immediates the classifier reads as stock holding other bytes
+     * than the shipped file: this tool's safe area (504x368 at 286,72) over a
+     * stock geometry, as another tool's restore of its own backup leaves it
+     * (the file reported in #245), and another physical size. The locator's
+     * checks decide: planned, the file untouched. */
+    [['this tool\'s safe area over a stock geometry', function (b) {
+        Buffer.from('00000000f8010000', 'hex').copy(b, 0x20ca66); Buffer.from('700100001e014800', 'hex').copy(b, 0x20ca74); },
+        'fed8e394ffd1aa1da24b4a537409d58723cf6e8c67b78f97967a6d43c0cc7b37'],
+     ['another physical size', function (b) { b[0x20ca36] ^= 0x01; }, null]].forEach(function (m) {
+        var siteSha = otherFile(m[1]);
+        if (m[2]) ok(m[0] + ': the file reported in #245', siteSha === m[2], siteSha);
+        r = run(['status', '--target', other]);
+        ok(m[0] + ': status pristine, res ORIGINAL', /known:\s+yes, pristine/.test(r.out) && /^res:\s+ORIGINAL/m.test(r.out), r.out);
+        r = run(['probe', other]);
+        ok(m[0] + ': probe patchable, no differs line (the bytes are at a site)', !/^differs:/m.test(r.out) && /^patchable:\s+yes$/m.test(r.out), r.out);
+        r = plan(other, ['--panel', 'high']);
+        ok(m[0] + ': planned in memory, the file untouched', r.code === 0 && !!r.plan && sha256(other) === siteSha, r.out);
+    });
+    /* the shipped file: no differs line */
+    r = run(['probe', tgt]);
+    ok('the shipped file: probe prints no differs line', r.code === 0 && !/^differs:/m.test(r.out), r.out);
+    /* a loaded segment fewer than the shipped file: the count named */
+    (function () {
+        var loc = require('../carplay_locate.js'), S = require('../carplay_patch.js').SHIPPED['5de62156575d737391ea42254e778a97dbbb51f8'];
+        var b = Buffer.from(SRCBUF), phoff = b.readUInt32LE(0x20), n = b.readUInt16LE(0x38), es = b.readUInt16LE(0x36), last = -1;
+        for (var i = 0; i < n; i++) if (b.readUInt32LE(phoff + i * es) === 1) last = i;
+        b.writeUInt32LE(0, phoff + last * es);
+        var d = loc.partsDiffering(S, b);
+        ok('a loaded segment fewer: the count named', JSON.stringify(d) === JSON.stringify(['loaded segments: 1, the shipped file has 2']), JSON.stringify(d));
+    })();
+    fs.unlinkSync(other);
 
     /* A binary of the backup's build the locator does not recognise: revert
      * writes the whole backup. */
@@ -459,8 +501,8 @@ try {
     foreign[MAPURL[0][0] + 4] ^= 0x20;
     fs.writeFileSync(e1234, foreign);
     r = run(['status', '--target', e1234]);
-    ok('foreign map URL bytes: NOT APPLIED, the build still known', /^mapurl:\s+NOT APPLIED \(map URL: log string not found\)$/m.test(r.out) &&
-        /known:\s+yes, modified build/.test(r.out), r.out);
+    ok('foreign map URL bytes: NOT APPLIED, the build pristine (the locator decides)', /^mapurl:\s+NOT APPLIED \(map URL: log string not found\)$/m.test(r.out) &&
+        /known:\s+yes, pristine/.test(r.out), r.out);
     r = run(['apply', '--target', e1234, '--panel', 'high', '--yes']);
     ok('foreign map URL bytes: an earlier release\'s patch holds the other edits, those bytes as found', r.code === 0 &&
         JSON.stringify(mapUrlBytes(fs.readFileSync(e1234))) === JSON.stringify(mapUrlBytes(foreign)), r.out);
@@ -473,8 +515,8 @@ try {
     foreign[SHOWUI[0][0] + 40] ^= 0x20;
     fs.writeFileSync(e1234, foreign);
     r = run(['status', '--target', e1234]);
-    ok('foreign ShowUI log text bytes: NOT APPLIED, the build still known', /^showui:\s+NOT APPLIED \(ShowUI URL: ShowUI not called with the alternate display URL\)$/m.test(r.out) &&
-        /known:\s+yes, modified build/.test(r.out), r.out);
+    ok('foreign ShowUI log text bytes: NOT APPLIED, the build pristine (the locator decides)', /^showui:\s+NOT APPLIED \(ShowUI URL: ShowUI not called with the alternate display URL\)$/m.test(r.out) &&
+        /known:\s+yes, pristine/.test(r.out), r.out);
     r = run(['apply', '--target', e1234, '--panel', 'high', '--yes']);
     ok('foreign ShowUI log text bytes: an earlier release\'s patch holds the other edits, those bytes as found', r.code === 0 &&
         JSON.stringify(rangeBytes(SHOWUI, fs.readFileSync(e1234))) === JSON.stringify(rangeBytes(SHOWUI, foreign)), r.out);
@@ -587,14 +629,14 @@ try {
         /sink:\s+slot 0x2a20b0 \(59 bytes\): ORIGINAL/.test(r.out) &&
         /selfstart:\s+call 0x18176c in onSuggestUi 0x1816f0 \(setStreamStatus 0x181560, requestStream 0x181810\): ORIGINAL/.test(r.out) &&
         /res:\s+immediates 0x20ca32 0x20ca54 0x20ca66 0x20ca74 \(builder 0x20ca30\): ORIGINAL/.test(r.out) &&
-        /proven:\s+yes, carplay 22\.28\.3/.test(r.out) && /patchable:\s+yes/.test(r.out) && /build-id:\s+5de62156/.test(r.out), r.out);
+        !/proven:/.test(r.out) && /patchable:\s+yes/.test(r.out) && /build-id:\s+5de62156/.test(r.out), r.out);
     ok('probe: the file untouched', sha256(SRC) === ORIG_SHA && fs.statSync(SRC).mtime.getTime() === before);
     r = run(['probe', bc]);
     ok('probe: a damaged site makes the build not patchable, with the reason', /patchable:\s+no — self-start: call has no AVAILABLE argument/.test(r.out), r.out);
 
-    /* A build outside the proven list (another build-id) with every site
-     * stock: planned only with --unproven; an earlier release's patch of it
-     * verifies and reverts byte-exact. */
+    /* A build no list names (another build-id) with every site stock:
+     * planned as any other; an earlier release's patch of it verifies and
+     * reverts byte-exact. */
     var other = Buffer.from(SRCBUF);
     var bid = other.indexOf(Buffer.from('5de62156575d737391ea42254e778a97dbbb51f8', 'hex'));
     other[bid] ^= 0xff;
@@ -602,22 +644,21 @@ try {
     var ot = path.join(dir, 'carplay_other');
     fs.writeFileSync(ot, other);
     r = run(['status', '--target', ot]);
-    ok('unproven build: pristine by its stock sites, not proven, its version, the URL edits found', /known:\s+yes, pristine build a2e62156/.test(r.out) &&
-        /proven:\s+no/.test(r.out) && /version:\s+22\.28\.3/.test(r.out) && /^mapurl:\s+ORIGINAL/m.test(r.out) && /^showui:\s+ORIGINAL/m.test(r.out), r.out);
+    ok('another build: pristine by its stock sites, its version, the URL edits found', /known:\s+yes, pristine build a2e62156/.test(r.out) &&
+        !/proven:/.test(r.out) && /version:\s+22\.28\.3/.test(r.out) && /^mapurl:\s+ORIGINAL/m.test(r.out) && /^showui:\s+ORIGINAL/m.test(r.out), r.out);
     r = plan(ot, ['--panel', 'high']);
-    ok('unproven build: plan without --unproven refuses, no plan', r.code !== 0 && /is not a proven build; pass --unproven/.test(r.out) && !r.plan, r.out);
-    r = plan(ot, ['--panel', 'high', '--unproven']);
     var summary = null; try { summary = JSON.parse(r.out.trim().split('\n').pop()); } catch (e) {}
-    ok('unproven build: plan with --unproven made, the build not proven', r.code === 0 && !!r.plan && !!summary && summary.provenBuild === false, r.out);
+    ok('another build: planned without --unproven, its build and version in the summary, no list named', r.code === 0 && !!r.plan && !!summary &&
+        summary.build === 'a2e62156575d737391ea42254e778a97dbbb51f8' && summary.version === 'carplay 22.28.3' && !('provenBuild' in summary) && summary.coding === 'ok', r.out);
     r = run(['apply', '--target', ot, '--panel', 'high', '--sink', 'udp://127.0.0.1:20557?mime_type=video/H264', '--unproven', '--yes']);
-    ok('unproven build: an earlier release\'s patch holds every edit', r.code === 0 && mapUrlIs(fs.readFileSync(ot), 2) && showUiIs(fs.readFileSync(ot), 2), r.out);
+    ok('another build: an earlier release\'s patch holds every edit', r.code === 0 && mapUrlIs(fs.readFileSync(ot), 2) && showUiIs(fs.readFileSync(ot), 2), r.out);
     var od = diffs(other, fs.readFileSync(ot));
-    ok('unproven build: the diff stays in the edit regions', od.length > 0 && od.every(function (x) {
+    ok('another build: the diff stays in the edit regions', od.length > 0 && od.every(function (x) {
         return (x >= SLOT && x < SLOT + 4) || (x >= SINK && x < SINK + SINK_LEN) || (x >= CALL && x < CALL + CALL_LEN) || inResRegion(x) || inUrls(x); }));
     r = run(['verify', '--target', ot]);
-    ok('unproven build: verify passes, map URL on, ShowUI URL with ETA', r.code === 0 && /IC_HIGH, sink udp:\/\/127\.0\.0\.1:20557/.test(r.out) && /map URL on, ShowUI URL with ETA$/m.test(r.out), r.out);
+    ok('another build: verify passes, map URL on, ShowUI URL with ETA', r.code === 0 && /IC_HIGH, sink udp:\/\/127\.0\.0\.1:20557/.test(r.out) && /map URL on, ShowUI URL with ETA$/m.test(r.out), r.out);
     r = run(['revert', '--target', ot, '--yes']);
-    ok('unproven build: revert restores it byte-exact', r.code === 0 && fs.readFileSync(ot).equals(other), r.out);
+    ok('another build: revert restores it byte-exact', r.code === 0 && fs.readFileSync(ot).equals(other), r.out);
 
     /* A backup of another build is never restored over the target. */
     fs.writeFileSync(tgt, SRCBUF);
@@ -663,9 +704,8 @@ function codingAndRecord() {
         r = run(['status', '--target', ct]);
         ok('coding: status names it', /^coding:\s+KI_KOMBI_VARIANT 7$/m.test(r.out), r.out);
         r = plan(ct, ['--panel', 'high']);
-        ok('coding: variant 7, the plan says the coding is ok, the build proven', r.code === 0 && !!r.plan && (summaryOf(r.out) || {}).coding === 'ok' &&
-            (summaryOf(r.out) || {}).provenBuild === true, r.out);
-        [[function () { car.coding(9); }, 'KI_KOMBI_VARIANT 9 is not the proven cluster coding (7)', /^coding:\s+KI_KOMBI_VARIANT 9$/m, 'refused'],
+        ok('coding: variant 7, the plan says the coding is ok', r.code === 0 && !!r.plan && (summaryOf(r.out) || {}).coding === 'ok', r.out);
+        [[function () { car.coding(9); }, 'KI_KOMBI_VARIANT 9 is not the supported cluster coding (7)', /^coding:\s+KI_KOMBI_VARIANT 9$/m, 'refused'],
          [function () { car.coding(7, 0x0b); }, 'the cluster coding cannot be read (coding not valid (flags 0xb))', /^coding:\s+unreadable \(coding not valid/m, 'unreadable'],
          [function () { car.coding(null); }, 'the cluster coding cannot be read', /^coding:\s+unreadable \(.* unreadable\)$/m, 'unreadable']].forEach(function (c) {
             fresh();

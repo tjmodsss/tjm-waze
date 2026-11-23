@@ -18,6 +18,12 @@
  * Acquiring and Shown go to Parked when the display parks the scene, and
  * Lingering is released (Idle); Parked goes to Shown when the display shows
  * it, to Waiting when it is lost, and is released when nothing wants it.
+ * With a preload layer (Preload, below):
+ *
+ *   Idle --preload--> Loading --fetched--> Loaded --wanted: map, no fetch--> Acquiring
+ *                                            ^
+ *                                            +-- Lingering after linger_ms, or Parked not
+ *                                                wanted: unmapped, the fetch kept
  *
  * - The slot is requested when at least one layer wants it and released only
  *   when none has for linger_ms, so clients coming and going, or one
@@ -152,12 +158,13 @@
  *   asked for again on the ladder as any no answer, and counted, as is any
  *   no answer that follows it. From the second in a row its scene is
  *   unpublished, so the next request publishes it fresh; every
- *   kReconnectAfter-th in a row the unit reconnects its RAMSES framework
+ *   kReconnectAfter-th in a row of a wanted target (a load nothing wants
+ *   never counts) the unit reconnects its RAMSES framework
  *   (on_renderer_stuck): a display in that state ignored
  *   every later fetch of the participant session until a new one. The
  *   count starts over when a fetch of the target completes (on_fetched),
- *   when it is shown, while nothing wants it and when the display service
- *   goes away. A reconnect, for this or for a target not rendered (below),
+ *   when it is shown, while nothing wants it and no preload layer loads
+ *   it, and when the display service goes away. A reconnect, for this or for a target not rendered (below),
  *   goes at most once per kReconnectGapMs.
  * - Rendering: the display's renderer subscribes to a scene it is to draw,
  *   which the RAMSES client logs (ramses_console.h). A target the display
@@ -168,7 +175,13 @@
  *   at once the first time and on the ladder after that; from the second
  *   in a row its scene is unpublished, and every kReconnectAfter-th the
  *   unit reconnects (on_renderer_stuck). Before any subscription has been
- *   seen nothing is verified.
+ *   seen nothing is verified. A missing subscription counts only when the
+ *   console was there to log it (console_live_since): live without a break
+ *   since the target's last fetch (a request or a preload's load) or since
+ *   its renderer was read unsubscribing or gone (Target::watch_ms). The car's
+ *   DLT daemon turns RAMSES's console off and on while the service runs
+ *   (ramses_console.h): a subscription made while it is off is never read,
+ *   and such a showing is not verified (Unobservable) rather than released.
  * - Holds: a target that follows another (TargetSpec::follows) keeps its
  *   slot from the stock HMI while that target is shown and one of its
  *   take_over_contents is mapped in the slot (follow(), which keeps a
@@ -186,6 +199,49 @@
  *   for its slot (Refusal::NoSlot) is not asked for again until the service
  *   restarts.
  *
+ * - Preload: while a layer on the target has preload 1, visible or not, and
+ *   the port can keep a fetch with no map (Port::preloads), the target's
+ *   scene is kept fetched by the display. Not requested and not wanted, it
+ *   is published as at a request and fetched with no map (Port::load):
+ *   Loading, then Loaded once the fetch completes (on_fetched). Nothing of
+ *   it is on screen and its slot stays free for other content; its layers
+ *   are staged and flushed as for a shown target (flushing), so its scene
+ *   is current when it is mapped. A load goes by the rules of a request:
+ *   kMinRequestGapMs after the target's last request, once the last release
+ *   of its scene id is settled, not while the display service settles or
+ *   the boot hold lasts, not while its slot is reported locked, and not
+ *   while another target with its scene id is requested, kept, loaded or
+ *   wanted. A load the display refuses, or does not complete by
+ *   kStartTimeoutMs (a stalled fetch, as above), is asked again on the
+ *   ladder. Wanted while Loaded, the target maps the loaded scene with no
+ *   fetch (Port::remap) kMinRequestGapMs after its last request, unless
+ *   its slot is reported locked (it waits, "slot locked") or its holder is
+ *   yielded to, and goes on as any request (Acquiring, Parked, Shown); its
+ *   flushes go on while that map is outstanding. Not wanted for linger_ms,
+ *   or parked when nothing wants it, it is unmapped with its fetch kept
+ *   (Port::unmap) and Loaded again, the take-overs' count starting over as
+ *   at a release; one whose fetch the port has lost is released. Until a
+ *   table report has its own row unmapped, a row of its scene id in its
+ *   slot counts as ours (holder_of); one reported shown for kNotMappedMs
+ *   (the unmap not done) is released and loaded again on the ladder. A
+ *   target that leaves Loading before its fetch completes (a pop-up it
+ *   gives way to) is released and loaded again: Loaded always follows a
+ *   completed fetch. A kept target (Kept through a lock) nothing wants is
+ *   Loaded, its fetch kept. A lock leaves a Loaded target as it is: it is not mapped. With no
+ *   preload layer left, a Loading or Loaded target nothing wants is
+ *   released (unfetched) at once. A fetch the display drops while Loaded
+ *   (on_lost), or one loaded when the heartbeat replies stop (drop_kept),
+ *   is taken down and loaded again on the ladder, from where the ladder
+ *   stands, which starts over after kLadderResetMs loaded. A target wanted
+ *   and not requested whose scene id a Loading or Loaded target nothing
+ *   wants holds has that target released (give_way); it waits as "scene id
+ *   in use by another target". A port that cannot keep a fetch ignores
+ *   preload: the target is as with no preload layer. While the panel's
+ *   scene is mapped in 0x203 the display reports slot 0x200 (the stock
+ *   HMI's media widget) disabled, and available again right after the
+ *   unmap, before the unfetch (VERIFIED on the car): a loaded scene leaves
+ *   0x200 as it is (INFERRED). How long the display keeps a fetch it does
+ *   not map is CAR-ONLY.
  * - Incidents: a shown target (not a hold) that leaves Shown other than
  *   for its linger is one log line "INCIDENT target <name> lost: <why>, <the
  *   budget>, since-shown <s> s", why one of KOMBI removal, unmap, stream
@@ -195,8 +251,8 @@
  *   whose holder the next table report decides is logged once it has.
  *   Shown again: "INCIDENT target <name> back after <ms> ms, <path>", path
  *   fast re-map, full request or shown again by the display; released
- *   unwanted first: "INCIDENT target <name> not back: released after <ms>
- *   ms". A stalled fetch (above): "INCIDENT target <name> stalled: fetch
+ *   unwanted first, or Loading or Loaded (not on screen) unwanted: "INCIDENT
+ *   target <name> not back: released after <ms> ms". A stalled fetch (above): "INCIDENT target <name> stalled: fetch
  *   accepted but never completed ..."; a reconnect: "INCIDENT target <name>
  *   reconnecting the RAMSES framework: <why>". The wording stays: log
  *   exports grep for it.
@@ -312,6 +368,17 @@ public:
     virtual void take_over(const TargetSpec &t, uint64_t content) = 0;
     /* Ask for the slot table (SlotManager::on_slots). */
     virtual void refresh_slots() = 0;
+    /* The port can keep a target's scene fetched with no map: load() and
+     * unmap() do so (SlotManager "Preload"). */
+    virtual bool preloads() const { return false; }
+    /* Fetch t's published scene and keep it fetched, not mapped. Answered
+     * by SlotManager::on_fetched or on_refused; a fetch the display drops
+     * after that, by on_lost. Only when preloads(). */
+    virtual void load(const TargetSpec &) {}
+    /* Take t's mapped scene out of its slot and keep it fetched, for
+     * remap(). No answer is awaited. False, nothing sent: it is not
+     * fetched; the slot manager releases it. */
+    virtual bool unmap(const TargetSpec &) { return false; }
     /* Called on every tick while request(t) is unanswered and not given up. True: the
      * display accepted the request and only its showing is outstanding (a
      * display that is still starting accepts a map and shows nothing); the
@@ -355,7 +422,7 @@ public:
     virtual bool outdated(const TargetSpec &) const { return false; }
 };
 
-enum class TargetState { Idle, Acquiring, Parked, Shown, Lingering, Waiting, Unavailable };
+enum class TargetState { Idle, Acquiring, Parked, Shown, Lingering, Waiting, Unavailable, Loading, Loaded };
 const char *target_state_name(TargetState s);
 
 /* Whether the display's renderer draws a shown or lingering target: its
@@ -442,8 +509,9 @@ public:
     /* What the target's layers want, recomputed by the compositor each tick:
      * shown at all, whether a wanting layer contends with the stock HMI, lets
      * the holds that follow it hold (guide_hold) and lets it give way to the
-     * stock pop-ups (yield). */
-    void want(int target, bool wanted, bool contend, bool guide_hold = true, bool yield = true);
+     * stock pop-ups (yield), and whether any of its layers, visible or
+     * not, has preload 1 (Preload, above). */
+    void want(int target, bool wanted, bool contend, bool guide_hold = true, bool yield = true, bool preload = false);
     /* After the compositor's wants: each hold is wanted, contending, exactly
      * while the target it follows is shown and its wanting layers let it
      * hold (none has guide_hold false), one of take_over_contents is mapped
@@ -475,7 +543,7 @@ public:
      * for the status: what else the KOMBI shows while ours is up. */
     std::string table_text() const;
     void on_shown(uint64_t scene_id, int64_t now_ms);
-    /* The display completed the fetch of a requested scene. */
+    /* The display completed the fetch of a requested or loading scene. */
     void on_fetched(uint64_t scene_id, int64_t now_ms);
     /* Mapped, but parked invisible behind the content the slot shows. */
     void on_parked(uint64_t scene_id, int64_t now_ms);
@@ -483,7 +551,8 @@ public:
     void on_lost(uint64_t scene_id, const std::string &why, int64_t now_ms);
     void on_slots(const std::vector<SlotInfo> &slots, int64_t now_ms);
     /* The display may drop what it keeps (heartbeat replies stopped): every
-     * kept target released (Kept through a lock). */
+     * kept target released (Kept through a lock), every loaded one released
+     * and loaded again on the ladder (Preload). */
     void drop_kept(const char *why, int64_t now_ms);
 
     void tick(int64_t now_ms);
@@ -500,16 +569,19 @@ public:
     /* True when the target is requested (Acquiring, Parked, Shown,
      * Lingering): its layers are staged and flushed. */
     bool requested(int target) const { return t_[target].requested; }
-    /* Requested and staged: its layers' changes are flushed (not parked,
-     * not re-mapping a kept scene). */
+    /* Its scene is fetched, or being fetched, with no map (Loading,
+     * Loaded, or Waiting to be mapped): its layers are staged and flushed. */
+    bool loaded(int target) const { return t_[target].loaded; }
+    /* Requested and staged, or loaded: its layers' changes are flushed (not
+     * parked, not re-mapping a kept scene). */
     bool flushing(int target) const
     {
         const Target &t = t_[target];
-        return t.requested && !t.remap && t.status.state != TargetState::Parked;
+        return (t.requested && (!t.remap || t.from_load) && t.status.state != TargetState::Parked) || t.loaded;
     }
     /* Its scene is kept fetched through a lock, or mapped again after one:
      * the scene shows its last flush. */
-    bool kept(int target) const { return t_[target].kept || t_[target].remap; }
+    bool kept(int target) const { return t_[target].kept || (t_[target].remap && !t_[target].from_load); }
     /* True when the target's scene is published, requested or warm. */
     bool published(int target) const { return t_[target].scene; }
     /* The rendering state and its evidence; empty: none. */
@@ -534,6 +606,9 @@ public:
     std::function<void(Evidence, const std::string &detail, int64_t now_ms)> on_evidence;
     /* The RAMSES console's line counts (RamsesConsole::counts_text). */
     std::function<std::string(int64_t now_ms)> console_text;
+    /* Since when the RAMSES console has been live without a break, -1: not
+     * live now (RamsesConsole::live_since). Unset: always live. */
+    std::function<int64_t(int64_t now_ms)> console_live_since;
     /* The upload cap and ceiling for incident lines ("cap 5000 ceiling
      * 5500"). Unset: left out. */
     std::function<std::string()> budget_text;
@@ -564,8 +639,13 @@ private:
         bool fresh_retry = false;    /* the next request may go kFreshRetryMs after the last */
         int64_t shown_ms = 0;        /* the display showed it */
         int64_t check_ms = 0;        /* Checking since */
+        /* Its renderer's subscription is read from then on if the console is
+         * live: the last fetch asked for (request, load), or its renderer read
+         * unsubscribing or gone; -1: never. */
+        int64_t watch_ms = -1;
         int recoveries = 0;          /* releases for not rendering since it was last rendered */
         int no_fetch = 0;            /* stalled fetches in a row (above) */
+        int stuck = 0;               /* of them, those while wanted: the reconnects count these */
         int64_t since_ms = 0;        /* entered the current state */
         int64_t last_request_ms = -1000000;
         int ladder = 0;
@@ -629,6 +709,20 @@ private:
         /* A hold the lock that keeps the target it follows took too: held
          * until that target is neither kept nor re-mapping. */
         bool lock_hold = false;
+        /* A layer has preload 1 (want()). */
+        bool preload = false;
+        /* Its scene fetched, or being fetched, with no map (Preload): not
+         * requested; Loading, Loaded, or Waiting while wanted. */
+        bool loaded = false;
+        /* The outstanding re-map is of a loaded scene: flushes go on. */
+        bool from_load = false;
+        /* Loaded: the fetch completed (or was kept from a mapping). */
+        bool load_done = false;
+        /* Loaded by an unmap, and no table report has had its row unmapped
+         * since: a row of its scene id in its slot is its own; mapped since
+         * mapped_ms (-1: not reported mapped). */
+        bool unmapping = false;
+        int64_t still_mapped_ms = -1;
     };
 
     /* The renderers subscribed to one of our scenes since it was published:
@@ -650,6 +744,23 @@ private:
     void remap(int i, int64_t now_ms);
     /* A kept target whose slot is back may be mapped again now. */
     bool remap_due(int i, int64_t now_ms);
+    /* Preload (above): the target keeps a fetch, the port can keep one. */
+    bool loads(int i) const { return t_[i].preload && port_->preloads(); }
+    /* Published as at a request and fetched with no map: Loading. */
+    void load(int i, int64_t now_ms);
+    /* A mapped target nothing wants unmapped, its fetch kept: Loaded. False,
+     * nothing done: the port has lost the fetch. */
+    bool unmap(int i, int64_t now_ms);
+    /* A Loading, Loaded or Waiting loaded target's tick. */
+    void tick_loaded(int i, int64_t now_ms, bool *poll_slots);
+    /* Loaded targets not wanted that hold target i's scene id are released
+     * for it. */
+    void give_way(int i, int64_t now_ms);
+    /* Another target with i's scene id is wanted. */
+    bool scene_wanted(int i) const;
+    /* The scene published for a request or a load; false: it could not
+     * be, the target waits on the ladder. */
+    bool prepare(int i, int64_t now_ms);
     /* The slot's lock is reported, and that report still trusted
      * (lock_holds). */
     bool lock_trusted(int i, int64_t now_ms) const;
@@ -662,6 +773,8 @@ private:
      * and its renderer has unsubscribed, or neither is awaited any longer. */
     bool settled(int i, int64_t now_ms) const;
     bool subscribed(uint64_t scene_id) const;
+    /* A missing subscription of t's scene would have been read (console_live_since, watch_ms). */
+    bool watching(const Target &t, int64_t now_ms) const;
     int64_t gap(int i) const { return t_[i].fresh_retry ? kFreshRetryMs : kMinRequestGapMs; }
     /* Moves the rendering state on; a shown target not rendered is
      * released and asked for again. */
@@ -709,7 +822,8 @@ private:
     void settle_loss(int i, Holder h, bool removal, const std::string &reason, int64_t now_ms, int64_t lost_ms);
     bool yields(int i, int64_t now_ms);
     int by_scene(uint64_t scene_id) const;
-    /* The target requested or kept with that scene id; -1: none. */
+    /* The target requested or kept with that scene id, or loaded by an
+     * unmap the table has not shown yet (unmapping); -1: none. */
     int by_held(uint64_t scene_id) const;
     bool scene_busy(int i) const;
     /* The slot's status from its latest rows; -1: not reported. */
@@ -766,6 +880,7 @@ private:
     std::map<uint64_t, Subscribers> subs_;   /* by published scene id */
     uint64_t sub_lines_ = 0;                 /* subscription lines seen, any scene */
     bool unobservable_logged_ = false;
+    bool console_live_ = true;               /* console_live_since, as last logged */
     /* Why the next loss of a shown target is, when its state does not say. */
     std::string loss_hint_;
 };

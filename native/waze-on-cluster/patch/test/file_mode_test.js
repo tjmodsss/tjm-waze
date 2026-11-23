@@ -13,13 +13,13 @@
 
 var assert = require('assert');
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
 var fileMode = require('../file_mode.js');
 
 process.umask(0o077);
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-file-mode-'));
+var dir = tmp.dir();
 var checks = 0;
 function check(name, fn) { fn(); checks++; console.log('ok   ' + name); }
 function mode(f) { return fs.statSync(f).mode & 0o7777; }

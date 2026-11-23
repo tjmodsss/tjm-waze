@@ -27,9 +27,10 @@
 
 require('./head_unit_env.js');   /* a HIGH head unit, for patchd's hooks */
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
+var releaseTags = require('./release_tags.js');
 
 var PATCHD = path.join(__dirname, '..', 'patchd.js');
 var REPO = path.join(__dirname, '..', '..', '..', '..');
@@ -44,17 +45,10 @@ function git(args) { return cp.execFileSync('git', args, { cwd: REPO, encoding: 
 /* ---- the releases ------------------------------------------------------- */
 
 function cmp(a, b) { a = a.split('.').map(Number); b = b.split('.').map(Number); for (var i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i]; return 0; }
-function tags() {
-    try { return git(['tag', '-l', 'waze-on-cluster@*']).split('\n').filter(Boolean); } catch (e) { return null; }
-}
-var list = tags();
+var list = releaseTags.list();
 if (list === null) { process.stdout.write('SKIP: not in a git checkout\n'); process.exit(0); }
-if (!list.length) {
-    var shallow = false;
-    try { shallow = git(['rev-parse', '--is-shallow-repository']).trim() === 'true'; } catch (e) {}
-    try { git(['fetch', '--no-tags'].concat(shallow ? ['--depth=1'] : [], ['origin', '+refs/tags/waze-on-cluster@*:refs/tags/waze-on-cluster@*'])); } catch (e) {}
-    list = tags() || [];
-}
+/* none, or only those earlier_patcher.js fetched */
+if (list.indexOf('waze-on-cluster@0.5.0') < 0) { releaseTags.fetch('waze-on-cluster@*'); list = releaseTags.list() || []; }
 var RELEASES = list.map(function (t) { return t.slice('waze-on-cluster@'.length); }).filter(function (v) { return /^\d+\.\d+\.\d+$/.test(v); }).sort(cmp);
 ok('every release from 0.5.0 to 0.10.9 is at hand', ['0.5.0', '0.10.7', '0.10.8', '0.10.9'].every(function (v) { return RELEASES.indexOf(v) >= 0; }),
     RELEASES.join(' '));
@@ -115,12 +109,7 @@ OPT_IN.forEach(function (k) {
 
 /* ---- this version's patchd on a temporary /var/opt/waze-on-cluster ------- */
 
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-rollback-conf-'));
-var children = [];
-process.on('exit', function () {
-    children.forEach(function (c) { try { c.kill('SIGKILL'); } catch (e) {} });
-    try { cp.execFileSync('rm', ['-rf', dir]); } catch (e) {}
-});
+var dir = tmp.dir();
 var STATE = path.join(dir, 'state'), LOCAL = path.join(STATE, 'waze-on-cluster.local.conf'), FEATURES = path.join(STATE, 'features.conf');
 var MAP_STATE = path.join(STATE, 'map.state.conf');
 var SOCK = path.join(dir, 'shm', 'patch.sock');
@@ -160,7 +149,6 @@ function hook(which) {
 async function boot() {
     try { fs.unlinkSync(SOCK); } catch (e) {}
     var c = cp.spawn(process.execPath, [PATCHD], { env: ENV, stdio: 'ignore' });
-    children.push(c);
     for (var t = 0; t < 10000 && !fs.existsSync(SOCK); t += 50) await sleep(50);
     var up = fs.existsSync(SOCK);
     c.kill('SIGKILL');

@@ -60,6 +60,14 @@
  *   host's rect with the host's part of the picture, its own slot released;
  *   hidden by the host, no layer and nothing sent; shown again; the host
  *   gone, back on its own target; no part asked of the decoder (by default);
+ *   a host whose place cannot be drawn (its part misses the map, its rect
+ *   too small): on its own target instead;
+ * - hosted by a theme's layers, no scene (layers_hosting): in the panel at
+ *   the host's rect, its layer marked as the hosted map and so under the
+ *   theme's layers; back on its own target while
+ *   they are hidden and once the theme is gone;
+ * - the cluster's map hosted (hosted_wake): a frame with the scaling worker
+ *   wakes the service's loop to take it, and its part is drawn;
  * - hosted with hosted_vpp_scale (vpp_hosting): the host's part asked of the
  *   decoder at the size it is shown at, a whole frame meanwhile scaled by
  *   the worker, a VPP-made one sent as it is, one of another part dropped,
@@ -107,6 +115,15 @@ static void ok(const char *name, bool cond)
 
 static int rigs;
 static const uint64_t kBox = 0x01000310, kGuide = 0x010004f1;
+
+/* The feed's worker is still scaling a frame, or has one to take: the feed
+ * then asks to be woken in kScaleWaitMs however much later it is asked,
+ * while a frame due in kScaleWaitMs asks for a millisecond less a
+ * millisecond later. */
+template <class Feed> static bool scaling(const Feed &feed, int64_t now)
+{
+    return feed.wake_in_ms(now) == MapFeed::kScaleWaitMs && feed.wake_in_ms(now + 1) == MapFeed::kScaleWaitMs;
+}
 
 struct Rig {
     std::string path = "/tmp/woc-feed-test-" + std::to_string(getpid()) + "-" + std::to_string(++rigs) + ".sock";
@@ -177,7 +194,9 @@ struct Rig {
         if (!svc->start(&err))
             std::printf("start: %s\n", err.c_str());
     }
-    /* Simulated time; each step runs the socket exchange until idle. */
+    /* Simulated time; each step runs the socket exchange until idle, and
+     * until the scaling worker (its own thread, in real time) has nothing
+     * left for the feed to take, as the service's loop wakes for it. */
     void pump(int64_t ms, const std::vector<uint8_t> *frame = nullptr, int64_t frame_every = 65)
     {
         for (int64_t t = 0; t < ms; t += 5) {
@@ -204,7 +223,7 @@ struct Rig {
                 watch.live(on, now);
                 feed->set_stream(on, watch.frozen(now), watch.picture(now));
             }
-            for (int round = 0; round < 400; round++) {
+            for (int round = 0, waits = 0; round < 400; round++) {
                 std::vector<pollfd> fds;
                 size_t first = 0;
                 if (svc)
@@ -218,7 +237,14 @@ struct Rig {
                 feed->poll(now);
                 if (other)
                     other->poll(now);
-                if (round > 0 && n <= 0 && !pending)
+                /* at most 2 s of real time a step for the worker */
+                const bool wait = scaling(*feed, now) && waits < 2000;
+                if (wait) {
+                    usleep(1000);
+                    waits++;
+                    round--;
+                }
+                if (round > 0 && n <= 0 && !pending && !wait)
                     break;
             }
         }
@@ -299,14 +325,6 @@ static void guide_hold()
 
 }
 
-/* The HUD's worker is still scaling a frame: the feed then asks to be woken
- * in kScaleWaitMs however much later it is asked, while a frame due in
- * kScaleWaitMs asks for a millisecond less a millisecond later. */
-static bool hud_scaling(const MapFeeds &feeds, int64_t now)
-{
-    return feeds.wake_in_ms(now) == MapFeed::kScaleWaitMs && feeds.wake_in_ms(now + 1) == MapFeed::kScaleWaitMs;
-}
-
 /* The app's Off (MapFeeds on neither), as the app sends it: from the cluster
  * alone the cluster off; from both each off. Off releases the map's slot and
  * the turn box's hold, so the stock map and box show again, and the HUD's
@@ -344,13 +362,13 @@ static void show_off()
                 b.port.tick(b.now);
                 b.svc->after_poll(fds, first, b.now);
                 const bool pending = (feeds.cluster() && feeds.cluster()->wants_write()) || (feeds.hud_feed() && feeds.hud_feed()->wants_write());
-                const bool scaling = hud_scaling(feeds, b.now);
-                if (scaling)
+                const bool busy = scaling(feeds, b.now);
+                if (busy)
                     usleep(1000);
                 feeds.poll(b.now);
                 for (int i = 0; i < 4; i++)
                     asked = asked || b.svc->slots().requested(i);
-                if (round > 0 && n <= 0 && !pending && !scaling)
+                if (round > 0 && n <= 0 && !pending && !busy)
                     break;
             }
         }
@@ -562,9 +580,172 @@ static void hosting()
        r.st().hosted && placed && placed->params.rect.x == 836 && placed->params.rect.y == 220 &&
            placed->params.rect.w == 272 && placed->params.rect.h == 120 &&
            r.drawing("panel", f, &with));
+
+    /* A host whose place cannot be drawn: the map stays on its own target,
+     * never nowhere. */
+    cr::Host missing = whole;
+    missing.src_x = 0; missing.src_y = 0; missing.src_w = 200; missing.src_h = 100;   /* outside the half-size map */
+    design.host(sc2, missing);
+    r.pump(2500, &f);
+    ok("a host's part that misses the map: the map on its own target instead",
+       r.st().state == "showing" && r.st().target == "map" && !r.st().hosted && r.drawing("map", f, &with));
+    cr::Host tiny = whole;
+    tiny.w = 40; tiny.h = 20;
+    design.host(sc2, tiny);
+    r.pump(2500, &f);
+    ok("a host's rect too small for the map: the map on its own target instead",
+       r.st().state == "showing" && r.st().target == "map" && !r.st().hosted && r.drawing("map", f, &with));
+    design.host(sc2, whole);
+    r.pump(2500, &f);
+    ok("a host that can be drawn again: hosted again", r.st().hosted && r.st().target == "panel");
     design.drop(sc2);
     r.pump(500, &f);
     r.other = nullptr;
+    const int removed = std::system(("rm -rf " + root).c_str());
+    (void)removed;
+}
+
+/* A theme drawing the panel with layers only hosting the map, no scene
+ * (cluster-render PROTOCOL.md "Hosting from layers"): the map moves into the
+ * panel at the host's rect, with the host's part, its own slot released,
+ * and, its layer marked as the hosted map, is drawn under the theme's
+ * layers though made after them; every theme layer hidden: back on its own
+ * target; shown: hosted again; the theme gone: back on its own target.
+ * Nothing in the feed knows the host has no scene. */
+static void layers_hosting()
+{
+    const std::vector<uint8_t> f = atlas(5);
+    Rig r;
+    r.pump(2000, &f);
+    ok("layer host: the map shown on its own target", r.st().state == "showing" && r.st().target == "map" &&
+                                                          !r.st().hosted);
+    std::unique_ptr<cr::Client> theme(new cr::Client("theme", r.path));
+    r.other = theme.get();
+    r.pump(100, &f);
+    const cr::EffectOptions fx{"#version 100\nvoid main(){gl_FragColor=vec4(0.0);}", "", 0};
+    cr::LayerOptions bg, frame;
+    bg.target = frame.target = "panel";
+    frame.x = 690; frame.y = 150; frame.w = 580; frame.h = 420;
+    const uint32_t bg_ref = theme->effect(bg, fx), frame_ref = theme->effect(frame, fx);
+    r.pump(1500, &f);
+    cr::Host h;
+    h.into = "panel";
+    h.target = "map";
+    h.x = 700; h.y = 160; h.w = 560; h.h = 400;
+    h.src_x = 264; h.src_y = 40; h.src_w = 560; h.src_h = 400;
+    theme->host(h);
+    r.pump(2500, &f);
+    bool with = false;
+    const int map_i = r.svc->slots().index("map");
+    crs::FakeGraph *g = r.gpu.graph("panel");
+    const std::vector<int> stack = g ? g->visible() : std::vector<int>();
+    const bool under = stack.size() == 3 && g->shown.quads.at(stack[0]).r.x == 700 &&
+                       g->shown.quads.at(stack[0]).r.w == 560 && g->shown.quads.at(stack[1]).r.w == 1920 &&
+                       g->shown.quads.at(stack[2]).r.w == 580;
+    ok("layer host: the map in the panel at the host's rect with its part, under the theme's background and frame, "
+       "the map's slot released",
+       r.st().state == "showing" && r.st().target == "panel" && r.st().hosted &&
+           r.drawing("panel", crop_of(f, 264, 40, 560, 400), &with) && with && under &&
+           r.svc->slots().status(map_i).state == crs::TargetState::Idle);
+
+    bg.visible = frame.visible = false;
+    theme->set(bg_ref, bg);
+    theme->set(frame_ref, frame);
+    r.pump(2500, &f);
+    ok("layer host: every theme layer hidden: the map on its own target again",
+       r.st().state == "showing" && r.st().target == "map" && !r.st().hosted && r.drawing("map", f, &with) && with);
+    bg.visible = frame.visible = true;
+    theme->set(bg_ref, bg);
+    theme->set(frame_ref, frame);
+    r.pump(2500, &f);
+    ok("layer host: shown again: hosted again", r.st().target == "panel" && r.st().hosted);
+
+    r.other = nullptr;
+    theme.reset();
+    r.pump(2500, &f);
+    ok("layer host: the theme gone: the map on its own target again",
+       r.st().state == "showing" && r.st().target == "map" && !r.st().hosted && r.drawing("map", f, &with) && with);
+}
+
+/* The cluster's map hosted (MapFeeds, as the service runs it): its worker
+ * scales the host's part, so the service's loop is woken (wake_in_ms) to
+ * take the scaled frame and draws it without waiting for another frame. */
+static void hosted_wake()
+{
+    char tmpl[] = "/tmp/woc-hosted-wake-XXXXXX";
+    const std::string root = mkdtemp(tmpl) ? tmpl : "/nonexistent";
+    const std::string file = root + "/design.scene";
+    std::ofstream(file) << "scene 0x010004f8\nnode plate -\npass main\n";
+    chmod(file.c_str(), 0644);
+    const std::vector<uint8_t> f = atlas(5), f2 = atlas(6);
+    Rig r;
+    r.feed.reset();
+    r.sc.targets[1].scene_files = true;
+    r.sc.scene_files.root = root;
+    r.sc.scene_files.owner = getuid();
+    r.start();
+    FeedConfig fc;
+    fc.socket = r.path;
+    fc.video.level_bits = 0;
+    MapFeeds feeds(fc, true, false, 10);
+    feeds.set_stream(true, false, Picture::Shown);
+    cr::Client design("design", r.path);
+    std::vector<uint8_t> spare;
+    /* as the service's loop: woken for the feeds' wake_in_ms (real time,
+     * at most 2 s a step) */
+    const auto pump = [&](int64_t ms, const std::vector<uint8_t> *frame) {
+        for (int64_t t = 0; t < ms; t += 5) {
+            r.now += 5;
+            if (frame && t % 65 == 0) {
+                spare = *frame;
+                feeds.offer(&spare, (uint64_t)r.now, r.now);
+            }
+            for (int round = 0, waits = 0; round < 400; round++) {
+                std::vector<pollfd> fds;
+                const size_t first = r.svc->poll_fds(&fds);
+                const int n = ::poll(fds.data(), fds.size(), 0);
+                r.port.tick(r.now);
+                r.svc->after_poll(fds, first, r.now);
+                const bool pending = feeds.cluster()->wants_write() || design.wants_write();
+                feeds.poll(r.now);
+                design.poll(r.now);
+                const bool wait = scaling(feeds, r.now) && waits < 2000;
+                if (wait) {
+                    usleep(1000);
+                    waits++;
+                    round--;
+                }
+                if (round > 0 && n <= 0 && !pending && !wait)
+                    break;
+            }
+        }
+    };
+    pump(1000, &f);
+    cr::SceneOptions so;
+    so.target = "panel";
+    so.file = file;
+    so.sha256 = {crs::sha256_file(file)};
+    so.layers = true;
+    const uint32_t sc = design.scene(so);
+    pump(500, &f);
+    cr::Host h;
+    h.target = "map";
+    h.x = 700; h.y = 160; h.w = 560; h.h = 400;
+    h.src_x = 264; h.src_y = 40; h.src_w = 560; h.src_h = 400;
+    design.host(sc, h);
+    pump(2500, &f);
+    ok("hosted cluster map: shown in the host's scene", feeds.status("decode").state == "showing" &&
+                                                          feeds.status("decode").hosted);
+    pump(200, nullptr);   /* the worker's last frame taken, the next one due */
+    spare = f2;
+    feeds.offer(&spare, (uint64_t)r.now, r.now);
+    ok("hosted cluster map: a frame with its worker wakes the service's loop to take it",
+       scaling(*feeds.cluster(), r.now) && feeds.wake_in_ms(r.now) == MapFeed::kScaleWaitMs);
+    pump(500, nullptr);
+    bool with = false;
+    ok("hosted cluster map: that frame's part drawn", r.drawing("panel", crop_of(f2, 264, 40, 560, 400), &with) && with);
+    design.drop(sc);
+    pump(500, &f2);
     const int removed = std::system(("rm -rf " + root).c_str());
     (void)removed;
 }
@@ -619,12 +800,7 @@ static void vpp_hosting()
 
     const std::vector<uint8_t> p2 = crop_of(f2, 264, 40, 560, 400), p3 = crop_of(f3, 264, 40, 560, 400);
     r.part = want;
-    r.pump(200, &p2);
-    /* a whole frame the worker still had, done and taken (its own thread) */
-    for (int i = 0; i < 2000 && r.feed->wake_in_ms(r.now) == MapFeed::kScaleWaitMs; i++) {
-        usleep(1000);
-        r.pump(5);
-    }
+    r.pump(200, &p2);   /* a whole frame the worker still had, done and taken */
     const uint64_t scaled = r.feed->scaled_frames();
     r.pump(1300, &p2);
     ok("vpp: a frame of the part sent as it is, not through the worker",
@@ -959,6 +1135,8 @@ int main()
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, nullptr, _IONBF, 0);
     hosting();
+    layers_hosting();
+    hosted_wake();
     vpp_hosting();
     always_packed_map();
     old_renderer();
@@ -1003,8 +1181,11 @@ int main()
     std::vector<uint8_t> b2 = f2, b3 = f3;
     r.feed->offer(&b2, 2, r.now);
     r.feed->offer(&b3, 3, r.now);
-    ok("a frame is taken without a copy: an earlier frame's buffer comes back for each, the last sent kept",
-       b2.size() == f2.size() && b3.size() == f3.size() && b2 == f1 && b3 == f1);
+    /* b2 takes the place of the frame sent last, whose buffer comes back. Whether one comes back for b3 too
+     * depends on the socket: f2 goes whole at once into a large send buffer, freeing an earlier buffer, and is
+     * still on its way with a small one (the car's), when b3 gets a new buffer (client.h, frame()). Never a copy. */
+    ok("a frame is taken without a copy: an earlier frame's buffer comes back, then one of them or a new one",
+       b2.size() == f2.size() && b3.size() == f3.size() && b2 == f1 && b3 != f2 && b3 != f3);
     r.pump(200);
     g = r.gpu.graph("map");
     bool newest = false, stale = false;
@@ -1266,12 +1447,12 @@ int main()
                 b.port.tick(b.now);
                 b.svc->after_poll(fds, first, b.now);
                 const bool pending = (feeds.cluster() && feeds.cluster()->wants_write()) || (feeds.hud_feed() && feeds.hud_feed()->wants_write());
-                const bool scaling = hud_scaling(feeds, b.now);
-                if (scaling)
+                const bool busy = scaling(feeds, b.now);
+                if (busy)
                     usleep(1000);
                 feeds.poll(b.now);
                 hud_asked = hud_asked || b.svc->slots().requested(2);
-                if (round > 0 && n <= 0 && !pending && !scaling)
+                if (round > 0 && n <= 0 && !pending && !busy)
                     break;
             }
         }

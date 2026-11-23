@@ -126,6 +126,38 @@ namespace ramses
         RAMSES19_LIBRARY_OWNED(TextureSampler);
     };
 
+    class RenderBuffer : public SceneObject
+    {
+    public:
+        uint32_t getWidth() const;
+        uint32_t getHeight() const;
+        ERenderBufferType getBufferType() const;
+        ERenderBufferFormat getBufferFormat() const;
+        ERenderBufferAccessMode getAccessMode() const;
+        uint32_t getSampleCount() const;
+        RAMSES19_LIBRARY_OWNED(RenderBuffer);
+    };
+
+    class RenderTarget : public SceneObject
+    {
+    public:
+        uint32_t getWidth() const;
+        uint32_t getHeight() const;
+        RAMSES19_LIBRARY_OWNED(RenderTarget);
+    };
+
+    // A value class like EffectDescription (its constructor 0x1e7140 has the
+    // same shape: StatusObject base, impl copied to [this+0x10]); no
+    // exported destructor, so StatusObject's releases the impl.
+    class RenderTargetDescription : public StatusObject
+    {
+    public:
+        RenderTargetDescription();
+        ~RenderTargetDescription() {}
+        status_t addRenderBuffer(const RenderBuffer& renderBuffer);
+        RAMSES19_VALUE_STORAGE(RenderTargetDescription);
+    };
+
     class DataObject : public SceneObject { public: RAMSES19_LIBRARY_OWNED(DataObject); };
 
     class DataFloat : public DataObject
@@ -182,6 +214,7 @@ namespace ramses
         status_t setBlendingFactors(EBlendFactor srcColor, EBlendFactor destColor, EBlendFactor srcAlpha, EBlendFactor destAlpha);
         status_t getBlendingFactors(EBlendFactor& srcColor, EBlendFactor& destColor, EBlendFactor& srcAlpha, EBlendFactor& destAlpha) const;
         status_t setBlendingOperations(EBlendOperation operationColor, EBlendOperation operationAlpha);
+        status_t getBlendingOperations(EBlendOperation& operationColor, EBlendOperation& operationAlpha) const;
         status_t setDepthFunction(EDepthFunc func);
         status_t getDepthFunction(EDepthFunc& depthFunc) const;
         status_t setDepthWrite(bool enable);
@@ -190,6 +223,7 @@ namespace ramses
         status_t getCullingMode(ECullMode& mode) const;
         status_t setDrawMode(EDrawMode mode);
         status_t setColorWriteMask(bool writeRed, bool writeGreen, bool writeBlue, bool writeAlpha);
+        status_t getColorWriteMask(bool& writeRed, bool& writeGreen, bool& writeBlue, bool& writeAlpha) const;
         status_t setStencilFunction(EStencilFunc func, uint32_t ref, uint8_t mask);
         status_t setStencilOperation(EStencilOperation sfail, EStencilOperation dpfail, EStencilOperation dppass);
 
@@ -264,6 +298,8 @@ namespace ramses
         status_t setRenderOnce(bool enable);
         bool isRenderOnce() const;
         status_t retriggerRenderOnce();
+        status_t setRenderTarget(RenderTarget* renderTarget);
+        const RenderTarget* getRenderTarget() const;
         RAMSES19_LIBRARY_OWNED(RenderPass);
     };
 
@@ -287,6 +323,14 @@ namespace ramses
                                              uint32_t anisotropyLevel = 1, const char* name = nullptr);
         Texture2DBuffer* createTexture2DBuffer(uint32_t mipLevelCount, uint32_t width, uint32_t height,
                                                ETextureFormat textureFormat, const char* name = nullptr);
+        TextureSampler* createTextureSampler(ETextureAddressMode wrapUMode, ETextureAddressMode wrapVMode,
+                                             ETextureSamplingMethod samplingMethod, const RenderBuffer& renderBuffer,
+                                             uint32_t anisotropyLevel = 1, const char* name = nullptr);
+        // sampleCount 0: not multisampled.
+        RenderBuffer* createRenderBuffer(uint32_t width, uint32_t height, ERenderBufferType bufferType,
+                                         ERenderBufferFormat bufferFormat, ERenderBufferAccessMode accessMode,
+                                         uint32_t sampleCount = 0u, const char* name = nullptr);
+        RenderTarget* createRenderTarget(const RenderTargetDescription& rtDesc, const char* name = nullptr);
 
         DataFloat* createDataFloat(const char* name = nullptr);
         DataInt32* createDataInt32(const char* name = nullptr);

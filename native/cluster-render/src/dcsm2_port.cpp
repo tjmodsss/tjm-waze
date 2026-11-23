@@ -94,6 +94,31 @@ void Dcsm2Port::request(const TargetSpec &t)
     wire_->fetch(t.scene_id);
 }
 
+void Dcsm2Port::load(const TargetSpec &t)
+{
+    request(t);
+    contents_[t.scene_id].load = true;
+}
+
+bool Dcsm2Port::unmap(const TargetSpec &t)
+{
+    auto it = contents_.find(t.scene_id);
+    if (!up_ || it == contents_.end() || !it->second.fetched ||
+        (it->second.phase != Phase::Mapping && it->second.phase != Phase::Mapped && it->second.phase != Phase::Parked))
+        return false;
+    Content &c = it->second;
+    if (c.map_asked) {
+        unmaps_.push_back(Unmap{t.scene_id, 0});
+        wire_->unmap(t.scene_id);
+    }
+    c.phase = Phase::Kept;
+    c.map_asked = false;
+    c.accepted_ms = -1;
+    log_info("dcsm: content 0x%llx: unmapped from slot 0x%llx, kept fetched", (unsigned long long)t.scene_id,
+             (unsigned long long)c.spec.slot);
+    return true;
+}
+
 void Dcsm2Port::release(const TargetSpec &t)
 {
     auto it = contents_.find(t.scene_id);
@@ -295,6 +320,14 @@ void Dcsm2Port::on_fetch_status(uint64_t scene, uint32_t status, int64_t now_ms)
     case dcsm::E_FETCH_STATUS_FETCHED:
         if (c.phase != Phase::Fetching)
             break;
+        if (c.load) {
+            c.phase = Phase::Kept;
+            c.fetched = true;
+            log_info("dcsm: content 0x%llx: fetched, kept unmapped", (unsigned long long)scene);
+            if (manager_)
+                manager_->on_fetched(scene, now_ms);
+            break;
+        }
         if (manager_)
             manager_->on_fetched(scene, now_ms);
         c.phase = Phase::Mapping;
@@ -321,6 +354,8 @@ void Dcsm2Port::on_fetch_status(uint64_t scene, uint32_t status, int64_t now_ms)
                 manager_->on_lost(scene, "fetch removed", now_ms);
         } else if (c.phase == Phase::Fetching || c.phase == Phase::Mapping) {
             refuse(scene, c, Refusal::Transient, "fetch removed", now_ms);
+        } else if (c.phase == Phase::Kept && manager_) {
+            manager_->on_lost(scene, "fetch removed", now_ms);
         }
         break;
     default:

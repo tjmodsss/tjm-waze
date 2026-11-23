@@ -100,7 +100,28 @@
  * over after a fetch completes, a showing, or while not wanted. The boot
  * hold: nothing asked for before the stock HMI's content is mapped (our own
  * scene ids not counting) or 10 s; at once when it is, at 1 s when the
- * first table has it, and no hold without a slot table. */
+ * first table has it, and no hold without a slot table. Preload, with a
+ * port that keeps a fetch unmapped: the first preload layer publishes the
+ * scene and fetches it with no map (loading, then loaded), staged and
+ * flushed, with no traffic after; wanted, the loaded scene is mapped with
+ * no fetch; its linger over, or parked with nothing wanting it, it is
+ * unmapped and loaded again, or released when the port has lost the
+ * fetch; the last preload layer gone releases it; a warm scene's resend
+ * is charged at the load's fetch; a fetch the display drops, a refused or
+ * stalled load and the heartbeat replies stopping load it again on the
+ * ladder (no incident; a stall counted), which starts over after 30 s
+ * loaded; the display service gone and back loads it after the settle
+ * time; a target wanting its scene id has it released first, and no load
+ * goes while that target is wanted or holds the id; a lock leaves it
+ * loaded, and wanted then it waits until the slot is back; a kept target
+ * nothing wants is loaded; a pop-up while loading releases the load,
+ * never loaded without a fetch; after an unmap a report of its own row
+ * still mapped counts as ours, and one that stays so 3 s releases it and
+ * loads it again on the ladder; stalled loads nothing wants never
+ * reconnect the framework, a wanted target's third stall in a row does. A
+ * target with no preload layer, or a port that cannot keep a fetch, is as
+ * without preload, also waiting on the ladder while another target with
+ * its scene id is wanted. */
 #include <cstdio>
 #include <map>
 #include <sstream>
@@ -186,6 +207,16 @@ struct FakePort : Port {
     /* The boot hold applies (Port::slot_table). */
     bool table = false;
     bool slot_table() const override { return table; }
+    /* Preload (Port::preloads): a load is a fetch alone; an unmap keeps the
+     * fetch, false once the display has dropped it (!fetched). */
+    bool preloads_ok = false;
+    bool preloads() const override { return preloads_ok; }
+    void load(const TargetSpec &t) override { calls.push_back("load " + t.name); }
+    bool unmap(const TargetSpec &t) override
+    {
+        calls.push_back("unmap " + t.name + (fetched ? "" : " (not fetched)"));
+        return fetched;
+    }
 };
 
 struct FakeScenes : Scenes {
@@ -1640,6 +1671,64 @@ static void rendering()
     u.run(1600);
     ok("a subscription line of any scene makes subscriptions observable; one the client did not know is not ours",
        calls_are("release map; request map"));
+}
+
+
+/* The RAMSES console the car's DLT daemon turns off and on (console_live_since): a subscription line read once,
+ * then the console quiet, a shown map whose subscription is not read is not released (the car, 2026-11-23: every
+ * showing released 1.5 s after it for 8 min); live again, a map fetched in the quiet stays; its renderer read
+ * unsubscribing, or a fetch made while live and not subscribed, is released as before; the console going quiet
+ * during the check stops it; with no console_live_since it is checked as before. */
+static void quiet_console()
+{
+    int64_t since = -1;
+    Rig r;
+    r.m.console_live_since = [&since](int64_t) { return since; };
+    r.m.on_subscription(0x01000300, true, false, kRenderer, r.now);   /* subscription lines are readable */
+    r.m.want(0, true, false);
+    r.m.tick(r.now);
+    r.m.on_shown(kMapScene, r.now);
+    joined();
+    r.run(10000);
+    ok("quiet console: a shown map whose subscription is not read is kept, not verified",
+       calls_are("") && r.state(0) == TargetState::Shown && r.m.status(0).rendering == Rendering::Unobservable);
+    since = r.now;
+    r.run(5000);
+    ok("live again: the map fetched while it was quiet stays", calls_are("") && r.state(0) == TargetState::Shown);
+    r.m.on_subscription(kMapScene, false, false, kRenderer, r.now);
+    r.run(1480);
+    ok("its renderer read unsubscribing while live: checking", calls_are("") &&
+                                                                    r.m.status(0).rendering == Rendering::Checking);
+    r.run(40);
+    ok("not subscribed again 1.5 s on: released and asked for again at once", calls_are("release map; request map"));
+    r.run(200);
+    r.m.on_shown(kMapScene, r.now);
+    r.run(1510);
+    ok("fetched while live and not subscribed: released again, on the ladder",
+       joined().find("release map") != std::string::npos && r.state(0) == TargetState::Waiting);
+
+    Rig q;
+    q.m.console_live_since = [&since](int64_t) { return since; };
+    since = q.now - 1000;
+    q.m.on_subscription(0x01000300, true, false, kRenderer, q.now);
+    q.m.want(0, true, false);
+    q.m.tick(q.now);
+    q.m.on_shown(kMapScene, q.now);
+    joined();
+    q.run(1000);
+    since = -1;
+    q.run(5000);
+    ok("the console quiet during the check: not released", calls_are("") && q.state(0) == TargetState::Shown &&
+                                                              q.m.status(0).rendering == Rendering::Unobservable);
+
+    Rig n;
+    n.m.on_subscription(0x01000300, true, false, kRenderer, n.now);
+    n.m.want(0, true, false);
+    n.m.tick(n.now);
+    n.m.on_shown(kMapScene, n.now);
+    joined();
+    n.run(1510);
+    ok("no console_live_since: checked as before", calls_are("release map; request map"));
 }
 
 /* The lines logged since the last call. */
@@ -3986,6 +4075,454 @@ static void boot_hold()
     ok("no slot table: asked for at 1 s", calls_are("publish map; request map"));
 }
 
+/* Preload: rigs whose port can keep a fetch unmapped. The panel (1) has
+ * the HUD's (2) scene id in this rig. */
+struct PreloadRig : Rig {
+    PreloadRig() { port.preloads_ok = true; }
+    /* What the panel's layers want: shown, and a preload layer. */
+    void panel(bool wanted, bool preload) { m.want(1, wanted, false, true, true, preload); }
+    /* The panel preloaded: fetched, not mapped. */
+    void loaded()
+    {
+        panel(false, true);
+        m.tick(now);
+        m.on_fetched(kPanelScene, now);
+        joined();
+    }
+};
+
+static void preload_load_and_map()
+{
+    PreloadRig r;
+    r.panel(false, true);
+    r.m.tick(r.now);
+    ok("preload: the first preload layer publishes the scene and fetches it, no map",
+       calls_are("publish panel; load panel") && r.state(1) == TargetState::Loading && !r.m.requested(1) &&
+           r.m.loaded(1) && r.m.flushing(1) && !r.m.kept(1));
+    r.run(1000);
+    ok("preload: loading until the fetch completes, nothing more sent", calls_are("") &&
+                                                                         r.state(1) == TargetState::Loading);
+    r.m.on_fetched(kPanelScene, r.now);
+    ok("preload: loaded once fetched: not requested, staged and flushed",
+       r.state(1) == TargetState::Loaded && !r.m.requested(1) && r.m.flushing(1) && calls_are(""));
+    ok("preload: a scene published for the load is not charged as a resend", r.scenes.resends == 0);
+    r.run(120000);
+    ok("preload: kept loaded, no traffic", calls_are("") && r.state(1) == TargetState::Loaded);
+    ok("preload: nothing to wake for while loaded and not wanted", r.m.wake_in_ms(r.now) < 0);
+
+    r.panel(true, true);
+    r.m.tick(r.now);
+    ok("preload: wanted: the loaded scene mapped with no fetch, flushes going on",
+       calls_are("remap panel") && r.state(1) == TargetState::Acquiring && r.m.requested(1) && !r.m.loaded(1) &&
+           r.m.flushing(1) && !r.m.kept(1));
+    r.m.on_shown(kPanelScene, r.now);
+    ok("preload: shown", r.state(1) == TargetState::Shown && r.m.flushing(1));
+    r.run(5000);
+    joined();
+    r.panel(false, true);
+    r.run(2990);
+    ok("preload: not wanted: lingering, still mapped", r.state(1) == TargetState::Lingering && calls_are(""));
+    r.run(20);
+    ok("preload: the linger over: unmapped, its fetch kept, loaded again, not released",
+       calls_are("unmap panel") && r.state(1) == TargetState::Loaded && r.m.loaded(1) && !r.m.requested(1) &&
+           r.m.flushing(1));
+    r.run(400);
+    r.panel(true, true);
+    r.m.tick(r.now);
+    ok("preload: wanted again: mapped again with no fetch", calls_are("remap panel"));
+    r.m.on_shown(kPanelScene, r.now);
+    r.panel(false, false);
+    r.run(3010);
+    ok("preload: the last preload layer gone with it: released after its linger",
+       calls_are("release panel") && r.state(1) == TargetState::Idle && !r.m.loaded(1) && r.m.published(1));
+    r.run(60000);
+    ok("preload: and nothing asked for after", calls_are(""));
+
+    PreloadRig g;   /* gone while loaded */
+    g.loaded();
+    g.panel(false, false);
+    g.m.tick(g.now);
+    ok("preload: no preload layer left while loaded: released at once",
+       calls_are("release panel") && g.state(1) == TargetState::Idle && !g.m.loaded(1) && !g.m.flushing(1));
+    g.panel(false, true);
+    g.m.tick(g.now);
+    ok("preload: a preload layer again: loaded no sooner than 1 s after the last load", calls_are(""));
+    g.run(1000);
+    ok("preload: then loaded again", calls_are("load panel") && g.state(1) == TargetState::Loading);
+    g.panel(false, false);
+    g.m.tick(g.now);
+    ok("preload: gone while loading: released", calls_are("release panel") && g.state(1) == TargetState::Idle);
+    g.panel(false, true);
+    g.run(1000);
+    g.m.on_fetched(kPanelScene, g.now);
+    ok("preload: its warm scene's whole resend charged at the fetch",
+       calls_are("load panel") && g.state(1) == TargetState::Loaded && g.scenes.resends == 1);
+
+    PreloadRig w;   /* wanted while loading: mapped once fetched */
+    w.panel(true, true);
+    w.m.tick(w.now);
+    ok("preload: wanted from the start: a request as with no preload", calls_are("publish panel; request panel"));
+    w.m.on_shown(kPanelScene, w.now);
+    w.panel(false, true);
+    w.run(3010);
+    ok("preload: and unmapped, its fetch kept, after its linger", calls_are("unmap panel") &&
+                                                                   w.state(1) == TargetState::Loaded);
+
+    PreloadRig p;   /* parked, nothing wanting it */
+    p.panel(true, true);
+    p.m.tick(p.now);
+    p.rows(kPanelSlot, 2, {{0x01000500, 1}, {kPanelScene, 3}});
+    p.m.on_parked(kPanelScene, p.now);
+    joined();
+    p.panel(false, true);
+    p.m.tick(p.now);
+    ok("preload: parked and not wanted: unmapped, loaded", calls_are("unmap panel") &&
+                                                           p.state(1) == TargetState::Loaded);
+
+    PreloadRig d;   /* the unmap finds no fetch */
+    d.panel(true, true);
+    d.m.tick(d.now);
+    d.m.on_shown(kPanelScene, d.now);
+    joined();
+    d.port.fetched = false;
+    d.panel(false, true);
+    d.run(3010);
+    ok("preload: an unmap the port cannot keep: released", calls_are("unmap panel (not fetched); release panel") &&
+                                                          !d.m.loaded(1) && d.state(1) == TargetState::Idle);
+    d.run(1000);
+    ok("preload: then loaded again", calls_are("load panel"));
+
+    PreloadRig n;   /* the remap finds no fetch */
+    n.loaded();
+    n.port.fetched = false;
+    n.run(2000);
+    n.panel(true, true);
+    n.m.tick(n.now);
+    ok("preload: the display no longer holds the loaded scene: released",
+       calls_are("remap panel (not fetched); release panel") && n.state(1) == TargetState::Waiting);
+    n.m.tick(n.now);
+    ok("preload: and asked for in full at once", calls_are("request panel") && n.state(1) == TargetState::Acquiring);
+}
+
+static void preload_untouched()
+{
+    PreloadRig r;   /* the map, no preload layer, on a port that can keep a fetch */
+    r.m.want(0, true, false);
+    r.m.tick(r.now);
+    r.m.on_shown(kMapScene, r.now);
+    r.m.want(0, false, false);
+    r.run(2010);
+    ok("preload: a target with no preload layer is released after its linger", calls_are("publish map; request map; "
+                                                                                            "release map") &&
+                                                                                   r.state(0) == TargetState::Idle);
+
+    Rig n;   /* a port that cannot keep a fetch (iDrive 8) */
+    n.m.want(1, false, false, true, true, true);
+    n.run(5000);
+    ok("preload: ignored by a port that cannot keep a fetch", calls_are("") && n.state(1) == TargetState::Idle &&
+                                                              !n.m.loaded(1));
+    n.m.want(1, true, false, true, true, true);
+    n.m.tick(n.now);
+    n.m.on_shown(kPanelScene, n.now);
+    n.m.want(1, false, false, true, true, true);
+    n.run(3010);
+    ok("preload: there the target is requested and released as with no preload layer",
+       calls_are("publish panel; request panel; release panel") && n.state(1) == TargetState::Idle);
+    n.run(60000);
+    ok("preload: and not fetched after", calls_are(""));
+}
+
+static void preload_dropped()
+{
+    PreloadRig r;
+    r.loaded();
+    incidents();
+    r.m.on_lost(kPanelScene, "fetch removed", r.now);
+    ok("preload: the display drops the loaded fetch: taken down, waiting 2 s",
+       calls_are("release panel") && r.state(1) == TargetState::Waiting && !r.m.loaded(1) &&
+           r.m.status(1).retry_ms == r.now + 2000);
+    ok("preload: a loaded scene is not shown: no incident", incidents().empty());
+    r.run(1990);
+    ok("preload: nothing before the step", calls_are(""));
+    r.run(20);
+    ok("preload: loaded again on the ladder", calls_are("load panel") && r.state(1) == TargetState::Loading);
+    r.m.on_fetched(kPanelScene, r.now);
+    r.m.on_lost(kPanelScene, "fetch removed", r.now);
+    ok("preload: dropped again: the next step, 5 s", calls_are("release panel") &&
+                                                     r.m.status(1).retry_ms == r.now + 5000);
+    r.run(5010);
+    ok("preload: loaded at 5 s", calls_are("load panel"));
+    r.m.on_refused(kPanelScene, Refusal::Transient, "fetch removed", r.now);
+    ok("preload: a refused load waits on the ladder too (10 s)",
+       calls_are("release panel") && r.state(1) == TargetState::Waiting && r.m.status(1).retry_ms == r.now + 10000);
+    r.run(10010);
+    ok("preload: loaded at 10 s", calls_are("load panel"));
+    r.m.on_refused(kPanelScene, Refusal::Busy, "fetch E_DCSM_PRIOTOOLOW", r.now);
+    ok("preload: a busy refusal of a load waits on the ladder, not for the slot",
+       calls_are("release panel") && r.m.status(1).retry_ms == r.now + 20000);
+    r.run(20010);
+    joined();
+    r.m.on_fetched(kPanelScene, r.now);
+    r.run(30000);
+    ok("preload: loaded 30 s: the ladder starts over", calls_are(""));
+    r.m.on_lost(kPanelScene, "fetch removed", r.now);
+    ok("preload: dropped after that: 2 s", calls_are("release panel") && r.m.status(1).retry_ms == r.now + 2000);
+
+    PreloadRig s;   /* a load the display never completes */
+    s.port.fetching["panel"] = true;
+    s.panel(false, true);
+    s.m.tick(s.now);
+    joined();
+    incidents();
+    s.run(4990);
+    ok("preload: a load not fetched: loading until 5 s", calls_are("") && s.state(1) == TargetState::Loading);
+    s.run(20);
+    ok("preload: a stalled load: taken down, on the ladder, counted as a stall",
+       calls_are("release panel") && s.state(1) == TargetState::Waiting &&
+           has(incidents(), "INCIDENT target panel stalled: fetch accepted but never completed in 5000 ms, 1 in a row"));
+    s.run(2010);
+    s.run(5000);
+    ok("preload: the second in a row: its scene published fresh", calls_are("load panel; release panel; unpublish panel") &&
+                                                                    has(incidents(), "2 in a row"));
+
+    PreloadRig h;   /* the heartbeat replies stop */
+    h.loaded();
+    h.m.drop_kept("heartbeat replies stopped", h.now);
+    ok("preload: heartbeat replies stopped: the loaded scene released, loaded again on the ladder",
+       calls_are("release panel") && h.state(1) == TargetState::Waiting && h.m.status(1).retry_ms == h.now + 2000);
+
+    PreloadRig u;   /* the display service goes and comes back */
+    u.loaded();
+    u.port.up = false;
+    u.m.on_availability(false, u.now);
+    u.m.tick(u.now);
+    ok("preload: the display service gone: nothing loaded, nothing sent", calls_are("") && !u.m.loaded(1) &&
+                                                                           u.state(1) == TargetState::Idle);
+    u.run(10000);
+    ok("preload: nothing while it is gone", calls_are(""));
+    u.port.up = true;
+    u.m.on_availability(true, u.now);
+    u.run(990);
+    ok("preload: back: nothing before the settle time", calls_are(""));
+    u.run(20);
+    ok("preload: then loaded again, its scene still published", calls_are("load panel") &&
+                                                                 u.state(1) == TargetState::Loading);
+}
+
+static void preload_shared_scene()
+{
+    PreloadRig r;
+    r.loaded();
+    r.m.want(2, true, false);   /* the HUD, on the panel's scene id */
+    r.m.tick(r.now);
+    ok("preload: a target wanting the loaded scene's id: the loaded one released for it, then the request",
+       calls_are("release panel; unpublish panel; publish hud; request hud") && !r.m.loaded(1) &&
+           r.state(1) == TargetState::Waiting && r.m.status(1).reason == "scene id in use by another target");
+    r.m.on_shown(kPanelScene, r.now);
+    r.run(30000);
+    ok("preload: no load while the other holds the id", calls_are("") && r.state(1) == TargetState::Waiting);
+    r.m.want(2, false, false);
+    r.run(2010);
+    ok("preload: the other released after its linger", calls_are("release hud"));
+    r.run(10);
+    ok("preload: then loaded again", calls_are("unpublish hud; publish panel; load panel") &&
+                                     r.state(1) == TargetState::Loading);
+
+    PreloadRig w;   /* the other wanted and waiting: no load meanwhile */
+    w.m.want(2, true, false);
+    w.slot(kHudSlot, 2, 0x01000201);   /* HMI content shown in its slot: it waits */
+    w.m.tick(w.now);
+    joined();
+    w.panel(false, true);
+    w.run(5000);
+    ok("preload: no load while another target with the id is wanted", !has(joined(), "load") &&
+                                                                         !w.m.loaded(1));
+}
+
+static void preload_lock()
+{
+    PreloadRig r;
+    r.loaded();
+    r.rows(kPanelSlot, 0, {{0x01000500, 0}});   /* a lock of the panel's slot */
+    r.run(3000);
+    ok("preload: a lock leaves the loaded scene alone", !has(joined(), "release") && r.state(1) == TargetState::Loaded);
+    r.panel(true, true);
+    r.run(1000);
+    const std::string during = joined();
+    ok("preload: wanted while locked: not mapped, waiting as slot locked, still loaded",
+       !has(during, "remap") && !has(during, "request") && r.state(1) == TargetState::Waiting &&
+           r.m.status(1).reason == "slot locked" && r.m.loaded(1) && r.m.flushing(1));
+    r.rows(kPanelSlot, 1, {{0x01000500, 0}});
+    r.m.tick(r.now);
+    ok("preload: the slot back: mapped with no fetch", calls_are("remap panel"));
+
+    PreloadRig k;   /* kept through a lock, then not wanted */
+    k.port.keeps = true;
+    k.panel(true, true);
+    k.m.tick(k.now);
+    k.rows(kPanelSlot, 2, {{kPanelScene, 1}});
+    k.m.on_shown(kPanelScene, k.now);
+    k.run(1000);
+    k.rows(kPanelSlot, 0, {{kPanelScene, 1}});
+    k.m.on_lost(kPanelScene, "unmapped", k.now);
+    ok("preload: a shown target locked: kept", calls_are("publish panel; request panel; keep panel") && k.m.kept(1));
+    k.panel(false, true);
+    k.m.tick(k.now);
+    ok("preload: kept and not wanted: loaded, its fetch kept", calls_are("") && k.state(1) == TargetState::Loaded &&
+                                                               k.m.loaded(1) && !k.m.kept(1));
+    k.rows(kPanelSlot, 1, {{kPanelScene, 0}});
+    k.run(2000);
+    ok("preload: the slot back: nothing mapped while nothing wants it", calls_are("") &&
+                                                                        k.state(1) == TargetState::Loaded);
+    k.panel(true, true);
+    k.m.tick(k.now);
+    ok("preload: wanted: mapped with no fetch", calls_are("remap panel"));
+}
+
+/* A target with no preload layer, nothing wanting it, waiting on the ladder
+ * while another target with its scene id is wanted and not requested: at
+ * its retry it goes idle, its incident closed. */
+static void shared_id_ladder_no_preload()
+{
+    Rig r;
+    r.rows(kHudSlot, 2, {{0x02000001, 1}});   /* the HUD's slot held by another app: the HUD waits */
+    r.m.want(1, true, false);
+    r.m.tick(r.now);
+    r.m.on_shown(kPanelScene, r.now);
+    r.run(1000);
+    r.m.want(2, true, false);
+    r.run(100);
+    joined();
+    incidents();
+    r.m.on_lost(kPanelScene, "fetch removed", r.now);
+    r.m.want(1, false, false);
+    r.run(100);
+    ok("shared id, no preload: the panel waits on the ladder, the HUD wanted and not requested",
+       r.state(1) == TargetState::Waiting && r.m.status(1).retry_ms > r.now && !r.m.requested(2) &&
+           r.state(2) == TargetState::Waiting);
+    r.run(2000);
+    ok("shared id, no preload: at its retry the panel goes idle, not back",
+       r.state(1) == TargetState::Idle && has(incidents(), "INCIDENT target panel not back: released after"));
+}
+
+/* A stock pop-up the target gives way to while its load is out. */
+static void preload_popup()
+{
+    FakePort port;
+    port.preloads_ok = true;
+    FakeScenes scenes;
+    SlotManager m{&port, &scenes};
+    TargetSpec hud;
+    hud.name = "hud"; hud.slot = kHudSlot; hud.scene_id = kPanelScene; hud.width = 800; hud.height = 480;
+    hud.linger_ms = 3000;
+    hud.yield_slots = {0x322};
+    m.add(hud);
+    int64_t now = 100000;
+    const auto run = [&](int64_t ms) { for (int64_t x = 0; x < ms; x += 10) { now += 10; m.tick(now); } };
+    const auto row = [&](uint64_t slot, uint32_t status, uint64_t content, uint32_t map) {
+        SlotInfo si; si.slot = slot; si.status = status; si.content = content; si.map_status = map;
+        m.on_slots({si}, now);
+    };
+    calls.clear();
+    m.want(0, false, false, true, true, true);
+    m.tick(now);
+    ok("preload pop-up: loading", calls_are("publish hud; load hud") && m.status(0).state == TargetState::Loading);
+    m.want(0, true, false, true, true, true);
+    row(0x322, 2, 0x01000501, 1);
+    m.tick(now);
+    ok("preload pop-up: a pop-up while loading: the load released, the target giving way",
+       calls_are("release hud") && m.status(0).state == TargetState::Waiting && !m.loaded(0));
+    m.on_refused(kPanelScene, Refusal::FetchFailed, "E_FETCH_STATUS_FAILED", now);
+    m.want(0, false, false, true, true, true);
+    run(500);
+    ok("preload pop-up: nothing wanting it: not loaded without a fetch", m.status(0).state != TargetState::Loaded &&
+                                                                        !m.loaded(0) && calls_are(""));
+    run(1000);
+    ok("preload pop-up: loaded again", calls_are("load hud") && m.status(0).state == TargetState::Loading);
+    m.on_fetched(kPanelScene, now);
+    ok("preload pop-up: loaded once fetched", m.status(0).state == TargetState::Loaded);
+}
+
+/* The table's view of a target unmapped to Loaded. */
+static void preload_unmap_table()
+{
+    PreloadRig r;
+    r.panel(true, true);
+    r.m.tick(r.now);
+    r.rows(kPanelSlot, 2, {{kPanelScene, 1}});
+    r.m.on_shown(kPanelScene, r.now);
+    r.panel(false, true);
+    r.run(3010);
+    ok("unmap table: unmapped, loaded", calls_are("publish panel; request panel; unmap panel") &&
+                                        r.state(1) == TargetState::Loaded);
+    r.rows(kPanelSlot, 2, {{kPanelScene, 1}});   /* a report from before the unmap */
+    r.panel(true, true);
+    r.m.tick(r.now);
+    ok("unmap table: our own row still mapped is ours, not the stock HMI's: mapped again at once",
+       calls_are("remap panel") && r.state(1) == TargetState::Acquiring);
+
+    PreloadRig s;   /* the unmap not done */
+    s.panel(true, true);
+    s.m.tick(s.now);
+    s.rows(kPanelSlot, 2, {{kPanelScene, 1}});
+    s.m.on_shown(kPanelScene, s.now);
+    s.panel(false, true);
+    s.run(3010);
+    joined();
+    s.rows(kPanelSlot, 2, {{kPanelScene, 1}});
+    s.run(2990);
+    ok("unmap table: reported mapped after the unmap: loaded until 3 s", calls_are("") &&
+                                                                          s.state(1) == TargetState::Loaded);
+    s.run(20);
+    ok("unmap table: 3 s mapped: released, loaded again on the ladder",
+       calls_are("release panel") && s.state(1) == TargetState::Waiting && !s.m.loaded(1));
+    s.run(2000);
+    ok("unmap table: loaded at the ladder's step", calls_are("load panel"));
+
+    PreloadRig u;   /* the unmap reported, then the id mapped again by other content */
+    u.panel(true, true);
+    u.m.tick(u.now);
+    u.rows(kPanelSlot, 2, {{kPanelScene, 1}});
+    u.m.on_shown(kPanelScene, u.now);
+    u.panel(false, true);
+    u.run(3010);
+    joined();
+    u.rows(kPanelSlot, 1, {{kPanelScene, 0}});
+    u.rows(kPanelSlot, 2, {{kPanelScene, 1}});
+    u.run(10000);
+    ok("unmap table: once reported unmapped, the row is not watched", calls_are("") &&
+                                                                       u.state(1) == TargetState::Loaded);
+}
+
+/* Stalled loads nothing wants never reconnect the framework; a wanted
+ * target's stalls count from its own. */
+static void preload_stalls_no_reconnect()
+{
+    PreloadRig r;
+    int reconnects = 0;
+    r.m.on_renderer_stuck = [&reconnects](int64_t) { reconnects++; };
+    r.port.fetching["panel"] = true;
+    r.panel(false, true);
+    incidents();
+    r.run(120000);
+    const std::string inc = incidents();
+    size_t stalls = 0;
+    for (size_t at = inc.find("stalled"); at != std::string::npos; at = inc.find("stalled", at + 1))
+        stalls++;
+    ok("preload stalls: six loads stalled, the scene republished, no reconnect",
+       stalls >= 6 && reconnects == 0 && !has(inc, "reconnecting") && has(joined(), "unpublish panel"));
+    r.panel(true, true);
+    int wanted_stalls = 0;
+    for (int k = 0; k < 3; k++) {
+        for (int n = 0; n < 12000 && !has(incidents(), "stalled"); n++)
+            r.run(10);
+        wanted_stalls++;
+        if (k < 2)
+            ok("preload stalls: wanted, its first stalls reconnect nothing", reconnects == 0);
+    }
+    ok("preload stalls: the third wanted stall in a row reconnects", wanted_stalls == 3 && reconnects == 1);
+}
+
 int main()
 {
     incident_lines();
@@ -4023,6 +4560,7 @@ int main()
     fresh_fetch_failed();
     removal_retry();
     rendering();
+    quiet_console();
     guide_follows_the_map();
     table_in_status();
     guide_queue_order();
@@ -4054,6 +4592,15 @@ int main()
     keep_guide();
     stalled_fetches();
     boot_hold();
+    preload_load_and_map();
+    preload_untouched();
+    preload_dropped();
+    preload_shared_scene();
+    preload_lock();
+    shared_id_ladder_no_preload();
+    preload_popup();
+    preload_unmap_table();
+    preload_stalls_no_reconnect();
     {
         /* The HUD's media pop-up (0x322): the HUD map gives way while it shows */
         TargetSpec hud2;

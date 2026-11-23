@@ -12,13 +12,13 @@
  */
 const assert = require('assert');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const tmp = require('./tmp.js');
 const cp = require('child_process');
 
 const WAIT_MS = 1500;
 process.env.WOC_RECOVERY_LOCK_WAIT_MS = String(WAIT_MS);
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-statelock-'));
+const ROOT = tmp.dir();
 Object.assign(process.env, { WOC_STATE_DIR: path.join(ROOT, 'inmem'), WOC_CARPLAY: path.join(ROOT, 'no-carplay'), WOC_REMOUNT_LOCK: path.join(ROOT, 'remount.lock') });
 const recovery = require('../recovery.js');
 const RECOVERY = path.join(__dirname, '..', 'recovery.js');

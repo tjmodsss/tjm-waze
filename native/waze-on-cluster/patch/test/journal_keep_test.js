@@ -5,10 +5,10 @@
  * them under a flood, the lines it writes and leaves out, the load line, a
  * restart resuming after the newest line with a fake journalctl, and what
  * it writes to /var/opt: when, what of the files' lines, and how. */
-var assert = require('assert'), fs = require('fs'), os = require('os'), path = require('path'), cp = require('child_process');
+var assert = require('assert'), fs = require('fs'), path = require('path'), cp = require('child_process');
 var jk = require('../journal_keep.js');
 
-var tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wjk-'));
+var tmp = require('./tmp.js').dir();
 function fresh(name) { var d = path.join(tmp, name); fs.mkdirSync(d); return d; }
 function files(dir) { return fs.readdirSync(dir).filter(function (n) { return /^journal\.log/.test(n); }).sort(); }
 function line(n, len) { var s = 'line ' + n + ' '; return Buffer.from(s + 'x'.repeat(len - s.length - 1) + '\n'); }

@@ -10,10 +10,10 @@
 var assert = require('assert');
 var cp = require('child_process');
 var fs = require('fs');
-var os = require('os');
 var path = require('path');
+var tmp = require('./tmp.js');
 
-var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-collect-'));
+var dir = tmp.dir();
 var CUR = path.join(dir, 'current');
 fs.mkdirSync(CUR);
 fs.copyFileSync(path.join(__dirname, '..', '..', 'tools', 'collect-logs.sh'), path.join(CUR, 'collect-logs.sh'));

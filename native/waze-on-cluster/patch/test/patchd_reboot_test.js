@@ -19,28 +19,23 @@
 require('./head_unit_env.js');   /* a HIGH head unit for every patcher and patchd this runs */
 
 var fs = require('fs');
-var os = require('os');
 var net = require('net');
 var path = require('path');
+var tmp = require('./tmp.js');
 var cp = require('child_process');
 
 var PATCHD = path.join(__dirname, '..', 'patchd.js');
-var fails = 0, children = [], dirs = [];
+var fails = 0;
 function ok(name, cond, detail) {
     process.stdout.write((cond ? 'ok   ' : 'FAIL ') + name + (detail !== undefined && !cond ? '  — ' + detail : '') + '\n');
     if (!cond) fails++;
 }
-process.on('exit', function () {
-    children.forEach(function (c) { try { c.kill('SIGKILL'); } catch (e) {} });
-    dirs.forEach(function (d) { try { cp.execFileSync('rm', ['-rf', d]); } catch (e) {} });
-});
 
 /* A unit with a pending change (CarPlay's, or the marker `marker` names);
  * nsm_control answers as `mode` says; systemctl gives carplay's main PID
  * (4242 while <d>/proc/4242 is there). */
 function unit(waitMs, marker) {
-    var d = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-rb-'));
-    dirs.push(d);
+    var d = tmp.dir();
     ['shm', 'var', 'bin', 'units', 'proc'].forEach(function (x) { fs.mkdirSync(path.join(d, x)); });
     var t = { d: d, calls: path.join(d, 'calls'), mode: path.join(d, 'mode'), sock: path.join(d, 'shm', 'patch.sock') };
     fs.writeFileSync(t.calls, '');
@@ -74,7 +69,6 @@ function unit(waitMs, marker) {
 
 function daemon(t) {
     var c = cp.spawn(process.execPath, [PATCHD], { env: t.env, stdio: ['ignore', 'pipe', 'pipe'] });
-    children.push(c);
     var log = '';
     c.stdout.on('data', function (b) { log += b; });
     c.stderr.on('data', function (b) { log += b; });

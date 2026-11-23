@@ -35,20 +35,22 @@ function parseElf(buf) {
     if (buf[4] !== 2 || buf[5] !== 1 || buf.readUInt16LE(18) !== 62) return { reason: 'not a 64-bit little-endian x86-64 ELF' };
     var phoff = u64(buf, 0x20), phentsize = buf.readUInt16LE(0x36), phnum = buf.readUInt16LE(0x38);
     if (phoff === null || phoff + phnum * phentsize > buf.length) return { reason: 'ELF program headers out of range' };
-    var elf = { load: [], exec: null, eh: null, notes: [], dyn: null, dynBad: false };
+    var elf = { load: [], exec: null, eh: null, notes: [], dyn: null, dynBad: false, relro: null };
     for (var i = 0; i < phnum; i++) {
         var o = phoff + i * phentsize, type = buf.readUInt32LE(o);
-        var seg = { off: u64(buf, o + 8), va: u64(buf, o + 16), size: u64(buf, o + 32) };
+        /* flags: PF_X 1, PF_W 2, PF_R 4 */
+        var seg = { off: u64(buf, o + 8), va: u64(buf, o + 16), size: u64(buf, o + 32), flags: buf.readUInt32LE(o + 4) };
         if (seg.off === null || seg.va === null || seg.size === null || seg.off + seg.size > buf.length) {
             if (type === 2) elf.dynBad = true;          /* a PT_DYNAMIC outside the file */
             continue;
         }
         if (type === 1) {                               /* PT_LOAD; PF_X marks the code */
             elf.load.push(seg);
-            if ((buf.readUInt32LE(o + 4) & 1) && !elf.exec) elf.exec = { off: seg.off, end: seg.off + seg.size };
+            if ((seg.flags & 1) && !elf.exec) elf.exec = { off: seg.off, end: seg.off + seg.size };
         } else if (type === 0x6474e550) elf.eh = seg;   /* PT_GNU_EH_FRAME */
         else if (type === 4) elf.notes.push(seg);       /* PT_NOTE */
         else if (type === 2) elf.dyn = seg;             /* PT_DYNAMIC */
+        else if (type === 0x6474e552) elf.relro = { va: seg.va, size: u64(buf, o + 40) };   /* PT_GNU_RELRO, its memory size */
     }
     if (!elf.exec) return { reason: 'no executable ELF segment' };
     return elf;
@@ -84,6 +86,7 @@ function Image(buf, elf) {
     this.starts = funcStarts(buf, elf.eh);
     this.dyn = elf.dyn;
     this.dynBad = elf.dynBad;
+    this.relro = elf.relro;
     this.callIndex = null;
 }
 Image.prototype.va = function (off) {
@@ -996,21 +999,65 @@ function locate(buf) {
     return out;
 }
 
-/* The proven build `cur` is a copy of, rebuilt from it: the shipped bytes of
- * its entry in `proven` (by build-id: { sha256, stock: [[offset, hex]] })
+/* The shipped build `cur` is a copy of, rebuilt from it: the shipped bytes
+ * of its entry in `shipped` (by build-id: { sha256, stock: [[offset, hex]] })
  * written over every site, when the result is the shipped file whole; else
  * null. */
-function stockOriginal(proven, cur) {
-    var p = proven[elfBuildId(cur)];
+function stockOriginal(shipped, cur) {
+    var p = shipped[elfBuildId(cur)];
     if (!p) return null;
     var out = Buffer.from(cur);
     p.stock.forEach(function (s) { if (s[0] + s[1].length / 2 <= out.length) Buffer.from(s[1], 'hex').copy(out, s[0]); });
     return require('crypto').createHash('sha256').update(out).digest('hex') === p.sha256 ? out : null;
 }
 
+/* What each part of `buf` holds, with the shipped bytes `stock` ([[offset,
+ * hex]]) written over the sites first, so an edit there does not count: the
+ * SHA-256 of each PT_LOAD segment's bytes in the file (loads, in program
+ * header order) and of the bytes no segment loads (unloaded: section
+ * headers, .gnu_debuglink and the like, which the process never maps), the
+ * segments and the rebuilt image. null when it is not an ELF file. */
+function loadedParts(buf, stock) {
+    var b = Buffer.from(buf);
+    (stock || []).forEach(function (s) { if (s[0] + s[1].length / 2 <= b.length) Buffer.from(s[1], 'hex').copy(b, s[0]); });
+    var elf = parseElf(b);
+    if (!elf.load) return null;
+    var covered = Buffer.alloc(b.length), rest = [];
+    var loads = elf.load.map(function (s) { covered.fill(1, s.off, s.off + s.size); return sha256(b.slice(s.off, s.off + s.size)); });
+    for (var i = 0; i < b.length;) {
+        if (covered[i]) { i++; continue; }
+        var j = i;
+        while (j < b.length && !covered[j]) j++;
+        rest.push(b.slice(i, j));
+        i = j;
+    }
+    return { loads: loads, unloaded: sha256(Buffer.concat(rest)), segs: elf.load, out: b };
+}
+
+/* The parts of `buf` that differ from the shipped file of its build `p`
+ * ({ sha256, stock, loads, unloaded }), by name: [] when, with the shipped
+ * bytes over the sites, it is the shipped file; null when `p` has no part
+ * hashes to tell which. For the logs only: it decides nothing. */
+function partsDiffering(p, buf) {
+    var q = loadedParts(buf, p.stock);
+    if (q && sha256(q.out) === p.sha256) return [];
+    if (!p.loads) return null;
+    if (!q) return ['the file: not an ELF file'];
+    if (p.loads.length !== q.loads.length) return ['loaded segments: ' + q.loads.length + ', the shipped file has ' + p.loads.length];
+    var out = [];
+    q.segs.forEach(function (s, i) {
+        if (q.loads[i] !== p.loads[i]) out.push('loaded segment ' + (i + 1) + ' (' + ((s.flags & 4) ? 'r' : '-') + ((s.flags & 2) ? 'w' : '-') +
+            ((s.flags & 1) ? 'x' : '-') + ', file 0x' + s.off.toString(16) + '-0x' + (s.off + s.size).toString(16) + ')');
+    });
+    if (q.unloaded !== p.unloaded) out.push('the bytes no segment loads');
+    return out;
+}
+
+function sha256(b) { return require('crypto').createHash('sha256').update(b).digest('hex'); }
+
 module.exports = {
     locate: locate, buildId: elfBuildId, SINK_STOCK: SINK_STOCK, MAP_URL: MAP_URL, MAP_URL_FORMS: FORMS, SHOWUI_URL: SHOWUI_URL, ALT_URL: ALT_URL,
-    stockOriginal: stockOriginal,
+    stockOriginal: stockOriginal, partsDiffering: partsDiffering,
     /* the ELF reading aapd_locate.js shares */
     elf: { parseElf: parseElf, Image: Image, noteBuildId: buildId, scan: scan, namedString: namedString, leaRefs: leaRefs,
            funcOfString: funcOfString, relocated: relocated, hex32: hex32, version: version,

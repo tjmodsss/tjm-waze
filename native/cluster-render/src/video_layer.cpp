@@ -120,6 +120,13 @@ VideoLayer::VideoLayer(uint32_t id, int target, uint64_t seq, crk::UploadPacer &
     clock_.reset(now_ms);
 }
 
+void VideoLayer::cap_fps(uint32_t cap, int64_t now_ms)
+{
+    const uint32_t fps = cap && (p_.fps == 0 || p_.fps > cap) ? cap : p_.fps;
+    if (fps != clock_.fps())
+        clock_.retime(fps, now_ms);
+}
+
 const char *VideoLayer::size_error(uint32_t w, uint32_t h)
 {
     if (w < 64 || h < 32)
@@ -942,12 +949,15 @@ std::string VideoLayer::stats() const
                   (unsigned long long)whole_writes_, (unsigned long long)partial_writes_, (unsigned long long)rects_,
                   (unsigned long long)packed_writes_, (unsigned long long)refines_,
                   (unsigned long long)held_budget_);
+    std::string s = b;
+    if (clock_.fps() != p_.fps)
+        s += ", at most " + std::to_string(clock_.fps()) + " a second for another client (others_fps)";
     if (!hidden_tiles_)
-        return b;
+        return s;
     char h[96];
     std::snprintf(h, sizeof h, ", %llu tiles left hidden, %llu uncovered (%llu forced)",
                   (unsigned long long)hidden_tiles_, (unsigned long long)uncovers_, (unsigned long long)forced_);
-    return std::string(b) + h;
+    return s + h;
 }
 
 }  // namespace crs

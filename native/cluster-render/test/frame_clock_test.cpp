@@ -3,7 +3,8 @@
 /* Host test for the map's submission clock (frame_clock.h): that its
  * deadlines fall on an exact fractional grid, that a late send still targets
  * the grid, that deadlines passing with nothing to send are skipped rather
- * than made up, and the wait it reports until the next. */
+ * than made up, the wait it reports until the next, and a change of rate
+ * keeping the deadline due next. */
 #include <algorithm>
 #include <cstdio>
 
@@ -102,11 +103,35 @@ static void test_clock_off()
     ok("fps 0: still always due after a send", c.due(5));
 }
 
+/* retime: the deadline due next stays, the grid goes on from it at the new
+ * rate; from no clock, the grid starts at once. */
+static void test_clock_retime()
+{
+    FrameClock c;
+    c.configure(30);
+    c.reset(0);
+    c.sent(0);   /* next at 33 */
+    c.retime(20, 10);
+    bool kept = !c.due(32) && c.due(33) && c.fps() == 20;
+    c.sent(33);
+    kept = kept && !c.due(82) && c.due(83);   /* 33 + 50 */
+    ok("retime: the next deadline kept, then the new rate's grid from it", kept);
+    c.retime(20, 90);
+    ok("retime: the same rate again moves nothing", c.due(90) && c.ms_until_due(90) == 0);
+    FrameClock off;
+    off.retime(15, 500);
+    off.sent(500);
+    ok("retime: from no clock, the grid starts at once", off.ms_until_due(500) == 66 && off.fps() == 15);
+    off.retime(0, 520);
+    ok("retime: to no clock, always due", off.due(520) && off.ms_until_due(520) == 0);
+}
+
 int main()
 {
     test_clock_rate();
     test_clock_absolute_and_skip();
     test_clock_off();
+    test_clock_retime();
     if (failures) {
         std::printf("%d FAILED\n", failures);
         return 1;

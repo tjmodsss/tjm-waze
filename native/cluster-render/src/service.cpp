@@ -61,9 +61,11 @@ int Service::timeout_ms(int64_t now_ms) const
 {
     bool active = false;
     for (size_t i = 0; i < slots_.targets().size(); i++)
-        active = active || slots_.requested((int)i);
+        active = active || slots_.requested((int)i) || (slots_.loaded((int)i) && comp_->pending((int)i));
     /* Idle: four times a second, so a stalled layer's state, a slot poll and
-     * the status file stay current. */
+     * the status file stay current. A loaded target alone stays idle: what
+     * a client sends wakes the loop, and only a change left to flush ticks
+     * it at the frame rate. */
     int64_t t = active ? 1000 / std::max(1, cfg_.fps) : 250;
     for (int64_t w : {comp_->wake_in_ms(now_ms), slots_.wake_in_ms(now_ms)})
         if (w > 0 && w < t)

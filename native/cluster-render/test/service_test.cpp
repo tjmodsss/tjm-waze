@@ -44,7 +44,11 @@
  * released nor asked for again; its client gone, kept through the linger
  * and then released. The HUD's layers choose whether it gives way to the
  * stock pop-ups (yield), a client without the field getting it. A scene
- * with layers and a host of the map (layers_and_hosting). */
+ * with layers and a host of the map (layers_and_hosting); a host from a
+ * client's layers, with no scene (hosting_from_layers, hosting_from_layers_more, holding_into). A layer's
+ * preload, end to end (preload). A layer's others_fps holding another
+ * client's video and releasing it (others_fps). Render state and samplers
+ * (render_state_and_samplers). Canvases (canvases_over_socket). */
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -801,11 +805,16 @@ static void repeats()
         c.frame(map, &b, 1);
         s.pump(c, &now);
         ok("to a service without repeats: the frame", has(s.take(), frame));
+        /* A send buffer far smaller than a frame, as on the car's kernel: the
+         * first repeat's frame is still on its way when the second comes. */
+        const int small = 32 * 1024;
+        setsockopt(c.fd(), SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
         c.repeat(map, 2);
         c.repeat(map, 3);
-        s.pump(c, &now);
+        for (int i = 0; i < 40; i++)
+            s.pump(c, &now);
         const std::vector<std::string> m = s.take();
-        ok("and each repeat as the last frame whole again, newest id",
+        ok("and each repeat as the last frame whole again, newest id, the second while the first is on its way",
            m.size() == 2 && m[0] == "F 2 " + std::to_string(f1.size()) && m[1] == "F 3 " + std::to_string(f1.size()));
         std::vector<uint8_t> copy;
         ok("the last frame is kept", c.latest(map, &copy) && copy == f1);
@@ -1055,8 +1064,13 @@ static void scene_files()
         raw.send("{\"op\":\"scene\",\"ref\":4,\"target\":\"panel\",\"file\":\"" + gauge + "\",\"res\":\"" + res +
                  "\",\"sha256\":\"" + gsha + "\"}");
         raw.send("{\"op\":\"edit\",\"ref\":5,\"lines\":\"--hide x\"}");
+        /* its layers stay above every canvas's passes (graph.h kCanvasBase) */
+        raw.send("{\"op\":\"scene\",\"ref\":6,\"target\":\"panel\",\"file\":\"" + gauge + "\",\"res\":\"" + res +
+                 "\",\"sha256\":\"" + gsha + " " + rsha + "\",\"layers\":1,\"layers_order\":-1000000000}");
         r.pump(20);
         const std::string said = raw.events();
+        ok("scene files: layers_order below the canvases' render orders refused",
+           said.find("\"ref\":6,\"reason\":\"layers_order must be a number from -999737856") != std::string::npos);
         ok("scene files: refused on a target without them, with a resource file's hash not its, from outside the "
            "root, without a hash for each file; edits of none",
            said.find("target map takes no scene files (map_scene_files)") != std::string::npos &&
@@ -1468,6 +1482,1305 @@ static void layers_and_hosting()
     }
     const int removed = std::system(("rm -rf " + root).c_str());
     (void)removed;
+}
+
+/* Preload with the C++ client: the hello says the service knows it; a
+ * hidden preload layer has its target fetched and not mapped (loaded, in
+ * the status too); shown, the target is mapped with no second fetch;
+ * hidden again, unmapped after the linger and loaded, not released; the
+ * service restarting under the client, the field is sent again and the
+ * target loaded again; preload 0 releases it. A loaded target with nothing
+ * to flush leaves the loop at four ticks a second; wanted and waiting for
+ * its slot, a write the budget holds ticks it at the frame rate. */
+static void preload()
+{
+    Rig r;
+    cr::Client c("preload", r.path);
+    Events e;
+    e.wire(c);
+    r.clients = {&c};
+    r.pump(50);
+    ok("preload: the hello says the service knows preload", e.ready == 1 && c.takes_preload());
+    cr::LayerOptions lo;
+    lo.target = "panel";
+    lo.w = lo.h = 64;
+    lo.visible = false;
+    lo.preload = true;
+    cr::ImageOptions io;
+    io.w = io.h = 64;
+    const uint32_t img = c.image(lo, io);
+    std::vector<uint8_t> px(64 * 64 * 4, 200);
+    c.pixels(img, {}, px.data(), px.size());
+    r.pump(300);
+    ok("preload: a hidden preload layer: its target loaded, fetched and not mapped",
+       e.target["panel"] == "loaded" && e.layer[img] == "hidden" && r.port.loads == 1 && r.port.requests == 0 &&
+           !r.port.row(0x203, 0x01000400));
+    ok("preload: the status names the target loaded",
+       has(r.svc->server().status_text(r.now), "target panel: slot 0x203 scene 0x1000400 1920x720: loaded; scene "
+                                               "fetched, not mapped (preload)"));
+    lo.visible = true;
+    c.set(img, lo);
+    r.pump(1000);   /* the map spaced 1 s from the load */
+    ok("preload: made visible: shown, mapped with no second fetch", e.layer[img] == "shown" &&
+                                                                      e.target["panel"] == "shown" &&
+                                                                      r.port.remaps == 1 && r.port.loads == 1 &&
+                                                                      r.port.requests == 0);
+    lo.visible = false;
+    c.set(img, lo);
+    r.pump(4000);
+    ok("preload: hidden again: unmapped after the linger, loaded, not released",
+       e.target["panel"] == "loaded" && r.port.releases == 0 && !r.port.row(0x203, 0x01000400));
+    ok("preload: loaded with nothing to flush: the loop ticks four times a second",
+       r.svc->timeout_ms(r.now) == 250 && !r.svc->compositor().pending(1));
+    r.svc.reset();
+    r.start();
+    e.target.clear();
+    r.pump(2000);
+    ok("preload: the service restarted: the client sends preload again, the target loaded again",
+       e.ready == 2 && e.target["panel"] == "loaded" && r.port.loads == 2 && r.port.requests == 0);
+    lo.preload = false;
+    c.set(img, lo);
+    r.pump(100);
+    ok("preload: preload 0: released", e.target["panel"] == "idle" && r.port.releases == 1);
+
+    /* Wanted while loaded, its slot held by another app's content: its
+     * writes the budget holds tick the loop at the frame rate until they
+     * go. */
+    Rig b(64 * 1024);
+    cr::Client d("preload", b.path);
+    Events f;
+    f.wire(d);
+    b.clients = {&d};
+    b.pump(50);
+    cr::LayerOptions big = lo;
+    big.preload = true;
+    big.visible = false;
+    big.w = big.h = 256;
+    io.w = io.h = 256;
+    const uint32_t pic = d.image(big, io);
+    std::vector<uint8_t> whole(256 * 256 * 4, 90);
+    d.pixels(pic, {}, whole.data(), whole.size());
+    b.pump(300);
+    b.port.stock_map(0x203, 0x02000001);
+    big.visible = true;
+    d.set(pic, big);
+    b.pump(1500);
+    const bool waits = f.target["panel"] == "waiting" && b.svc->slots().loaded(1);
+    whole.assign(whole.size(), 91);
+    d.pixels(pic, {}, whole.data(), whole.size());
+    b.pump(10);
+    const bool held = b.svc->compositor().pending(1), fast = b.svc->timeout_ms(b.now) < 250;
+    ok("preload: wanted while loaded, the slot another app's: a write held by the budget ticks the loop fast",
+       waits && held && fast);
+    b.pump(5000);
+    ok("preload: once it has gone, idle again", !b.svc->compositor().pending(1) && b.svc->timeout_ms(b.now) == 250);
+}
+
+/* The updates a second the service's only video layer is clocked at now;
+ * 999: none. */
+static uint32_t video_clock(Rig &r)
+{
+    for (const Layer *l : r.svc->compositor().layers())
+        if (!std::strcmp(l->kind(), "video"))
+            return static_cast<const VideoLayer *>(l)->clock_fps();
+    return 999;
+}
+
+/* others_fps with the C++ client: the hello says the service knows it; a
+ * video alone keeps its own rate and its client gets no fps_cap event; a
+ * hidden layer with others_fps holds nothing; shown, the other client's
+ * video is written at most that often and its client told (with the app),
+ * the requesting client's own video not held and it told nothing; below 15
+ * counts as 15; hidden, set back to 0, dropped, or its client gone: the
+ * video back at its own rate and its client told 0. The service
+ * restarting: the held client told 0 as its connection goes, and held
+ * again once the request is shown again. */
+static void others_fps()
+{
+    Rig r;
+    cr::Client w("waze", r.path);
+    std::unique_ptr<cr::Client> k(new cr::Client("cluster", r.path));
+    Events ew, ek;
+    ew.wire(w);
+    ek.wire(*k);
+    std::vector<std::string> caps;
+    int cluster_caps = 0;
+    w.on_fps_cap = [&](unsigned fps, const std::string &app) { caps.push_back(std::to_string(fps) + " " + app); };
+    k->on_fps_cap = [&](unsigned, const std::string &) { cluster_caps++; };
+    r.clients = {&w, k.get()};
+    r.pump(50);
+    ok("others_fps: the hello says the service knows others_fps", w.takes_others_fps() && k->takes_others_fps());
+    cr::LayerOptions lo;
+    lo.target = "map";
+    lo.contend = true;
+    const uint32_t map = w.video(lo, cr::VideoOptions());
+    int seed = 1;
+    /* frames offered 100 a second for ms: the map's writes a second */
+    auto rate = [&](int64_t ms) {
+        const uint64_t before = r.svc->compositor().write_stats(0).frames;
+        for (int64_t t = 0; t < ms; t += 10) {
+            const std::vector<uint8_t> f = atlas(seed++);
+            w.frame(map, f.data(), f.size(), (uint64_t)seed);
+            r.pump(10);
+        }
+        return (unsigned)((r.svc->compositor().write_stats(0).frames - before) * 1000 / (uint64_t)ms);
+    };
+    rate(600);
+    unsigned alone = rate(2000);
+    ok("others_fps: a video alone: at its own 30 a second, no fps_cap event", ew.layer[map] == "shown" &&
+                                                                                 alone >= 28 && alone <= 31 &&
+                                                                                 caps.empty() &&
+                                                                                 video_clock(r) == 30);
+
+    cr::LayerOptions pl;
+    pl.target = "panel";
+    pl.w = pl.h = 64;
+    pl.visible = false;
+    pl.others_fps = 20;
+    cr::ImageOptions io;
+    io.w = io.h = 64;
+    const uint32_t img = k->image(pl, io);
+    std::vector<uint8_t> px(64 * 64 * 4, 200);
+    k->pixels(img, {}, px.data(), px.size());
+    unsigned hidden = rate(1000);
+    ok("others_fps: the request hidden: nothing held", hidden >= 28 && caps.empty() && video_clock(r) == 30);
+
+    pl.visible = true;
+    k->set(img, pl);
+    for (int i = 0; i < 100 && ek.layer[img] != "shown"; i++)
+        r.pump(10);
+    const unsigned held = rate(2000);
+    ok("others_fps: shown: the other client's video written at most 20 a second, its client told who asks",
+       ek.layer[img] == "shown" && held >= 18 && held <= 21 && video_clock(r) == 20 &&
+           caps == std::vector<std::string>{"20 cluster"} && w.fps_cap == 20 && w.fps_cap_app == "cluster");
+    ok("others_fps: the requesting client told nothing", k->fps_cap == 0 && cluster_caps == 0);
+    ok("others_fps: the status names the request",
+       r.svc->server().status_text(r.now).find("others_fps: cluster layer ") != std::string::npos);
+
+    pl.others_fps = 5;
+    k->set(img, pl);
+    r.pump(50);
+    ok("others_fps: below 15 counts as 15", w.fps_cap == 15 && video_clock(r) == 15);
+
+    pl.visible = false;
+    k->set(img, pl);
+    r.pump(50);
+    ok("others_fps: hidden: released, its client told 0",
+       w.fps_cap == 0 && caps.back() == "0 " && video_clock(r) == 30);
+    const unsigned back = rate(1000);
+    ok("others_fps: and back at 30 a second", back >= 28 && back <= 31);
+
+    pl.visible = true;
+    pl.others_fps = 20;
+    k->set(img, pl);
+    r.pump(100);
+    const bool again = w.fps_cap == 20;
+    pl.others_fps = 0;
+    k->set(img, pl);
+    r.pump(50);
+    ok("others_fps: set back to 0: released", again && w.fps_cap == 0 && video_clock(r) == 30);
+
+    pl.others_fps = 20;
+    k->set(img, pl);
+    r.pump(100);
+    const bool third = w.fps_cap == 20;
+    k->drop(img);
+    r.pump(50);
+    ok("others_fps: the layer dropped: released", third && w.fps_cap == 0 && video_clock(r) == 30);
+
+    const uint32_t img2 = k->image(pl, io);
+    k->pixels(img2, {}, px.data(), px.size());
+    r.pump(200);
+    const bool fourth = w.fps_cap == 20 && video_clock(r) == 20;
+    r.svc.reset();
+    r.start();
+    r.pump(10);
+    const bool restart_released = caps.back() == "0 ";
+    for (int i = 0; i < 300 && w.fps_cap != 20; i++)
+        r.pump(10);
+    ok("others_fps: the service restarted: told 0 as the connection goes, held again once the request is shown",
+       fourth && restart_released && w.fps_cap == 20);
+    r.clients = {&w};
+    k.reset();
+    r.pump(100);
+    ok("others_fps: its client gone: released", w.fps_cap == 0 && caps.back() == "0 " && video_clock(r) == 30);
+}
+
+/* PROTOCOL.md "Render state" and "Mipmaps", over the socket with the C++
+ * client: the hello says the service takes them; an asset with a
+ * mipmapped, mirrored, anisotropic sampler, an effect layer blending
+ * premultiplied without writing alpha, changed in place, and a mesh part
+ * with its own depth test and blending, made again with all of it after a
+ * service restart; malformed fields refused with an error event and
+ * nothing made. */
+static void render_state_and_samplers()
+{
+    Rig r;
+    cr::Client c("gauges", r.path);
+    Events e;
+    e.wire(c);
+    r.clients = {&c};
+    r.pump(50);
+    ok("render state: the hello says the service takes render state and samplers",
+       c.takes_render_state() && c.takes_samplers());
+    cr::AssetOptions ao;
+    ao.target = "panel";
+    ao.w = 64;
+    ao.h = 32;
+    cr::SamplerOptions so;
+    so.sampling = "trilinear";
+    so.wrap_u = "mirror";
+    so.wrap_v = "repeat";
+    so.anisotropy = 8;
+    const uint32_t dial = c.asset(ao, so);
+    std::vector<uint8_t> px(64 * 32 * 4, 180);
+    c.pixels(dial, {}, px.data(), px.size());
+    cr::LayerOptions lo;
+    lo.target = "panel";
+    lo.klass = "overlay";
+    lo.x = 100;
+    lo.y = 100;
+    lo.w = 64;
+    lo.h = 32;
+    cr::RenderState glow;
+    glow.blend = "premultiplied";
+    glow.color_mask = "rgb";
+    const uint32_t fx = c.effect(lo,
+                                 cr::EffectOptions{"#version 100\nprecision mediump float;\nuniform sampler2D u_dial;\n"
+                                                   "varying vec2 v_uv;\nvoid main(){gl_FragColor=texture2D(u_dial,v_uv);}",
+                                                   "", 0},
+                                 false, glow);
+    c.bind(fx, "u_dial", dial);
+    cr::LayerOptions ml = lo;
+    ml.x = 600;
+    ml.w = 400;
+    ml.h = 300;
+    cr::MeshOptions mo;
+    mo.cz = 6;
+    const uint32_t box = c.mesh(ml, mo);
+    cr::PartOptions po;
+    po.vs = "#version 100\nattribute vec3 a_position;\nattribute vec3 a_normal;\nuniform mat4 u_mvp;\n"
+            "varying vec3 v_n;\nvoid main(){v_n=a_normal;gl_Position=u_mvp*vec4(a_position,1.0);}";
+    po.fs = "#version 100\nprecision mediump float;\nvarying vec3 v_n;\nvoid main(){gl_FragColor=vec4(v_n,1.0);}";
+    cr::RenderState decal;
+    decal.depth_func = "greater_equal";
+    decal.depth_write = 0;
+    decal.blend_src = "one";
+    decal.blend_dst = "one";
+    decal.blend_op = "max";
+    ok("render state: a part with its own render state is taken",
+       c.part(box, 1, po, decal) && c.geometry(box, 1, cube()));
+    r.pump(400);
+    auto check = [&](const char *when, bool rgb_only) {
+        FakeGraph *g = r.gpu.graph("panel");
+        const FakeBuffer *b = nullptr;
+        const FakeQuad *q = nullptr;
+        const FakePart *p = nullptr;
+        if (g) {
+            for (const auto &kv : g->shown.buffers)
+                if (kv.second.w == 64 && kv.second.h == 32)
+                    b = &kv.second;
+            for (const auto &kv : g->shown.quads)
+                if (kv.second.textures.count("u_dial"))
+                    q = &kv.second;
+            for (const auto &kv : g->shown.parts)
+                p = &kv.second;
+        }
+        const uint8_t mask = rgb_only ? (kMaskR | kMaskG | kMaskB) : kMaskRGBA;
+        ok((std::string("render state: ") + when + ": the asset with every level and its sampler").c_str(),
+           b && b->levels == 7 && b->sampler.sampling == Sampling::Trilinear && b->sampler.u == Wrap::Mirror &&
+               b->sampler.v == Wrap::Repeat && b->sampler.anisotropy == 8 && b->mips.back().size() == 4 &&
+               b->mips.back()[0] == 180);
+        ok((std::string("render state: ") + when + ": the effect layer blends as asked").c_str(),
+           q && q->look.blending() == blend_state(Blend::Premultiplied) && q->look.color_mask == mask);
+        ok((std::string("render state: ") + when + ": the part drawn as asked").c_str(),
+           p && p->look.depth_test() == DepthFunc::GreaterEqual && !p->look.depth_writes() &&
+               p->look.blending().src == BlendFactor::One && p->look.blending().op == BlendOp::Max);
+    };
+    check("made", true);
+    cr::RenderState all;
+    all.blend = "premultiplied";
+    c.set_look(fx, all);
+    r.pump(50);
+    check("set_look", false);
+    r.svc.reset();
+    r.start();
+    r.pump(3000);
+    check("after a service restart", false);
+    ok("render state: no error so far", e.errors.empty());
+
+    Raw raw(r.path);
+    raw.send("{\"op\":\"hello\",\"app\":\"raw\",\"proto\":1}");
+    raw.send("{\"op\":\"layer\",\"ref\":1,\"target\":\"panel\",\"kind\":\"effect\",\"fs\":\"void main(){}\","
+             "\"blend_src\":\"src_color\"}");
+    raw.send("{\"op\":\"layer\",\"ref\":2,\"target\":\"panel\",\"kind\":\"effect\",\"fs\":\"void main(){}\","
+             "\"color_mask\":\"rgbx\"}");
+    raw.send("{\"op\":\"layer\",\"ref\":3,\"target\":\"panel\",\"kind\":\"effect\",\"fs\":\"void main(){}\","
+             "\"blend\":\"none\",\"blend_op\":\"max\"}");
+    raw.send("{\"op\":\"asset\",\"ref\":4,\"target\":\"panel\",\"w\":8,\"h\":8,\"sampling\":\"anisotropic\"}");
+    raw.send("{\"op\":\"asset\",\"ref\":5,\"target\":\"panel\",\"w\":8,\"h\":8,\"anisotropy\":2.5}");
+    raw.send("{\"op\":\"asset\",\"ref\":6,\"target\":\"panel\",\"w\":8,\"h\":8,\"wrap_v\":\"spiral\"}");
+    raw.send("{\"op\":\"layer\",\"ref\":7,\"target\":\"panel\",\"kind\":\"mesh\"}");
+    raw.send("{\"op\":\"part\",\"ref\":7,\"part\":1,\"vs\":\"attribute vec3 a_position;void main(){}\","
+             "\"fs\":\"void main(){}\",\"depth\":0,\"depth_func\":\"less\"}");
+    raw.send("{\"op\":\"part\",\"ref\":7,\"part\":2,\"vs\":\"attribute vec3 a_position;void main(){}\","
+             "\"fs\":\"void main(){}\",\"depth_func\":\"sometimes\"}");
+    r.pump(50);
+    const std::string ev = raw.events();
+    auto refused = [&](const char *op, int ref, const char *why) {
+        return ev.find(std::string("\"op\":\"") + op + "\",\"ref\":" + std::to_string(ref) + ",\"reason\":\"" + why) !=
+               std::string::npos;
+    };
+    ok("render state: a colour blend factor RAMSES 19 lacks is refused",
+       refused("layer", 1, "blend_src must be zero, one, src_alpha"));
+    ok("render state: a malformed colour mask is refused", refused("layer", 2, "color_mask must be"));
+    ok("render state: blend factors with blend none are refused", refused("layer", 3, "blend none takes no"));
+    ok("render state: an unknown sampling is refused", refused("asset", 4, "sampling must be nearest, bilinear"));
+    ok("render state: a fractional anisotropy is refused", refused("asset", 5, "anisotropy must be a whole number"));
+    ok("render state: an unknown wrap is refused", refused("asset", 6, "wrap_v must be clamp, repeat or mirror"));
+    ok("render state: a depth test without depth is refused", refused("part", 7, "depth 0 takes no depth_func"));
+    ok("render state: an unknown depth test is refused", refused("part", 7, "depth_func must be less"));
+    size_t layers = 0;
+    for (const Layer *l : r.svc->compositor().layers())
+        layers += std::string(l->kind()) == "effect";
+    ok("render state: nothing refused was made", layers == 1 && r.svc->compositor().assets().size() == 1);
+}
+
+/* The visible quads of g, bottom to top, each named by the first entry of
+ * names whose rect it has ("?": none). */
+static std::string stack_of(FakeGraph *g, const std::vector<std::pair<std::string, Rect>> &names)
+{
+    std::string out;
+    if (!g)
+        return out;
+    for (int q : g->visible()) {
+        const Rect &r = g->shown.quads.at(q).r;
+        std::string name = "?";
+        for (const auto &n : names)
+            if (n.second.x == r.x && n.second.y == r.y && n.second.w == r.w && n.second.h == r.h) {
+                name = n.first;
+                break;
+            }
+        out += (out.empty() ? "" : " ") + name;
+    }
+    return out;
+}
+
+/* A host from layers (PROTOCOL.md "Hosting from layers"): a theme drawing
+ * the panel with layers only hosts the map at a rect; the producer, told,
+ * moves its video there marked as the hosted map (as waze-on-cluster does)
+ * and it is drawn just under the theme's lowest drawn layer, over another
+ * client's layers below that and under its layers above; another client's
+ * unmarked video inside the rect keeps its place; a hidden theme layer is
+ * no anchor; an exclusive lowest theme layer: the map just over it, still
+ * shown; the edge; refusals (its own target, ref with into, an unknown
+ * into), each ending the client's host of the target, also a refused move,
+ * which the client forgets too (not sent again after a restart); a host
+ * with no layer drawn waits and blocks nobody; of two live themes the one
+ * sent first is live, the other waits, told why, and takes over while the
+ * first is hidden; live only while a theme layer is drawn and the panel is
+ * on screen (hidden, or the stock HMI taking the panel: the producer is
+ * told the map is not hosted, the theme why); a scene file with layers 1 on
+ * the panel keeps it live and the scene's own host wins over it, one
+ * without layers makes it wait; unhost; kept by the client across a service
+ * restart; the theme's client gone or crashed (its socket closed with
+ * nothing said): the map not hosted any more. */
+static void hosting_from_layers()
+{
+    char tmpl[] = "/tmp/crs-service-layerhost-XXXXXX";
+    const std::string root = mkdtemp(tmpl) ? tmpl : "/nonexistent";
+    const std::string gauge = written(root + "/gauge.scene", kGaugeScene);
+    Rig r;
+    r.sc.targets[1].scene_files = true;
+    r.sc.scene_files.root = root;
+    r.sc.scene_files.owner = getuid();
+    r.start();
+    cr::Client a("theme", r.path), b("producer", r.path), o("other", r.path);
+    Events ea, eb, eo;
+    ea.wire(a);
+    eb.wire(b);
+    eo.wire(o);
+    std::vector<cr::Host> told;
+    b.on_host = [&told](const cr::Host &h) { told.push_back(h); };
+    std::map<std::string, std::string> hosting;   /* the theme's hosting events: state[: reason] */
+    a.on_hosting = [&hosting](const std::string &t, const std::string &, const std::string &state,
+                              const std::string &why) { hosting[t] = state + (why.empty() ? "" : ": " + why); };
+    r.clients = {&a, &b, &o};
+    r.pump(50);
+    ok("layer hosts: the hello says the service takes them", a.takes_host_layers());
+
+    /* The producer's map on its own slot. */
+    cr::LayerOptions ml;
+    ml.target = "map";
+    ml.contend = true;
+    uint32_t video = b.video(ml, cr::VideoOptions());
+    const std::vector<uint8_t> f1 = atlas(1);
+    b.frame(video, f1.data(), f1.size(), 1);
+    r.pump(1500);
+    ok("layer hosts: the producer's map shown on its slot", eb.layer[video] == "shown" && eb.target["map"] == "shown");
+
+    /* The theme: a background over the whole panel and a frame, layers
+     * only; another client's layers below and above them. */
+    const cr::EffectOptions fx{"#version 100\nvoid main(){gl_FragColor=vec4(0.0);}", "", 0};
+    const Rect R_BG{0, 0, 1920, 720}, R_FRAME{690, 150, 580, 420}, R_MAP{700, 160, 560, 400}, R_LOW{10, 10, 100, 100},
+               R_HIGH{20, 20, 50, 50}, R_MID{30, 600, 80, 80}, R_OVID{760, 200, 128, 96}, R_AMB{40, 40, 60, 60},
+               R_T2{620, 500, 50, 50};
+    auto lo_at = [](const Rect &q, const char *klass, int z) {
+        cr::LayerOptions l;
+        l.target = "panel";
+        l.klass = klass;
+        l.z = z;
+        l.x = q.x; l.y = q.y; l.w = q.w; l.h = q.h;
+        return l;
+    };
+    const cr::LayerOptions bg_lo = lo_at(R_BG, "content", 0), frame_lo = lo_at(R_FRAME, "content", 0);
+    const uint32_t low = o.effect(lo_at(R_LOW, "ambient", 0), fx);
+    const uint32_t mid = o.effect(lo_at(R_MID, "content", -1), fx);
+    const uint32_t bg = a.effect(bg_lo, fx);
+    const uint32_t frame = a.effect(frame_lo, fx);
+    const uint32_t high = o.effect(lo_at(R_HIGH, "overlay", 0), fx);
+    r.pump(1500);
+    ok("layer hosts: the theme and the other client shown on the panel",
+       ea.layer[bg] == "shown" && ea.layer[frame] == "shown" && eo.layer[low] == "shown" && eo.layer[mid] == "shown" &&
+           eo.layer[high] == "shown");
+
+    cr::Host h;
+    h.into = "panel";
+    h.target = "map";
+    h.x = 700; h.y = 160; h.w = 560; h.h = 400;
+    h.src_x = 264; h.src_y = 40; h.src_w = 560; h.src_h = 400;
+    /* A background client hosting first, a tiny layer of its own under the
+     * theme's over its rect: live alone, but the theme, drawn higher over
+     * the map, wins. */
+    cr::Host gh = h;
+    gh.x = 640;
+    std::map<std::string, std::string> hosting_bg;
+    {
+        cr::Client bgc("background", r.path);
+        bgc.on_hosting = [&hosting_bg](const std::string &t, const std::string &, const std::string &state,
+                                       const std::string &why) { hosting_bg[t] = state + (why.empty() ? "" : ": " + why); };
+        r.clients.push_back(&bgc);
+        r.pump(50);
+        bgc.effect(lo_at(Rect{710, 170, 1, 1}, "ambient", 0), fx);
+        bgc.host(gh);
+        r.pump(300);
+        ok("layer hosts: a background client's early host with a tiny layer: live while alone",
+           b.hosts.count("map") && b.hosts["map"].x == 640 && hosting_bg["map"] == "live");
+        ok("layer hosts: the client keeps and sends it", a.host(h));
+        r.pump(300);
+        ok("layer hosts: the visible theme, drawn higher over the map, wins over the host sent first",
+           b.hosts.count("map") && b.hosts["map"].x == 700 &&
+               hosting_bg["map"] == "waiting: target map is hosted by another client's layers, drawn higher over it");
+        r.clients.pop_back();
+    }
+    r.pump(100);
+    ok("layer hosts: the producer told the map is hosted in the panel at the rect, the theme that it is live",
+       b.hosts.count("map") && b.hosts["map"].into == "panel" && b.hosts["map"].x == 700 &&
+           b.hosts["map"].src_x == 264 && b.hosts["map"].shown && !told.empty() && hosting["map"] == "live");
+    ok("layer hosts: the status names it, live",
+       has(r.svc->server().status_text(r.now), "theme hosts map from its layers on panel at 560x400+700+160 from "
+                                               "560x400+264+40; live"));
+
+    /* The producer moves its video into the rect, as waze-on-cluster does:
+     * marked as the hosted map, made after the theme's layers, content z 0,
+     * which alone would be on top of the frame. */
+    b.drop(video);
+    cr::LayerOptions hl = lo_at(R_MAP, "content", 0);
+    hl.hosted = "map";
+    cr::VideoOptions crop;
+    crop.w = 560;
+    crop.h = 400;
+    crop.stall_ms = 600000;
+    video = b.video(hl, crop);
+    std::vector<uint8_t> f2(560 * 600, 90);
+    b.frame(video, f2.data(), f2.size(), 2);
+    r.pump(2000);
+    const std::vector<std::pair<std::string, Rect>> names = {{"low", R_LOW},     {"mid", R_MID}, {"bg", R_BG},
+                                                             {"frame", R_FRAME}, {"map", R_MAP}, {"high", R_HIGH},
+                                                             {"ovid", R_OVID},   {"t2", R_T2}};
+    FakeGraph *g = r.gpu.graph("panel");
+    ok("layer hosts: the map under the theme's layers, over the other client's below them, under its overlay",
+       eb.layer[video] == "shown" && eb.target["map"] == "idle" && stack_of(g, names) == "low mid map bg frame high");
+    cr::LayerOptions unmarked = hl;
+    unmarked.hosted.clear();
+    b.set(video, unmarked);
+    r.pump(200);
+    ok("layer hosts: the mark cleared with set(): the video at its own place, over the frame",
+       stack_of(r.gpu.graph("panel"), names) == "low mid bg frame map high");
+    b.set(video, hl);
+    r.pump(200);
+    ok("layer hosts: marked again: under the theme again", stack_of(r.gpu.graph("panel"), names) == "low mid map bg frame high");
+
+    /* A client drawing over the theme at its rect wins; the map is then
+     * drawn over the theme's layers there too, never under them, though its
+     * lowest layer is below them. */
+    {
+        cr::Client top("top", r.path);
+        r.clients.push_back(&top);
+        r.pump(50);
+        top.effect(lo_at(Rect{710, 170, 1, 1}, "ambient", 0), fx);
+        top.effect(lo_at(Rect{712, 172, 1, 1}, "overlay", 0), fx);
+        top.host(gh);
+        r.pump(300);
+        ok("layer hosts: a client drawing over the theme wins, the theme told why, the map over the theme's layers",
+           b.hosts["map"].x == 640 &&
+               hosting["map"] == "waiting: target map is hosted by another client's layers, drawn higher over it" &&
+               stack_of(r.gpu.graph("panel"), names) == "low ? mid bg frame map high ?");
+        r.clients.pop_back();
+    }
+    r.pump(300);
+    /* An image at opacity 0 over the rect is not seen: it wins nothing,
+     * however high it is. */
+    {
+        cr::Client ghost("ghost", r.path);
+        std::map<std::string, std::string> hosting_ghost;
+        ghost.on_hosting = [&hosting_ghost](const std::string &t, const std::string &, const std::string &state,
+                                            const std::string &why) { hosting_ghost[t] = state + (why.empty() ? "" : ": " + why); };
+        r.clients.push_back(&ghost);
+        r.pump(50);
+        cr::LayerOptions clear = lo_at(Rect{712, 172, 4, 4}, "overlay", 0);
+        clear.opacity = 0;
+        cr::ImageOptions io4;
+        io4.w = io4.h = 4;
+        const uint32_t img = ghost.image(clear, io4);
+        std::vector<uint8_t> px4(4 * 4 * 4, 255);
+        ghost.pixels(img, {}, px4.data(), px4.size());
+        ghost.host(gh);
+        r.pump(300);
+        ok("layer hosts: a client whose only layer over its rect is an image at opacity 0: not eligible, the theme live",
+           b.hosts["map"].x == 700 && hosting["map"] == "live" &&
+               hosting_ghost["map"] == "waiting: no layer of the client is drawn over its rect on panel");
+        r.clients.pop_back();
+    }
+    r.pump(300);
+    /* Clients whose hosts are not eligible (shown 0; a rect its layers are
+     * not over) never move the picture, an alert layer of theirs over the
+     * rect included: it stays by the theme's anchor. */
+    {
+        cr::Client off("off", r.path), away("away", r.path);
+        r.clients.push_back(&off);
+        r.clients.push_back(&away);
+        r.pump(50);
+        off.effect(lo_at(Rect{720, 180, 4, 4}, "alert", 0), fx);
+        cr::Host hidden_host = gh;
+        hidden_host.shown = false;
+        off.host(hidden_host);
+        away.effect(lo_at(Rect{730, 190, 4, 4}, "alert", 0), fx);
+        cr::Host elsewhere = gh;
+        elsewhere.x = 100; elsewhere.y = 40; elsewhere.w = 100; elsewhere.h = 50;
+        away.host(elsewhere);
+        r.pump(300);
+        ok("layer hosts: hosts not eligible, with alert layers over the rect: the map still under the theme",
+           b.hosts["map"].x == 700 && hosting["map"] == "live" &&
+               stack_of(r.gpu.graph("panel"), names) == "low mid map bg frame high ? ?");
+        r.clients.pop_back();
+        r.clients.pop_back();
+    }
+    r.pump(300);
+    ok("layer hosts: that client gone: the theme live again", b.hosts["map"].x == 700 && hosting["map"] == "live" &&
+                                                                  stack_of(r.gpu.graph("panel"), names) == "low mid map bg frame high");
+
+    /* shown 0: a host from layers shows the map nowhere, so it is not live:
+     * the map goes back to its own slot. */
+    cr::Host nowhere = h;
+    nowhere.shown = false;
+    a.host(nowhere);
+    r.pump(100);
+    ok("layer hosts: shown 0: not live, the producer told the map is not hosted, the theme why",
+       !b.hosts.count("map") && hosting["map"] == "waiting: it shows the target nowhere (shown 0)");
+    a.host(h);
+    r.pump(100);
+
+    /* Another client's video inside the rect, not marked: its own place. */
+    cr::VideoOptions small;
+    small.w = 128;
+    small.h = 96;
+    small.stall_ms = 600000;
+    const uint32_t ovid = o.video(lo_at(R_OVID, "overlay", 0), small);
+    std::vector<uint8_t> f3(128 * 144, 60);
+    o.frame(ovid, f3.data(), f3.size(), 1);
+    r.pump(1000);
+    ok("layer hosts: another client's overlay video inside the rect keeps its place, over the theme",
+       eo.layer[ovid] == "shown" && stack_of(r.gpu.graph("panel"), names) == "low mid map bg frame high ovid");
+    o.drop(ovid);
+    r.pump(200);
+
+    /* A hidden theme layer is no anchor: one of a lower class leaves the
+     * map where it was, over the other client's content. */
+    cr::LayerOptions amb_lo = lo_at(R_AMB, "ambient", 0);
+    amb_lo.visible = false;
+    const uint32_t amb = a.effect(amb_lo, fx);
+    r.pump(200);
+    ok("layer hosts: a hidden ambient theme layer: the map still by the lowest drawn one",
+       stack_of(r.gpu.graph("panel"), names) == "low mid map bg frame high");
+    a.drop(amb);
+    r.pump(200);
+
+    /* An exclusive lowest theme layer: the map just over it, so it is not
+     * suspended with what is below. */
+    cr::LayerOptions ex = bg_lo;
+    ex.exclusive = true;
+    a.set(bg, ex);
+    r.pump(500);
+    ok("layer hosts: an exclusive background: the map just over it, shown, still hosted",
+       eb.layer[video] == "shown" && b.hosts.count("map") && stack_of(r.gpu.graph("panel"), names) == "bg map frame high");
+    a.set(bg, bg_lo);
+    r.pump(500);
+    ok("layer hosts: not exclusive again: back under it", stack_of(r.gpu.graph("panel"), names) == "low mid map bg frame high");
+
+    /* The edge works as for a scene's host. */
+    cr::Host eh = h;
+    eh.edge_top = 40;
+    eh.edge_bottom = 40;
+    eh.edge_dim = 160;
+    a.host(eh);
+    r.pump(100);
+    int edges = 0;
+    g = r.gpu.graph("panel");
+    for (int q : g->visible())
+        edges += g->shown.quads.at(q).uniforms.count("u_edge") ? 1 : 0;
+    ok("layer hosts: an edge drawn on the hosted video", edges == 2);
+    a.host(h);
+    r.pump(100);
+
+    /* Refusals; a host with no layer drawn waits and blocks nobody. */
+    cr::Host own = h;
+    own.target = "panel";
+    ok("layer hosts: its own target refused by the client", !a.host(own));
+    {
+        Raw raw(r.path);
+        raw.send("{\"op\":\"hello\",\"app\":\"raw\",\"proto\":1}");
+        raw.send("{\"op\":\"host\",\"into\":\"panel\",\"target\":\"map\",\"x\":0,\"y\":0,\"w\":10,\"h\":10}");
+        raw.send("{\"op\":\"host\",\"into\":\"panel\",\"target\":\"map\",\"x\":0,\"y\":0,\"w\":100,\"h\":50,"
+                 "\"src_x\":0,\"src_y\":0,\"src_w\":32,\"src_h\":16}");
+        raw.send("{\"op\":\"host\",\"into\":\"panel\",\"target\":\"panel\",\"x\":0,\"y\":0,\"w\":10,\"h\":10}");
+        raw.send("{\"op\":\"host\",\"into\":\"panel\",\"ref\":3,\"target\":\"map\",\"x\":0,\"y\":0,\"w\":10,\"h\":10}");
+        raw.send("{\"op\":\"host\",\"into\":\"nowhere\",\"target\":\"hud\",\"x\":0,\"y\":0,\"w\":10,\"h\":10}");
+        raw.send("{\"op\":\"host\",\"into\":\"panel\",\"target\":\"map\",\"x\":0,\"y\":0,\"w\":100,\"h\":50}");
+        r.pump(100);
+        const std::string got = raw.events();
+        ok("layer hosts: refused: a rect or part under 64x32, its own target, ref with into, an unknown into, naming into",
+               got.find("a host from layers is at least 64x32 (w, h and src_w, src_h)") != std::string::npos &&
+               got.find("a host shows other targets, not its own") != std::string::npos &&
+               got.find("ref or into, not both") != std::string::npos &&
+               got.find("unknown target nowhere") != std::string::npos &&
+               got.find("\"into\":\"panel\"") != std::string::npos);
+        ok("layer hosts: a host with no layer drawn: taken, waiting and told why, the theme's still live",
+           got.find("\"ev\":\"hosting\",\"target\":\"map\",\"into\":\"panel\",\"state\":\"waiting\","
+                    "\"reason\":\"no layer of the client is drawn over its rect on panel\"") != std::string::npos &&
+               b.hosts.count("map") && b.hosts["map"].x == 700 && hosting["map"] == "live");
+    }
+
+    /* Two live themes: the one drawn higher over its rect (the newer, here)
+     * is live, the other waits; it hidden, the first takes over: a hidden
+     * theme blocks nothing. */
+    {
+        cr::Client t2("theme2", r.path);
+        std::map<std::string, std::string> hosting2;
+        t2.on_hosting = [&hosting2](const std::string &t, const std::string &, const std::string &state,
+                                    const std::string &why) { hosting2[t] = state + (why.empty() ? "" : ": " + why); };
+        r.clients.push_back(&t2);
+        r.pump(50);
+        const uint32_t t2_layer = t2.effect(lo_at(R_T2, "content", 0), fx);
+        cr::Host h2 = h;
+        h2.x = 600;
+        t2.host(h2);
+        r.pump(500);
+        ok("layer hosts: a second theme drawn higher over its rect is live; the first waits, told why",
+           b.hosts["map"].x == 600 && hosting2["map"] == "live" &&
+               hosting["map"] == "waiting: target map is hosted by another client's layers, drawn higher over it" &&
+               has(r.svc->server().status_text(r.now), "(theme2)"));
+        cr::LayerOptions t2_hidden = lo_at(R_T2, "content", 0);
+        t2_hidden.visible = false;
+        t2.set(t2_layer, t2_hidden);
+        r.pump(500);
+        ok("layer hosts: the second theme hidden: it blocks nothing, the first is live again",
+           b.hosts.count("map") && b.hosts["map"].x == 700 && hosting["map"] == "live" &&
+               hosting2["map"] == "waiting: no layer of the client is drawn over its rect on panel");
+        r.clients.pop_back();
+    }
+    r.pump(200);
+
+    /* Live only while a theme layer is drawn. */
+    cr::LayerOptions hidden = bg_lo;
+    hidden.visible = false;
+    a.set(bg, hidden);
+    r.pump(100);
+    ok("layer hosts: one theme layer hidden, the other shown: still hosted", b.hosts.count("map"));
+    hidden = frame_lo;
+    hidden.visible = false;
+    a.set(frame, hidden);
+    r.pump(100);
+    ok("layer hosts: every theme layer hidden: the producer told the map is not hosted, the status says why",
+       !b.hosts.count("map") && told.back().into.empty() &&
+           has(r.svc->server().status_text(r.now), "waiting: no layer of the client is drawn over its rect on panel"));
+    a.set(bg, bg_lo);
+    a.set(frame, frame_lo);
+    r.pump(100);
+    ok("layer hosts: shown again: hosted again", b.hosts.count("map") && b.hosts["map"].into == "panel");
+
+    /* The stock HMI taking the panel: nobody sees it, so not hosted. */
+    r.port.steal(r.sc.targets[1]);
+    r.pump(200);
+    ok("layer hosts: the stock HMI takes the panel: the map not hosted, the theme told why",
+       !b.hosts.count("map") && hosting["map"].find("waiting: panel is not on screen") == 0);
+    r.port.free_slot(r.sc.targets[1]);
+    r.pump(2000);
+    ok("layer hosts: the panel back: hosted again", b.hosts.count("map") && hosting["map"] == "live");
+
+    /* A scene file on the panel: with layers 1 the layers are drawn over
+     * it, so the theme's host can be live, but the scene's own host of the
+     * map wins (as without hosts from layers); without layers they wait. */
+    cr::SceneOptions so;
+    so.target = "panel";
+    so.file = gauge;
+    so.sha256 = {sha256_file(gauge)};
+    so.layers = true;
+    const uint32_t sc = o.scene(so);
+    r.pump(1500);
+    ok("layer hosts: another client's scene with layers 1: still hosted by the theme",
+       eo.layer[sc] == "shown" && b.hosts.count("map") && b.hosts["map"].x == 700);
+    cr::Host sh = h;
+    sh.into.clear();
+    sh.x = 600;
+    o.host(sc, sh);
+    r.pump(200);
+    ok("layer hosts: the scene's host of the map taken and live, the theme's waits, told why",
+       !has(eo.errors, "host:") && b.hosts.count("map") && b.hosts["map"].x == 600 &&
+           hosting["map"] == "waiting: target map is hosted by a scene");
+    so.layers = false;
+    o.scene(sc, so);
+    r.pump(1500);
+    ok("layer hosts: the scene without layers: the theme's layers wait, the map not hosted, the theme told why",
+       ea.layer[bg] == "waiting" && !b.hosts.count("map") &&
+           hosting["map"] == "waiting: panel's layers wait for a scene file there");
+    o.drop(sc);
+    r.pump(1500);
+    ok("layer hosts: the scene dropped: hosted by the theme again",
+       b.hosts.count("map") && b.hosts["map"].x == 700 && ea.layer[bg] == "shown");
+
+    /* unhost. */
+    a.unhost("map");
+    r.pump(100);
+    ok("layer hosts: unhost: the producer told the map is not hosted, nothing in the status",
+       !b.hosts.count("map") && told.back().into.empty() && !has(r.svc->server().status_text(r.now), "hosts map"));
+
+    /* A refused move to another into ends the host, and the client forgets
+     * it: not sent again after a restart. */
+    a.host(h);
+    r.pump(100);
+    cr::Host moved = h;
+    moved.into = "nowhere";
+    a.host(moved);
+    r.pump(100);
+    ok("layer hosts: a move to an unknown into refused: the host ended, the producer told",
+       has(ea.errors, "host: unknown target nowhere") && !b.hosts.count("map") && told.back().into.empty());
+    r.svc.reset();
+    r.pump(100);
+    r.start();
+    r.pump(1500);
+    ok("layer hosts: after a restart the client sends no host it was refused", !b.hosts.count("map"));
+
+    /* Kept by the client across a restart. */
+    a.host(h);
+    r.pump(100);
+    r.svc.reset();
+    r.pump(100);
+    ok("layer hosts: the service gone: nothing hosted", b.hosts.empty());
+    r.start();
+    r.pump(1500);
+    b.frame(video, f2.data(), f2.size(), 3);
+    r.pump(1000);
+    ok("layer hosts: after a restart the client sends it again: hosted, the map under the theme again",
+       b.hosts.count("map") && b.hosts["map"].into == "panel" &&
+           stack_of(r.gpu.graph("panel"), names) == "low mid map bg frame high");
+
+    /* The theme's client gone (it exits). */
+    a.unhost("map");
+    r.pump(100);
+    {
+        std::unique_ptr<cr::Client> t(new cr::Client("theme2", r.path));
+        r.clients.push_back(t.get());
+        r.pump(50);
+        t->effect(bg_lo, fx);
+        t->host(h);
+        r.pump(1500);
+        ok("layer hosts: another theme hosts the map once the first ended its host",
+           b.hosts.count("map") && b.hosts["map"].into == "panel" &&
+               has(r.svc->server().status_text(r.now), "theme2 hosts map"));
+        r.clients.pop_back();
+    }
+    r.pump(100);
+    ok("layer hosts: that theme's client gone: the map not hosted", !b.hosts.count("map") && told.back().into.empty());
+
+    /* Crashed: a socket that closes with nothing more said. */
+    {
+        Raw crash(r.path);
+        crash.send("{\"op\":\"hello\",\"app\":\"crash\",\"proto\":1}");
+        crash.send("{\"op\":\"layer\",\"ref\":1,\"target\":\"panel\",\"kind\":\"effect\",\"x\":0,\"y\":0,"
+                   "\"w\":1920,\"h\":720,\"fs\":\"#version 100\\nvoid main(){gl_FragColor=vec4(0.0);}\"}");
+        crash.send("{\"op\":\"host\",\"into\":\"panel\",\"target\":\"map\",\"x\":700,\"y\":160,\"w\":560,\"h\":400}");
+        r.pump(1500);
+        ok("layer hosts: a raw client hosts the map", b.hosts.count("map") && b.hosts["map"].into == "panel");
+    }
+    r.pump(100);
+    ok("layer hosts: its socket closed with nothing said: the map not hosted",
+       !b.hosts.count("map") && told.back().into.empty());
+    const int removed = std::system(("rm -rf " + root).c_str());
+    (void)removed;
+}
+
+/* Hosts from layers with a third target, hud: two hosted targets, each with
+ * its producer's marked video, into one target, each video by its own
+ * host's anchor (the second restack finds its anchor after the first moved
+ * layers); hosts on different intos: the into that holds the target keeps
+ * it while it has an eligible host, a host on another into sent later
+ * waits, told why, and does not take it by unhost and host again; it takes
+ * over once the live one is hidden, and keeps it when that one is shown
+ * again. */
+static void hosting_from_layers_more()
+{
+    Rig r;
+    TargetSpec u;
+    u.name = "hud"; u.slot = 0x323; u.scene_id = 0x010004f9; u.width = 800; u.height = 480; u.linger_ms = 3000;
+    r.sc.targets.push_back(u);
+    r.start();
+    cr::Client a("themeA", r.path), bb("themeB", r.path), pm("mapper", r.path), ph("hudder", r.path);
+    std::map<std::string, std::string> hosting_a, hosting_b;
+    a.on_hosting = [&hosting_a](const std::string &t, const std::string &, const std::string &state,
+                                const std::string &why) { hosting_a[t] = state + (why.empty() ? "" : ": " + why); };
+    bb.on_hosting = [&hosting_b](const std::string &t, const std::string &, const std::string &state,
+                                 const std::string &why) { hosting_b[t] = state + (why.empty() ? "" : ": " + why); };
+    r.clients = {&a, &bb, &pm, &ph};
+    r.pump(50);
+    const cr::EffectOptions fx{"#version 100\nvoid main(){gl_FragColor=vec4(0.0);}", "", 0};
+    auto lo_at = [](const char *target, const Rect &q, const char *klass) {
+        cr::LayerOptions l;
+        l.target = target;
+        l.klass = klass;
+        l.x = q.x; l.y = q.y; l.w = q.w; l.h = q.h;
+        return l;
+    };
+    const Rect R_A{0, 0, 1920, 720}, R_B{1000, 100, 600, 400}, R_MV{100, 100, 560, 400}, R_HV{1040, 140, 400, 240};
+    const uint32_t a_layer = a.effect(lo_at("panel", R_A, "content"), fx);
+    bb.effect(lo_at("panel", R_B, "content"), fx);
+    r.pump(1500);
+    cr::Host hm;
+    hm.into = "panel"; hm.target = "map";
+    hm.x = 100; hm.y = 100; hm.w = 560; hm.h = 400;
+    a.host(hm);
+    cr::Host hh;
+    hh.into = "panel"; hh.target = "hud";
+    hh.x = 1040; hh.y = 140; hh.w = 400; hh.h = 240;
+    bb.host(hh);
+    r.pump(300);
+    /* the producers' marked videos, made after the themes' layers */
+    cr::LayerOptions mv = lo_at("panel", R_MV, "content");
+    mv.hosted = "map";
+    cr::VideoOptions vm;
+    vm.w = 560; vm.h = 400; vm.stall_ms = 600000;
+    const uint32_t mvid = pm.video(mv, vm);
+    std::vector<uint8_t> fm(560 * 600, 90);
+    pm.frame(mvid, fm.data(), fm.size(), 1);
+    cr::LayerOptions hv = lo_at("panel", R_HV, "content");
+    hv.hosted = "hud";
+    cr::VideoOptions vh;
+    vh.w = 400; vh.h = 240; vh.stall_ms = 600000;
+    const uint32_t hvid = ph.video(hv, vh);
+    std::vector<uint8_t> fh(400 * 360, 120);
+    ph.frame(hvid, fh.data(), fh.size(), 1);
+    r.pump(1500);
+    const std::vector<std::pair<std::string, Rect>> names = {{"A", R_A}, {"B", R_B}, {"mv", R_MV}, {"hv", R_HV}};
+    ok("layer hosts: two hosted targets into one target: each video by its own host's anchor",
+       hosting_a["map"] == "live" && hosting_b["hud"] == "live" && stack_of(r.gpu.graph("panel"), names) == "mv A hv B");
+    pm.drop(mvid);
+    ph.drop(hvid);
+    bb.unhost("hud");
+    r.pump(300);
+
+    /* Hosts on different intos: themeA holds the map on the panel; themeB,
+     * a layer on the hud over its rect, hosts the map into the hud later. */
+    bb.effect(lo_at("hud", Rect{0, 0, 800, 480}, "content"), fx);
+    cr::Host hb;
+    hb.into = "hud"; hb.target = "map";
+    hb.x = 100; hb.y = 100; hb.w = 400; hb.h = 240;
+    bb.host(hb);
+    r.pump(1500);
+    ok("layer hosts: a host on another into sent later waits, told why; the live one keeps the map",
+       hosting_a["map"] == "live" &&
+           hosting_b["map"] == "waiting: target map is hosted by another client's layers on panel, there first" &&
+           pm.hosts.count("map") && pm.hosts["map"].into == "panel");
+    for (int k = 0; k < 3; k++) {
+        bb.unhost("map");
+        r.pump(100);
+        bb.host(hb);
+        r.pump(300);
+    }
+    ok("layer hosts: unhost and host again does not take it", hosting_a["map"] == "live" &&
+                                                             pm.hosts["map"].into == "panel" &&
+                                                             hosting_b["map"].find("waiting") == 0);
+    cr::LayerOptions a_hidden = lo_at("panel", R_A, "content");
+    a_hidden.visible = false;
+    a.set(a_layer, a_hidden);
+    r.pump(500);
+    ok("layer hosts: the live one hidden: the one waiting takes over",
+       hosting_b["map"] == "live" && pm.hosts["map"].into == "hud" &&
+           hosting_a["map"] == "waiting: no layer of the client is drawn over its rect on panel");
+    a.set(a_layer, lo_at("panel", R_A, "content"));
+    r.pump(1500);
+    ok("layer hosts: shown again, it does not take the map back: the one live keeps it",
+       hosting_b["map"] == "live" && pm.hosts["map"].into == "hud" &&
+           hosting_a["map"] == "waiting: target map is hosted by another client's layers on hud, there first");
+    bb.unhost("map");
+    r.pump(500);
+    ok("layer hosts: that one gone: the first live again", hosting_a["map"] == "live" && pm.hosts["map"].into == "panel");
+}
+
+/* The holding into keeps the map: themeA (panel, live), themeB (hud,
+ * waiting) and themeC (panel, eligible, drawn lower than themeA). themeA
+ * hidden, unhosted, or gone: themeC on the same into takes the map, not
+ * themeB; themeA back (shown, hosting again) wins again on the panel. */
+static void holding_into()
+{
+    Rig r;
+    TargetSpec u;
+    u.name = "hud"; u.slot = 0x323; u.scene_id = 0x010004f9; u.width = 800; u.height = 480; u.linger_ms = 3000;
+    r.sc.targets.push_back(u);
+    r.start();
+    std::unique_ptr<cr::Client> a(new cr::Client("themeA", r.path));
+    cr::Client bb("themeB", r.path), cc("themeC", r.path), pm("mapper", r.path);
+    std::map<std::string, std::string> hosting_b, hosting_c;
+    bb.on_hosting = [&hosting_b](const std::string &t, const std::string &, const std::string &state,
+                                 const std::string &why) { hosting_b[t] = state + (why.empty() ? "" : ": " + why); };
+    cc.on_hosting = [&hosting_c](const std::string &t, const std::string &, const std::string &state,
+                                 const std::string &why) { hosting_c[t] = state + (why.empty() ? "" : ": " + why); };
+    r.clients = {a.get(), &bb, &cc, &pm};
+    r.pump(50);
+    const cr::EffectOptions fx{"#version 100\nvoid main(){gl_FragColor=vec4(0.0);}", "", 0};
+    auto lo_at = [](const char *target, const Rect &q, const char *klass) {
+        cr::LayerOptions l;
+        l.target = target;
+        l.klass = klass;
+        l.x = q.x; l.y = q.y; l.w = q.w; l.h = q.h;
+        return l;
+    };
+    auto host = [](const char *into, int x, unsigned w, unsigned h) {
+        cr::Host o;
+        o.into = into; o.target = "map";
+        o.x = x; o.y = 100; o.w = w; o.h = h;
+        return o;
+    };
+    const cr::LayerOptions a_lo = lo_at("panel", Rect{0, 0, 1920, 720}, "content");
+    const uint32_t a_layer = a->effect(a_lo, fx);
+    bb.effect(lo_at("hud", Rect{0, 0, 800, 480}, "content"), fx);
+    cc.effect(lo_at("panel", Rect{800, 100, 560, 400}, "ambient"), fx);
+    r.pump(1500);
+    const cr::Host ha = host("panel", 100, 560, 400);
+    a->host(ha);
+    r.pump(300);
+    bb.host(host("hud", 100, 400, 240));
+    r.pump(300);
+    cc.host(host("panel", 800, 560, 400));
+    r.pump(500);
+    auto at = [&pm](const char *into, int x) { return pm.hosts.count("map") && pm.hosts["map"].into == into && pm.hosts["map"].x == x; };
+    ok("holding: themeA live on the panel, themeB on the hud waits, themeC lower on the panel waits",
+       at("panel", 100) && hosting_b["map"] == "waiting: target map is hosted by another client's layers on panel, there first" &&
+           hosting_c["map"] == "waiting: target map is hosted by another client's layers, drawn higher over it");
+
+    cr::LayerOptions hidden = a_lo;
+    hidden.visible = false;
+    a->set(a_layer, hidden);
+    r.pump(500);
+    ok("holding: themeA hidden: themeC on the panel takes the map, not themeB",
+       at("panel", 800) && hosting_c["map"] == "live" && hosting_b["map"].find("waiting") == 0);
+    a->set(a_layer, a_lo);
+    r.pump(500);
+    ok("holding: themeA shown again: live again", at("panel", 100));
+
+    a->unhost("map");
+    r.pump(500);
+    ok("holding: themeA unhosts: themeC on the panel takes the map, not themeB",
+       at("panel", 800) && hosting_c["map"] == "live" && hosting_b["map"].find("waiting") == 0);
+    a->host(ha);
+    r.pump(500);
+    ok("holding: themeA hosts again: live again on the panel", at("panel", 100));
+
+    r.clients = {&bb, &cc, &pm};
+    a.reset();
+    r.pump(500);
+    ok("holding: themeA gone: themeC on the panel takes the map, not themeB",
+       at("panel", 800) && hosting_c["map"] == "live" && hosting_b["map"].find("waiting") == 0);
+}
+
+/* PROTOCOL.md "Canvases", over the socket with the C++ client: the hello
+ * says the service takes canvases; a depth canvas with an effect drawn in
+ * it with stencil state, sampled by a layer on screen; made again after a
+ * service restart; stencil on screen, a canvas of another client, an image
+ * in a canvas and a canvas past its limits refused with nothing made. */
+static void canvases_over_socket()
+{
+    Rig r;
+    cr::Client c("theme", r.path);
+    Events e;
+    e.wire(c);
+    r.clients = {&c};
+    r.pump(50);
+    ok("canvas: the hello says the service takes canvases", c.takes_canvas());
+    cr::CanvasOptions co;
+    co.target = "panel";
+    co.w = 320;
+    co.h = 160;
+    co.depth = true;
+    co.clear[3] = 1;
+    const uint32_t cv = c.canvas(co);
+    cr::LayerOptions in;
+    in.w = 320;
+    in.h = 160;
+    cr::RenderState mask;
+    mask.stencil_func = "always";
+    mask.stencil_ref = 1;
+    mask.stencil_pass = "replace";
+    const uint32_t art = c.effect_in(cv, in,
+                                     cr::EffectOptions{"#version 100\nprecision mediump float;\nvoid main(){"
+                                                       "gl_FragColor=vec4(1.0,0.5,0.0,1.0);}",
+                                                       "", 0},
+                                     false, mask);
+    cr::LayerOptions lo;
+    lo.target = "panel";
+    lo.klass = "overlay";
+    lo.x = 100;
+    lo.y = 100;
+    lo.w = 320;
+    lo.h = 160;
+    const uint32_t shown = c.effect(lo, cr::EffectOptions{"#version 100\nprecision mediump float;\n"
+                                                          "uniform sampler2D u_canvas;\nvarying vec2 v_uv;\n"
+                                                          "void main(){gl_FragColor=texture2D(u_canvas,v_uv);}",
+                                                          "", 0});
+    c.bind(shown, "u_canvas", cv);
+    r.pump(400);
+    auto check = [&](const char *when) {
+        FakeGraph *g = r.gpu.graph("panel");
+        int handle = 0;
+        const FakeQuad *aq = nullptr, *sq = nullptr;
+        if (g) {
+            for (const auto &kv : g->shown.canvases)
+                handle = kv.first;
+            for (const auto &kv : g->shown.quads)
+                (kv.second.canvas ? aq : sq) = &kv.second;
+        }
+        ok((std::string("canvas: ") + when + ": made in the panel's scene, with depth").c_str(),
+           handle && g->shown.canvases.at(handle).spec.depth && g->shown.canvases.at(handle).spec.w == 320);
+        ok((std::string("canvas: ") + when + ": the effect drawn in it, with its stencil state").c_str(),
+           aq && aq->canvas == handle && aq->look.stencil.func == StencilFunc::Always &&
+               aq->look.stencil.ref == 1 && aq->look.stencil.pass == StencilOp::Replace);
+        ok((std::string("canvas: ") + when + ": sampled by the layer on screen").c_str(),
+           sq && sq->textures.count("u_canvas") && sq->textures.at("u_canvas") == handle);
+    };
+    check("made");
+    ok("canvas: both layers shown", e.layer[art] == "shown" && e.layer[shown] == "shown");
+    r.svc.reset();
+    r.start();
+    r.pump(3000);
+    check("after a service restart");
+    ok("canvas: no error so far", e.errors.empty());
+
+    Raw raw(r.path);
+    raw.send("{\"op\":\"hello\",\"app\":\"raw\",\"proto\":1}");
+    raw.send("{\"op\":\"layer\",\"ref\":1,\"target\":\"panel\",\"kind\":\"effect\",\"fs\":\"void main(){}\","
+             "\"stencil_func\":\"always\"}");
+    raw.send("{\"op\":\"layer\",\"ref\":2,\"target\":\"panel\",\"kind\":\"effect\",\"fs\":\"void main(){}\","
+             "\"canvas\":" + std::to_string(cv) + "}");
+    raw.send("{\"op\":\"canvas\",\"ref\":3,\"target\":\"panel\",\"w\":64,\"h\":64}");
+    raw.send("{\"op\":\"layer\",\"ref\":4,\"target\":\"panel\",\"kind\":\"image\",\"canvas\":3}");
+    raw.send("{\"op\":\"layer\",\"ref\":5,\"target\":\"panel\",\"kind\":\"effect\",\"fs\":\"void main(){}\","
+             "\"canvas\":3,\"stencil_func\":\"always\"}");
+    raw.send("{\"op\":\"canvas\",\"ref\":6,\"target\":\"panel\",\"w\":4096,\"h\":64}");
+    raw.send("{\"op\":\"canvas\",\"ref\":7,\"target\":\"panel\",\"w\":64,\"h\":64,\"sampling\":\"trilinear\"}");
+    raw.send("{\"op\":\"canvas\",\"ref\":8,\"target\":\"panel\",\"w\":64,\"h\":64,\"clear\":\"1 1\"}");
+    r.pump(50);
+    const std::string ev = raw.events();
+    auto refused = [&](const char *op, int ref, const char *why) {
+        return ev.find(std::string("\"op\":\"") + op + "\",\"ref\":" + std::to_string(ref) + ",\"reason\":\"" + why) !=
+               std::string::npos;
+    };
+    ok("canvas: stencil on screen refused", refused("layer", 1, "stencil fields are for layers in a canvas with depth"));
+    ok("canvas: another client's canvas is not one's own", refused("layer", 2, "no such canvas"));
+    ok("canvas: an image does not draw in a canvas", refused("layer", 4, "only effect and mesh layers"));
+    ok("canvas: stencil in a canvas without depth refused", refused("layer", 5, "stencil fields are for layers"));
+    ok("canvas: past 2048 refused", refused("canvas", 6, "w must be a number from 1 to 2048"));
+    ok("canvas: mipmapped sampling refused", refused("canvas", 7, "a canvas has no mip levels"));
+    ok("canvas: a clear colour of two numbers refused", refused("canvas", 8, "clear is four numbers"));
+    ok("canvas: the raw client's one canvas made, nothing else",
+       r.svc->compositor().canvases().size() == 2 && r.svc->compositor().layers().size() == 2);
+
+    /* Stencil state kept field by field: stencil_func only as sent, off
+     * taken. */
+    raw.send("{\"op\":\"canvas\",\"ref\":9,\"target\":\"panel\",\"w\":32,\"h\":32,\"depth\":1}");
+    raw.send("{\"op\":\"layer\",\"ref\":10,\"target\":\"panel\",\"kind\":\"effect\",\"fs\":\"void main(){}\","
+             "\"canvas\":9,\"stencil_ref\":2}");
+    r.pump(50);
+    auto stencil = [&]() {
+        for (const crs::Canvas *c : r.svc->compositor().canvases())
+            if (c->spec().depth && c->spec().w == 32)
+                for (const crs::Layer *l : r.svc->compositor().layers())
+                    if (l->params.canvas == c->id())
+                        return static_cast<const crs::EffectLayer *>(l)->look().stencil;
+        return crs::StencilState();
+    };
+    ok("stencil: stencil_ref alone leaves the stencil off", stencil().func == crs::StencilFunc::Off &&
+                                                             stencil().ref == 2);
+    raw.send("{\"op\":\"set\",\"ref\":10,\"stencil_func\":\"equal\"}");
+    r.pump(50);
+    ok("stencil: stencil_func sent: on, the ref kept", stencil().func == crs::StencilFunc::Equal && stencil().ref == 2);
+    raw.send("{\"op\":\"set\",\"ref\":10,\"stencil_ref\":3}");
+    r.pump(50);
+    ok("stencil: a set without stencil_func keeps it", stencil().func == crs::StencilFunc::Equal &&
+                                                         stencil().ref == 3);
+    raw.send("{\"op\":\"set\",\"ref\":10,\"stencil_func\":\"off\"}");
+    r.pump(50);
+    ok("stencil: stencil_func off turns it off", stencil().func == crs::StencilFunc::Off &&
+                                                  raw.events().find("\"ref\":10,\"reason\"") == std::string::npos);
+    raw.send("{\"op\":\"set\",\"ref\":10,\"stencil_ref\":7,\"stencil_pass\":\"replace\"}");
+    r.pump(50);
+    raw.send("{\"op\":\"set\",\"ref\":10,\"stencil_func\":\"always\"}");
+    r.pump(50);
+    ok("stencil: fields set while it is off kept, then used when it is turned on",
+       stencil().func == crs::StencilFunc::Always && stencil().ref == 7 &&
+           stencil().pass == crs::StencilOp::Replace);
+}
+
+/* What a fake service listening at path read from one client connection:
+ * its JSON messages' bodies, and the number of binary ones. */
+struct FakeService {
+    std::string path;
+    int ls = -1, fd = -1;
+    std::string in;
+    std::vector<std::string> json;
+    int binary = 0;
+    explicit FakeService(const std::string &p) : path(p)
+    {
+        unlink(path.c_str());
+        struct sockaddr_un a;
+        std::memset(&a, 0, sizeof a);
+        a.sun_family = AF_UNIX;
+        std::snprintf(a.sun_path, sizeof a.sun_path, "%s", path.c_str());
+        ls = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (bind(ls, (struct sockaddr *)&a, sizeof a) < 0 || listen(ls, 1) < 0)
+            std::printf("fake service: no socket\n");
+        fcntl(ls, F_SETFL, O_NONBLOCK);
+    }
+    ~FakeService()
+    {
+        if (fd >= 0)
+            close(fd);
+        close(ls);
+        unlink(path.c_str());
+    }
+    void pump(cr::Client &c, int64_t *now, int ms)
+    {
+        for (int i = 0; i < ms; i += 10) {
+            *now += 10;
+            c.poll(*now);
+            if (fd < 0)
+                fd = accept(ls, nullptr, nullptr);
+            char b[65536];
+            pollfd p{fd, POLLIN, 0};
+            while (fd >= 0 && ::poll(&p, 1, 0) > 0) {
+                const ssize_t n = read(fd, b, sizeof b);
+                if (n <= 0)
+                    break;
+                in.append(b, (size_t)n);
+            }
+            size_t off = 0, used = 0, len = 0;
+            uint8_t type = 0;
+            const char *body = nullptr;
+            bool bad = false;
+            while (cr::next_message(in.data() + off, in.size() - off, &used, &type, &body, &len, &bad)) {
+                if (type == cr::kJson)
+                    json.push_back(std::string(body, len));
+                else
+                    binary++;
+                off += used;
+            }
+            in.erase(0, off);
+        }
+    }
+    void hello(const std::string &extra)
+    {
+        const std::string m = cr::encode(cr::kJson, "{\"ev\":\"hello\",\"proto\":1,\"backend\":\"id7\","
+                                                    "\"targets\":\"map:1088x480,panel:1920x720\"" + extra + "}");
+        if (write(fd, m.data(), m.size()) != (ssize_t)m.size())
+            std::printf("fake service: hello not written\n");
+    }
+    /* The connection gone: the client connects again. */
+    void hang_up()
+    {
+        close(fd);
+        fd = -1;
+        json.clear();
+        in.clear();
+    }
+    bool sent(const std::string &part) const
+    {
+        for (const std::string &j : json)
+            if (j.find(part) != std::string::npos)
+                return true;
+        return false;
+    }
+};
+
+/* Rolled back to a service without canvases (its hello without canvas):
+ * the client sends none of its canvases, nothing drawn in them (which that
+ * service would draw on screen at canvas coordinates) and no bind of a
+ * canvas, made before the connection or while connected, its other layers
+ * as before; a service that takes canvases gets them all after its hello. */
+static void canvases_to_an_older_service()
+{
+    FakeService old("/tmp/crs-old-service-" + std::to_string(getpid()));
+    cr::Client c("theme", old.path);
+    cr::CanvasOptions co;
+    co.target = "panel";
+    co.w = co.h = 64;
+    const uint32_t cv = c.canvas(co);
+    cr::LayerOptions in;
+    in.w = in.h = 64;
+    cr::RenderState mask;
+    mask.stencil_func = "always";
+    const uint32_t art = c.effect_in(cv, in, cr::EffectOptions{"void main(){}", "", 0}, false, mask);
+    cr::LayerOptions lo;
+    lo.target = "panel";
+    lo.w = lo.h = 64;
+    const uint32_t shown = c.effect(lo, cr::EffectOptions{"void main(){}", "", 0});
+    c.bind(shown, "u_canvas", cv);
+    c.uniform(art, "u_level", {0.5f});
+    int64_t now = 1000;
+    old.pump(c, &now, 100);
+    old.hello("");
+    old.pump(c, &now, 100);
+    const uint32_t mesh = c.mesh_in(cv, in, cr::MeshOptions());
+    c.part(mesh, 1, cr::PartOptions{"void main(){}", "void main(){}", false, "back", "alpha"});
+    cr::Geometry g;
+    g.positions = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+    g.indices = {0, 1, 2};
+    c.geometry(mesh, 1, g);
+    c.uniform(art, "u_level", {0.7f});
+    old.pump(c, &now, 100);
+    const std::string ref_art = "\"ref\":" + std::to_string(art) + ",", ref_mesh = "\"ref\":" + std::to_string(mesh) + ",";
+    ok("older service: no canvas, nothing drawn in one, no bind of one sent, before or after its hello",
+       !c.takes_canvas() && old.sent("\"op\":\"layer\"") && !old.sent("\"op\":\"canvas\"") &&
+           !old.sent("\"canvas\":") && !old.sent(ref_art) && !old.sent(ref_mesh) && !old.sent("\"op\":\"bind\"") &&
+           !old.sent("stencil") && old.binary == 0);
+    ok("older service: the layer on screen sent", old.sent("\"op\":\"layer\",\"ref\":" + std::to_string(shown) + ","));
+    old.hang_up();
+    old.pump(c, &now, 1000);   /* past the client's backoff: connected again */
+    old.hello(",\"canvas\":1");
+    old.pump(c, &now, 100);
+    ok("a service that takes canvases: the canvas, the layers in it, their parts, geometry and uniforms, and the "
+       "bind sent after its hello",
+       c.takes_canvas() && old.sent("\"op\":\"canvas\",\"ref\":" + std::to_string(cv) + ",") &&
+           old.sent("\"canvas\":" + std::to_string(cv)) && old.sent("\"op\":\"part\",\"ref\":" + std::to_string(mesh)) &&
+           old.binary == 1 && old.sent("\"op\":\"uniform\",\"ref\":" + std::to_string(art)) &&
+           old.sent("\"op\":\"bind\",\"ref\":" + std::to_string(shown)));
 }
 
 int main()
@@ -1978,6 +3291,14 @@ int main()
     framing();
     scene_files();
     layers_and_hosting();
+    hosting_from_layers();
+    hosting_from_layers_more();
+    holding_into();
+    preload();
+    others_fps();
+    render_state_and_samplers();
+    canvases_over_socket();
+    canvases_to_an_older_service();
     std::printf(failures ? "%d FAILED\n" : "all ok\n", failures);
     return failures ? 1 : 0;
 }

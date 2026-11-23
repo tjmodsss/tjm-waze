@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.6.14
+
+A Patch or Remove patch that fails shows the reason.
+
+## 0.6.13
+
+`Untested version` is gone from CarPlay's and Android Auto's Status: Maps
+on cluster patches every software version of the car it can check, and
+removes the patch by itself if the head unit then fails to start. Requires
+the next waze-on-cluster.
+
 ## 0.6.12
 
 The cluster's safe area is back to 504x368 at (286, 72); a smaller area made

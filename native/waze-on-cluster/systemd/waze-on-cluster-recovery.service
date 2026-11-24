@@ -25,6 +25,10 @@ RestartSec=5
 KillMode=mixed
 TimeoutStopSec=60
 StandardOutput=journal
+# The head unit's slice for its standard services, where carplay and
+# aapd run: not ahead of the HMI, and level with the services it
+# watches and starts, so its bounded steps get CPU time while the unit is busy.
+Slice=standard.slice
 StandardError=journal
 
 [Install]

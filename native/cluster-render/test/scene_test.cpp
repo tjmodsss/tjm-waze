@@ -261,11 +261,12 @@ static void edits(const std::string &dir)
        s->played == std::vector<std::string>({"play sweep", "play sweep", "skip sweep"}) &&
            s->started.at("sweep") == 600300 && s->times.back() == 601300 && !s->ticking());
     ed.add("--play sweep\n--skip sweep");
-    ok("a --skip replaces the --play of its sequence waiting", ed.stage(s, 8000) && s->played.size() == 4 &&
-                                                                    s->played.back() == "skip sweep");
+    ok("a --skip replaces the --play of its sequence waiting; with nothing playing, its end 1 ms past the system's "
+       "time",
+       ed.stage(s, 8000) && s->played.size() == 4 && s->played.back() == "skip sweep" && s->times.back() == 601301);
     ed.add("--play glow");
     ok("a real-time system's sequence: started, its time not the service's to set",
-       ed.stage(s, 8100) && s->played.back() == "play glow" && s->times.back() == 601300 && !s->ticking());
+       ed.stage(s, 8100) && s->played.back() == "play glow" && s->times.back() == 601301 && !s->ticking());
     ed.add("--play nowhere");
     ok("an unknown sequence: nothing to flush", !ed.stage(s) && ed.kept() == kept);
     const std::vector<EditProblem> unknown = ed.take_problems();
@@ -295,7 +296,7 @@ static void edits(const std::string &dir)
 static void sequence_clock()
 {
     SequenceClock c;
-    const int sys = 0, other = 0, a = 0, b = 0;
+    const int sys = 0, other = 0, fresh = 0, a = 0, b = 0;
     uint64_t from = 0;
     ok("a fresh system: its time from 10 minutes up, the sequence from there",
        c.play(&other, &a, 0, 400, false, 0, &from) == 600000 && from == 600000 && c.ticking());
@@ -313,19 +314,27 @@ static void sequence_clock()
     ok("played again while it plays: from the time then, to a new end",
        c.play(&sys, &a, 0, 1000, false, 20500, &from) == 701500 && from == 701500 && c.tick(21600)[0].second == 702500 &&
            !c.ticking());
-    ok("a skip with nothing playing: one time, its end; its start as long ago as it lasts; no tick",
-       c.play(&sys, &b, 702500, 400, true, 30000, &from) == 702500 && from == 702100 && !c.ticking());
-    c.play(&sys, &a, 702500, 1000, false, 40000, &from);
+    ok("a skip with nothing playing: one time, its end 1 ms past the system's time; its start as long ago as it "
+       "lasts; no tick",
+       c.play(&sys, &b, 702500, 400, true, 30000, &from) == 702501 && from == 702101 && !c.ticking());
+    ok("a skip of a fresh system: its end at 10 minutes",
+       c.play(&fresh, &b, 0, 400, true, 30000, &from) == 600000 && from == 599600 && !c.ticking());
+    c.play(&sys, &a, 702501, 1000, false, 40000, &from);
     c.tick(40200);
     ok("a skip while another plays: the time not moved, the other plays on",
-       c.play(&sys, &b, 0, 100, true, 40300, &from) == 702800 && from == 702700 && c.ticking());
+       c.play(&sys, &b, 0, 100, true, 40300, &from) == 702801 && from == 702701 && c.ticking());
     ok("the one playing skipped: its end at once, nothing ticks",
-       c.play(&sys, &a, 0, 1000, true, 40400, &from) == 702900 && from == 701900 && !c.ticking());
-    c.play(&sys, &a, 702900, 1000, false, 50000, &from);
+       c.play(&sys, &a, 0, 1000, true, 40400, &from) == 702901 && from == 701901 && !c.ticking());
+    c.play(&sys, &a, 702901, 1000, false, 45000, &from);
+    c.tick(45200);
+    ok("a skip in the tick's millisecond: its end 1 ms past the time that tick set",
+       c.play(&sys, &b, 0, 100, true, 45200, &from) == 703102 && from == 703002 && c.ticking());
+    c.tick(46000);
+    c.play(&sys, &a, 703901, 1000, false, 50000, &from);
     t = c.tick(50900);
-    ok("ticks left out (the link busy): the next one at its own time", t.size() == 1 && t[0].second == 703800);
+    ok("ticks left out (the link busy): the next one at its own time", t.size() == 1 && t[0].second == 704801);
     t = c.tick(52000);
-    ok("and one late past the end: the end", t.size() == 1 && t[0].second == 703900 && !c.ticking());
+    ok("and one late past the end: the end", t.size() == 1 && t[0].second == 704901 && !c.ticking());
 }
 
 int main()

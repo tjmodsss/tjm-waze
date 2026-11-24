@@ -176,8 +176,8 @@ void main() {
  * plain quad; an orthographic camera, a main and a glow pass; two animation
  * sequences, never started, processed on the client too (so the check reads
  * what they animate): "sweep" of a real-time system takes the data object
- * "swept" from 0 to 10 in a second, "drive" of a system without a clock of
- * its own the data object "driven". */
+ * "swept" from 0 to 10 in a second, "drive" and "settle" of a system without
+ * a clock of its own the data objects "driven" and "settled". */
 static bool save_gauge(ramses::RamsesClient &client, ramses::sceneId_t id, const std::string &file,
                        const std::string &res)
 {
@@ -243,11 +243,12 @@ static bool save_gauge(ramses::RamsesClient &client, ramses::sceneId_t id, const
         ramses::AnimationSequence *seq = anim ? sys->createAnimationSequence(seq_name) : nullptr;
         return seq && ok_status(seq->addAnimation(*anim));
     };
+    ramses::AnimationSystem *driven =
+        s->createAnimationSystem(ramses::EAnimationSystemFlags_ClientSideProcessing, "gauge_driven");
     good = good &&
            bake(s->createRealTimeAnimationSystem(ramses::EAnimationSystemFlags_ClientSideProcessing, "gauge_clock"),
                 "swept", "sweep") &&
-           bake(s->createAnimationSystem(ramses::EAnimationSystemFlags_ClientSideProcessing, "gauge_driven"), "driven",
-                "drive");
+           bake(driven, "driven", "drive") && bake(driven, "settled", "settle");
     ramses::ResourceFileDescription rd(res.c_str());
     rd.add(fx);
     rd.add(pos);
@@ -1680,17 +1681,25 @@ int main()
         const float mid = value();
         ed->add("--skip sweep");
         run(100);
+        const float ending = value();
+        usleep(300 * 1000);
         const float end = value();
+        ed->add("--skip sweep");
+        run(100);
+        const float kept = value();
         ed->add("--play sweep");
         run(100);
         const float again = value();
         ed->add("--play nowhere");
         run(100);
         const std::vector<EditProblem> unknown = ed->take_problems();
-        std::printf("     swept %g 300 ms after --play, %g after --skip, %g after --play again\n", mid, end, again);
-        ok("the file's animation sequence: played, skipped to its end, played again from its start, an unknown one "
-           "reported; the scene still described",
-           mid > 0 && mid < 10 && end == 10 && again < mid && unknown.size() == 1 &&
+        std::printf("     swept %g 300 ms after --play, %g after --skip, %g 300 ms after it, %g after --skip "
+                    "again, %g after --play again\n",
+                    mid, ending, end, kept, again);
+        ok("the file's animation sequence: played, skipped to its end within 250 ms, left at its end by another "
+           "skip, played again from its start, an unknown one reported; the scene still described",
+           mid > 0 && mid < 10 && ending >= 7.5f && ending < 10 && end == 10 && kept == 10 && again < mid &&
+               unknown.size() == 1 &&
                unknown[0].reason.find("no animation sequence nowhere") != std::string::npos && described("gauge"));
     }
     /* A sequence of a system without a clock of its own: its time set by
@@ -1714,12 +1723,20 @@ int main()
         ed->add("--skip drive");
         run(100);
         const float skipped = value();
+        /* Another sequence of the system skipped while nothing plays in it. */
+        ramses::DataFloat *settled = gauge_object<ramses::DataFloat>(client, "settled");
+        float rest = -1, settled_end = -1;
+        const bool read_rest = settled && ok_status(settled->getValue(rest));
+        ed->add("--skip settle");
+        run(100);
+        const bool read_end = settled && ok_status(settled->getValue(settled_end));
         std::printf("     driven %g 500 ms after --play, %g at its end (its system at %llu ms), %g after --play "
-                    "again, %g after --skip\n",
-                    mid, end, (unsigned long long)at_end, again, skipped);
+                    "again, %g after --skip; settled %g, %g after --skip with nothing playing\n",
+                    mid, end, (unsigned long long)at_end, again, skipped, rest, settled_end);
         ok("a sequence the service sets the time of: played on its ticks, held at its end, played again from its "
-           "start, skipped to its end; the scene still described",
-           mid > 2 && mid < 8 && end == 10 && at_end >= 601000 && again < mid && skipped == 10 && described("gauge"));
+           "start, skipped to its end, another skipped to its end with nothing playing; the scene still described",
+           mid > 2 && mid < 8 && end == 10 && at_end >= 601000 && again < mid && skipped == 10 && read_rest &&
+               rest == 0 && read_end && settled_end == 10 && described("gauge"));
     }
 
     /* Published again: the HUD (the panel's scene id) shown while the HMI holds the panel. */

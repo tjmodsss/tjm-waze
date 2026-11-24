@@ -663,10 +663,10 @@ class WazeClusterControl extends EventEmitter {
         return ps.state === 'original' ? t('Not patched') : t('Partly patched');
     }
 
-    /* The cluster map row: the shared render's map, while CarPlay's or
-     * Android Auto's patch is in effect: on disk with nothing pending, as
-     * the last status outside a change said (a running or failed change
-     * keeps it). */
+    /* The cluster map row: the shared render's map, while CarPlay's patch
+     * is in effect (on disk with nothing pending) or the running aapd runs
+     * Android Auto's, as the last status outside a change said (a running
+     * or failed change keeps it). */
     mapText() {
         return t('Cluster map: {0}', this._mapState());
     }
@@ -739,6 +739,20 @@ class WazeClusterControl extends EventEmitter {
         return !!aa && !this.busy() && !aa.pending;
     }
 
+    /* Nothing runs: a change may start, also while another one waits for
+     * the next head-unit start (patchd then plans or turns off again, and
+     * that start applies the last one). */
+    _aaFree() {
+        return !!this.aa() && !this.busy();
+    }
+
+    /* Android Auto's patch is planned for the next start: in effect with
+     * nothing waiting, or a Patch, Zoom or card change waiting. */
+    _aaArmed() {
+        const aa = this.aa();
+        return !!aa && (aa.pending ? aa.pending === 'apply' : aa.state === 'patched');
+    }
+
     /* A density or card change is refused until aa.changeAt. */
     _aaSpaced() {
         const aa = this.aa();
@@ -750,9 +764,10 @@ class WazeClusterControl extends EventEmitter {
         return !!aa && !!aa.conflict;
     }
 
+    /* Patch: also over a Remove patch that waits for the next start. */
     canEnableAa() {
         const aa = this.aa();
-        return this._aaIdle() && !this._aaBlocked() && ['original', 'unknown', 'error'].includes(aa.state);
+        return this._aaFree() && !this._aaBlocked() && aa.pending !== 'apply' && ['original', 'unknown', 'error'].includes(aa.state);
     }
 
     canDisableAa() {
@@ -763,10 +778,10 @@ class WazeClusterControl extends EventEmitter {
         return aa.removable !== undefined ? aa.removable : this._aaIdle() && ['patched', 'unknown', 'error'].includes(aa.state);
     }
 
-    /* Zoom out shows more map: a lower density, from the one on disk. */
+    /* Zoom out shows more map: a lower density, from the planned one. */
     canZoom(step) {
         const aa = this.aa();
-        if (!this._aaIdle() || this._aaSpaced() || this._aaBlocked() || aa.state !== 'patched' || !aa.densities || aa.dpi == null) {
+        if (!this._aaFree() || this._aaSpaced() || this._aaBlocked() || !this._aaArmed() || !aa.densities || aa.dpi == null) {
             return false;
         }
         const next = aa.dpi + step;
@@ -775,7 +790,7 @@ class WazeClusterControl extends EventEmitter {
 
     canToggleCard() {
         const aa = this.aa();
-        return this._aaIdle() && !this._aaSpaced() && !this._aaBlocked() && aa.state === 'patched' && !!aa.diskCard;
+        return this._aaFree() && !this._aaSpaced() && !this._aaBlocked() && this._aaArmed() && !!aa.diskCard;
     }
 
     /* The density on disk, marked when the one aapd runs until the next
@@ -1021,7 +1036,9 @@ class WazeClusterControl extends EventEmitter {
     }
 
     /* From a status outside a change (neither busy nor an error): which
-     * patch is in effect. */
+     * patch is in effect. While an Android Auto change waits for the next
+     * head-unit start, what the running aapd runs (runDpi: null for none);
+     * a patchd that does not say leaves it as it was. */
     _noteInEffect() {
         const ps = this.patchStatus;
         if (ps.state !== 'busy' && ps.state !== 'error' && ps.busy !== 'carplay') {
@@ -1029,7 +1046,8 @@ class WazeClusterControl extends EventEmitter {
         }
         const aa = ps.aa;
         if (aa && aa.state !== 'busy' && aa.state !== 'error') {
-            this._inEffect.androidAuto = aa.state === 'patched' && !aa.pending;
+            this._inEffect.androidAuto = !aa.pending ? aa.state === 'patched'
+                : aa.runDpi !== undefined ? aa.runDpi !== null : this._inEffect.androidAuto;
         }
     }
 

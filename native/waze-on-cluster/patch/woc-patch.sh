@@ -50,11 +50,8 @@ activation() {
     echo "Never systemctl stop/restart carplay.service."
 }
 aa_activation() {
-    echo "It takes effect at the next head-unit start. Only if recmgr loaded aapd"
-    echo "in both restart lists at this boot, it can start now (car parked):"
-    echo '    pid=$(systemctl show aapd.service -p MainPID --value)'
-    echo '    [ "$pid" -gt 0 ] && kill -9 "$pid" && systemctl start aapd.service'
-    echo "Never systemctl stop/restart aapd.service."
+    echo "It takes effect at the next head-unit start. Never kill, stop or restart"
+    echo "aapd on its own: Android Auto then gets no touch input until the head unit restarts."
 }
 
 cmd=${1:-}; [ $# -gt 0 ] && shift || true

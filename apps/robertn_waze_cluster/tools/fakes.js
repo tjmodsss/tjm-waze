@@ -16,9 +16,13 @@
  *
  * FakePatch speaks the patch daemon protocol: on connect the log backlog and
  * the current state; apply -> busy, then patched with the asked panel;
- * revert -> busy, then original; an Android Auto change -> busy, then
- * done after STEP_MS, or with `holdAa` set when the test calls
- * releaseAa(failure); status -> the current state; a command
+ * revert -> busy, then original; an Android Auto change -> busy, then,
+ * after STEP_MS (or with `holdAa` set when the test calls
+ * releaseAa(failure)), as patchd answers it: what the running aapd runs
+ * stays, and the change waits for the next head-unit start (pending,
+ * runDpi, runCard), or nothing waits when aapd runs it already; a Zoom or
+ * card change while Android Auto's patch is not planned is only saved;
+ * aaStart() is that head-unit start; status -> the current state; a command
  * while one runs -> refused, to its asker; reboot -> restarting, or with
  * `rebootFails` set, failed with that code. The map settings per driver
  * profile as patchd keeps them: `map` the settings in effect, `shared` and
@@ -247,6 +251,38 @@ class FakePatch extends LineServer {
         this._broadcast(this._status());
     }
 
+    /* What the running aapd runs: {dpi, card}, or null for no patch. */
+    _aaRun() {
+        const a = this.aa;
+        if (a.pending) return a.runDpi != null ? { dpi: a.runDpi, card: a.runCard || 'shown' } : null;
+        return a.state === 'patched' ? { dpi: a.dpi, card: a.diskCard || 'shown' } : null;
+    }
+
+    /* Android Auto's patch is planned for the next start. */
+    _aaArmed() {
+        const a = this.aa;
+        return a.pending ? a.pending === 'apply' : a.state === 'patched';
+    }
+
+    /* The state once plan (null: Remove patch) is armed while aapd runs run. */
+    _aaAfter(plan, run, chosen) {
+        const same = (plan && run && plan.dpi === run.dpi && plan.card === run.card) || (!plan && !run);
+        const planned = plan ? { dpi: plan.dpi, diskCard: plan.card } : {};
+        if (same) return Object.assign({ state: plan ? 'patched' : 'original' }, planned, chosen, { removable: !!plan });
+        return Object.assign({ state: 'unknown', pending: plan ? 'apply' : 'revert', aapd: 'deferred' }, planned, chosen,
+            { removable: !!plan, runDpi: run ? run.dpi : null, runCard: run ? run.card : null });
+    }
+
+    /* The next head-unit start: aapd runs what is planned, nothing waits. */
+    aaStart() {
+        const a = this.aa, chosen = { density: a.density, card: a.card, densities: a.densities };
+        this.aa = this._aaArmed() ? this._aaAfter({ dpi: a.dpi, card: a.diskCard || 'shown' }, { dpi: a.dpi, card: a.diskCard || 'shown' }, chosen)
+            : this._aaAfter(null, null, chosen);
+        this._rebooting = false;
+        this.restart = { state: 'idle' };
+        this._broadcast(this._status());
+    }
+
     _status() {
         return { ev: 'status', state: this.busy ? 'busy' : this.state, panel: this.panel,
             res: this.res, safe: this.safe, mapurl: this.mapurl, carplay: this.carplay, reason: this.reason,
@@ -341,14 +377,15 @@ class FakePatch extends LineServer {
         if (/^aa-/.test(msg.cmd)) {
             const density = msg.cmd === 'aa-density' ? msg.value : this.aa.density;
             const card = msg.cmd === 'aa-card' ? msg.value : this.aa.card || 'shown';
-            const after = msg.cmd === 'aa-revert' ? { state: 'original' } : { state: 'patched', dpi: density, diskCard: card };
-            const before = this.aa;
+            const before = this.aa, run = this._aaRun(), densities = before.densities;
+            const plan = msg.cmd === 'aa-revert' ? null : msg.cmd === 'aa-apply' || this._aaArmed() ? { dpi: density, card } : undefined;
             this.aa = Object.assign({}, this.aa, { state: 'busy', reason: msg.cmd === 'aa-revert' ? 'reverting' : 'applying' });
             this._broadcast(this._status());
             /* failure: the change failed so, the values on disk as they were */
             const finish = (failure) => {
                 this.aa = failure ? Object.assign({}, before, { state: 'error', reason: failure, error: failure })
-                    : { state: after.state, dpi: after.dpi, diskCard: after.diskCard, density, card, densities: this.aa.densities, aapd: 'restarted', removable: after.state === 'patched' };
+                    : plan === undefined ? Object.assign({}, before, { density, card })
+                    : this._aaAfter(plan, run, { density, card, densities });
                 this.log(msg.cmd + ' done');
                 this._broadcast(this._status());
             };

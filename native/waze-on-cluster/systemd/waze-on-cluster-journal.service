@@ -24,6 +24,9 @@ ExecStart=/usr/bin/node /var/opt/waze-on-cluster/current/journal_keep.js
 Restart=always
 RestartSec=10
 TimeoutStopSec=10
+# The head unit's slice for background work: never ahead of the HMI or
+# of the services whose lines it keeps.
+Slice=background.slice
 Nice=19
 IOSchedulingClass=idle
 CPUShares=64

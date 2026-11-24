@@ -2392,12 +2392,22 @@ private:
             return false;
         }
         const uint64_t now = rt->getTime();
-        /* The end: started as long ago as it lasts, its stop passed. */
-        const uint64_t from = end ? now - std::min(now, lasts + 1) : now;
+        /* The end: its last lead_ms played, as the renderer takes a start
+         * only while the sequence's end is ahead of its clock (ABI.md). One
+         * started here that long ago or earlier is left as it is. */
+        const uint64_t lead_ms = 250;
+        const uint64_t back = end ? lasts - std::min(lasts, lead_ms) : 0;
+        const uint64_t from = now - std::min(now, back);
+        auto started = realtime_starts_.find(seq);
+        if (end && started != realtime_starts_.end() && started->second <= from) {
+            log_info("ramses: sequence %s of a real-time system left as it is: in its last 250 ms or ended", name.c_str());
+            return true;
+        }
         if (!ok(seq->startAt(from))) {
             *why = "the renderer refused it";
             return false;
         }
+        realtime_starts_[seq] = from;
         log_info("ramses: sequence %s of a real-time system %s at %llu ms (this side's clock %+lld ms)", name.c_str(),
                  end ? "skipped to its end" : "played", (unsigned long long)from, (long long)realtime_offset_ms_);
         return true;
@@ -2427,6 +2437,7 @@ private:
     std::map<std::string, ramses::RamsesObject *> data_;
     std::map<ramses::AnimationSystem *, bool> systems_;   /* the file's animation systems: real-time? */
     SequenceClock clock_;                                 /* the others' time, while they play */
+    std::map<ramses::AnimationSequence *, uint64_t> realtime_starts_;   /* the start last stamped, real-time */
     int64_t realtime_offset_ms_;
     bool flush_failing_ = false;
 };

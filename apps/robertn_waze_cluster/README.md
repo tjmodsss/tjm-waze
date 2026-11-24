@@ -87,7 +87,8 @@ The app is in the head unit's display language.
   turn card at the top of the map.
 
 **Restart head unit** shows when a change needs a restart. Press it to
-apply the change.
+apply the change. Android Auto's changes all wait for it: set what you
+want first, then restart once.
 
 ## If the map doesn't show
 

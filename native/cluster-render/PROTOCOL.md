@@ -778,7 +778,7 @@ most 256 characters; numbers are separated by commas.
 | `--pass-off RE`, `--pass-on RE` | a render pass disabled, enabled |
 | `--uniform RE:NAME=v[,v...]` | the uniform `NAME` of each matching mesh's appearance: as many whole elements as given and it has (float, vec2-4, mat2-4; int and ivec2-4 rounded); one bound to a data object is not set (`--set` it) |
 | `--set NAME=v[,v...]` | the data object called `NAME` (the name, not a pattern): float, int, vec2-4 |
-| `--play NAME`, `--skip NAME` | to a service whose hello has `scene_anim` 1: the animation sequence called `NAME` (the name, not a pattern) of an animation system the file has, interpolated by the renderer ([below](#playing-a-files-animations)). `--play` starts it from its start (from there again when it is playing or has played); `--skip` shows its end at once (it is started as long ago as it lasts) |
+| `--play NAME`, `--skip NAME` | to a service whose hello has `scene_anim` 1: the animation sequence called `NAME` (the name, not a pattern) of an animation system the file has, interpolated by the renderer ([below](#playing-a-files-animations)). `--play` starts it from its start (from there again when it is playing or has played); `--skip` shows its end: at once in a system without a clock of its own (it is started as long ago as it lasts), within 250 ms in a real-time one |
 
 A line replaces the kept line with the same key, its kind (`--show` counts
 as `--hide`, `--pass-on` as `--pass-off`, `--skip` as `--play`) and what
@@ -814,10 +814,16 @@ What a sequence does at play depends on its animation system:
   while it plays, but the renderer plays it on its own clock, against a
   start the service stamps from the head unit's clock plus
   `scene_realtime_offset_ms` (cluster-render.conf, default 0; the time used
-  is logged). A display whose clock is not the head unit's, nor kept in step
-  with it, starts it that much early (its start partly skipped, or only its
-  end shown) or late (nothing moving until then). Use the kind above on such
-  a display.
+  is logged). The renderer takes a start only while the sequence's end is
+  still ahead of its clock, so `--skip` starts it to end 250 ms after the
+  stamp: its last 250 ms play (a sequence that lasts no longer plays whole
+  and ends as long after the stamp as it lasts). A sequence already in its
+  last 250 ms, or ended, is left as it is. A skip that reaches the display
+  after that end is not taken: a sequence playing stops where it is until
+  the next `--play`. A display whose clock is not the head unit's, nor kept
+  in step with it, starts it that much early (its start partly skipped, or
+  not taken once its end has passed) or late (nothing moving until then).
+  Use the kind above on such a display.
 
 For a rest state that is right whatever happens (a renderer that never
 plays it, a play cut short, the scene published again), save the file with

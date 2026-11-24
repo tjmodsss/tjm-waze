@@ -308,8 +308,10 @@ uint64_t SequenceClock::play(const void *sys, const void *seq, uint64_t at, uint
 {
     auto it = drives_.find(sys);
     /* Never below the longest a sequence lasts: a skip can always start one
-     * as long ago as it lasts, without moving the others' time. */
-    const uint64_t t = it == drives_.end() ? std::max(at, kMaxLasts) : now(it->second, now_ms);
+     * as long ago as it lasts. */
+    uint64_t t = it == drives_.end() ? std::max(at, kMaxLasts) : now(it->second, now_ms);
+    if (end)
+        t = std::max(t, (it == drives_.end() ? at : it->second.last) + 1);
     *from = end ? t - std::min(t, lasts) : t;
     if (it == drives_.end()) {
         if (*from + lasts <= t)

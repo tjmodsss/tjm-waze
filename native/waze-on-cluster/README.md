@@ -76,8 +76,10 @@ CarPlay and aapd.
 The app's **Patch** and **Remove patch** buttons, for CarPlay and for
 Android Auto, apply and revert the patches through the root patch daemon
 `patchd`. A change takes effect when CarPlay (or aapd) next starts: `patchd`
-restarts it at once only where that cannot restart the head unit (PATCH.md
-"Activation"); otherwise the app shows **Restart head unit**.
+restarts CarPlay at once only where that cannot restart the head unit
+(PATCH.md "Activation"); otherwise, and for Android Auto always (an aapd
+started on its own gets no touch input), the app shows **Restart head
+unit**.
 
 **Never `systemctl stop` or `restart` carplay or aapd**: CarPlay dumps core
 on SIGTERM, which restarts the head unit.

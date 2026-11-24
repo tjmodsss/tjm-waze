@@ -25,6 +25,10 @@ ExecStopPost=-/bin/sh -c '[ -e /etc/systemd/system/waze-on-cluster-capture.servi
 Restart=always
 RestartSec=5
 StandardOutput=journal
+# The head unit's slice for its standard services, where carplay and
+# aapd run: not ahead of the HMI, and level with the services it
+# patches and restarts, so its bounded steps get CPU time while the unit is busy.
+Slice=standard.slice
 # On stop, signal only the daemon (not its mount/patch/systemctl children), and
 # give an in-progress patch time to finish so / is never left writable.
 KillMode=mixed

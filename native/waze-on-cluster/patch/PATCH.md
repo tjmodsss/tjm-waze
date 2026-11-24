@@ -919,10 +919,9 @@ next head-unit start, for an aapd that still reads it.
 `Environment=LD_PRELOAD=/usr/lib/libschedconfig.so.1`, kept first. aapd
 runs as `cia_13006`, is not setuid and has no file capabilities (its
 process has none: `CapEff`, `CapPrm` 0), so the loader honours the
-preload. `patchd` restarts aapd itself only where recmgr loaded its
-entry and systemd loaded this drop-in.
+preload. `patchd` never restarts aapd ("Android Auto: Activation").
 
-**Activation.** As for carplay; an install never restarts aapd. A change
+**Activation.** Every change waits for the next head-unit start. A change
 of the turn card also changes the render's crop, which it reads at its
 start, so the change waits for the next head-unit start
 ("Android Auto: the geometry").
@@ -1325,8 +1324,11 @@ about 0.62 x dpi rows down, so the cut is 156 rows up to 200 dpi, then
 1088:480 (240 dpi `4,160,1270,560`, 300 `46,196,1188,524`, 400
 `116,258,1048,462`). The render reads its crop at start: `patchd` writes this
 one to `/var/opt/waze-on-cluster/aa-crop.env`, which `waze-on-cluster.service`
-passes as `-s src_crop=…`, and a change of it waits, with the copy of
-aapd.conf it goes with, for the next head-unit start. Showing the card again removes the file. A render
+passes as `-s src_crop=…`. A crop other than the one the running render
+read at its start (its `WOC_SRC_CROP`, from `/proc/<pid>/environ`) waits,
+with the copy of aapd.conf it goes with, for the next head-unit start; with
+no render running, any change of the file does. Showing the card again
+removes the file. A render
 that restarts before that start (an update of the tool, a crash) reads the
 new crop early, while the phone still draws the old geometry: the map is
 cropped wrongly until the head-unit start.
@@ -1377,15 +1379,11 @@ points it at. `aapd.service` (`Type=simple`, `WatchdogSec=30`,
 `User=cia_13006`) has no `Restart=` and no `OnFailure=`, and the firmware's
 recmgr and crash-handler lists do not name it. So its end matters only to
 recmgr, which restarts the head unit for a service it does not list, and,
-for a core dump, to the crash handler. `patchd` restarts aapd itself only
-where recmgr loaded `aapd` in both lists this boot and systemd loaded the
-tool's drop-in: SIGKILL of the main PID (no core dump, so no crash
-handler), the run's `InvocationID` recorded in
-`/dev/shm/waze-on-cluster/aapd-killed`, then `systemctl start aapd.service`,
-`is-active`, and its memory read until it runs the plan (or, for Remove
-patch, runs as it ships). The drop-in adds no `SuccessExitStatus`: a
-SIGKILL fails the unit (`Result=signal`), which runs nothing. Otherwise the
-change waits for the next head-unit start, `/dev/shm/waze-on-cluster/aa-pending`
+for a core dump, to the crash handler. `patchd` never restarts aapd: an
+aapd started while the head unit runs gets no touch or iDrive controller
+input until the next head-unit start. So Patch, Remove patch, Zoom and the
+turn card each wait for the next head-unit start (the app's **Restart head
+unit**), `/dev/shm/waze-on-cluster/aa-pending`
 marking it with what aapd runs until then (`run`: its density and turn
 card, null for stock). Remove patch of a patch still waiting leaves nothing
 waiting: aapd runs as it ships already. A put-back of an earlier release's

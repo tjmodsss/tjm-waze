@@ -11,9 +11,10 @@
  * which refuse an unknown binary) and arms it (inmem.js), or turns it off; a
  * patch an earlier release wrote to the files is put back first, from
  * verified backups, with / remounted read-write only for that write. The
- * change takes effect when the service next starts: patchd restarts it only
- * when recmgr loaded its restart entry this boot and systemd loaded the
- * tool's drop-in for it (restartBlocked), else at the next head-unit start.
+ * change takes effect when the service next starts: patchd restarts carplay
+ * only when recmgr loaded its restart entry this boot and systemd loaded the
+ * tool's drop-in for it (restartBlocked), else at the next head-unit start;
+ * aapd's change always waits for the next head-unit start.
  * It applies no patch on its own. Explicit
  * capture commands go to the DLT capture service on its own socket; reading
  * logs does not change tracing mode. Started with --dlt-capture (its unit),
@@ -98,7 +99,7 @@
  *                    pending: apply | revert, while a written change waits for
  *                    the next head-unit start (carplay is then deferred)
  *                    aa: Android Auto's patch, {state, reason, conflict, pending,
- *                    aapd (restarted | deferred), dpi and diskCard (on disk),
+ *                    aapd (deferred), dpi and diskCard (on disk),
  *                    runDpi and runCard (while pending: what aapd runs until
  *                    the next start, null for no patch), density and card
  *                    (chosen), densities [min, max, step], changeAt (while a
@@ -204,8 +205,8 @@ var HIGHF_MARKER = path.join(STATE_DIR, 'highf-repatched');
 /* The boot a restart was asked for in: boot recovery takes the end of that
  * boot for an orderly one. */
 var RESTART_FILE = path.join(STATE_DIR, 'restart-requested');
-/* A density or turn-card change rewrites aapd.conf on / and can restart
- * aapd: at most one per DENSITY_SPACING_MS. A head-unit restart at most one per
+/* A density or turn-card change plans a new copy of aapd.conf: at most one
+ * per DENSITY_SPACING_MS. A head-unit restart at most one per
  * REBOOT_SPACING_MS, across patchd restarts too. */
 var DENSITY_SPACING_MS = parseInt(process.env.WOC_DENSITY_SPACING_MS, 10) || 10000;
 var REBOOT_SPACING_MS = 10 * 60 * 1000;
@@ -1115,22 +1116,22 @@ function remountRo(tries, cb) {
     });
 }
 
-/* Restarting carplay or aapd is safe only while nothing takes its SIGKILL
- * for a failure: recmgr loaded its entry this boot (recmgr_list.js), and,
- * for carplay, systemd loaded the tool's drop-in, whose
- * SuccessExitStatus=SIGKILL keeps the kill from failing carplay.service and
- * so from running its OnFailure=mediaddpserver_kill.service, which restarts
- * the head unit. aapd.service has no OnFailure=, so its failure matters only
- * to recmgr (PATCH.md "Activation"). Otherwise a change is left to take
- * effect at the next head-unit start. */
+/* Restarting carplay is safe only while nothing takes its SIGKILL for a
+ * failure: recmgr loaded its entry this boot (recmgr_list.js) and systemd
+ * loaded the tool's drop-in, whose SuccessExitStatus=SIGKILL keeps the kill
+ * from failing carplay.service and so from running its
+ * OnFailure=mediaddpserver_kill.service, which restarts the head unit
+ * (PATCH.md "Activation"). aapd is never restarted (t.restartRefused): an
+ * aapd started while the head unit runs gets no touch or controller input
+ * until the next head-unit start. Otherwise a change is left to take effect
+ * at the next head-unit start. */
 var recmgrLoaded = require('./recmgr_list.js').recmgrLoaded;
 var parseShow = require('./recovery.js').parseShow;
 var DROPIN = process.env.WOC_CARPLAY_DROPIN || '/etc/systemd/system/carplay.service.d/50-waze-on-cluster.conf';
-/* aapd's: names the env file of a start armed in memory (EnvironmentFile). */
-var AA_DROPIN = process.env.WOC_AAPD_DROPIN || '/etc/systemd/system/aapd.service.d/50-waze-on-cluster.conf';
 
 /* cb(null) when t's service may be restarted, else cb(why not). */
 function restartBlocked(t, cb) {
+    if (t.restartRefused) { cb(t.restartRefused); return; }
     if (!recmgrLoaded(t.name)) { cb('recmgr did not load a ' + t.name + ' restart entry this boot'); return; }
     if (!t.dropin) { cb(null); return; }
     cp.execFile('systemctl', ['show', t.unit, '-p', 'DropInPaths'], { timeout: 15000 }, function (err, out) {
@@ -1151,26 +1152,28 @@ var PENDING_REASON = {
     revert: 'patch removed; carplay runs as it ships from the next head-unit start'
 };
 /* Each target: its unit, binary, patcher, the running binary's link, its
- * pending marker, the run restartUnit kills (for recovery.js), the drop-in
- * a restart needs, and files besides the binary read at start (extra). */
+ * pending marker, the run restartUnit kills (for recovery.js) and the
+ * drop-in a restart needs, or why it is never restarted (restartRefused),
+ * and files besides the binary read at start (extra). */
 var CP = { name: 'carplay', unit: 'carplay.service', target: TARGET, patcher: PATCHER, running: TARGET + '.woc-running',
            pending: PENDING, killed: path.join(path.dirname(SOCK), 'carplay-killed'), dropin: DROPIN, reasons: PENDING_REASON, extra: [],
            svc: 'carplay', modified: 'carplay was modified by something else', overlayState: cpOverlayState };
 var AA = { name: 'aapd', unit: 'aapd.service', target: AAPD, patcher: AA_PATCHER, running: AAPD + '.woc-running',
-           pending: path.join(path.dirname(SOCK), 'aa-pending'), killed: path.join(path.dirname(SOCK), 'aapd-killed'), dropin: AA_DROPIN,
+           pending: path.join(path.dirname(SOCK), 'aa-pending'),
            /* aapd reads aapd.conf when it starts: a change there needs a start too. */
            extra: [AAPD_CONF],
+           restartRefused: 'aapd restarted on its own leaves Android Auto without touch input',
            reasons: { apply: 'Android Auto patch armed in memory; takes effect at the next head-unit start',
                       revert: 'Android Auto patch removed; aapd runs as it ships from the next head-unit start' },
            svc: 'aapd', modified: 'aapd was modified by something else', overlayState: aaOverlayState };
 
 /* Restart t's service: SIGKILL its main process, wait until systemd has
  * reaped it, `systemctl start` it, and confirm the unit is active. A systemd
- * stop or restart power-cycles the head unit (carplay dumps core on SIGTERM;
- * aapd is BMW's like it), so neither is used, not even as a fallback: no
+ * stop or restart power-cycles the head unit (carplay dumps core on
+ * SIGTERM), so neither is used, not even as a fallback: no
  * main PID, a failed start or a unit that never becomes active is an error.
  * Each wait is bounded (RESTART_TRIES x RESTART_POLL_MS). Only called when
- * restartBlocked found nothing. */
+ * restartBlocked found nothing, so never for aapd. */
 var RESTART_POLL_MS = parseInt(process.env.WOC_RESTART_POLL_MS, 10) || 250;
 var RESTART_TRIES = 40;
 function restartUnit(t, cb) {
@@ -2134,22 +2137,43 @@ function aaRunning(cb) {
     }, true);
 }
 
+/* The crop override the running render read at its start: its
+ * WOC_SRC_CROP line, '' for none, or null when there is no render to read
+ * (EnvironmentFile puts the line in its environment). */
+var PROC_DIR = process.env.WOC_PROC || '/proc';
+function renderCrop(cb) {
+    cp.execFile('systemctl', ['show', 'waze-on-cluster.service', '-p', 'MainPID'], { timeout: tmo(15000) }, function (err, out) {
+        var m = /^MainPID=(\d+)/m.exec((out || '') + ''), pid = m ? parseInt(m[1], 10) : 0;
+        var env = pid > 0 ? readText(path.join(PROC_DIR, String(pid), 'environ')) : null;
+        if (env === null) { cb(null); return; }
+        var line = env.split('\0').filter(function (l) { return /^WOC_SRC_CROP=/.test(l); })[0];
+        cb(line ? line + '\n' : '');
+    });
+}
+
 /* Applies the chosen density and card in memory. The render reads its crop
- * when it starts, so a change of the crop override is left, with the copy
- * of aapd.conf it goes with, for the next head-unit start; otherwise the
- * change takes effect as any other. done(err, roErr, activation, conflict,
- * why, run): run, what aapd runs, for a marker the caller writes. */
+ * when it starts, so a crop override other than the one the running render
+ * read is left, with the copy of aapd.conf it goes with, for the next
+ * head-unit start (with no render to read, any change of the file is);
+ * otherwise the change takes effect as any other. done(err, roErr,
+ * activation, conflict, why, run): run, what aapd runs, for a marker the
+ * caller writes. */
 function aaApply(noRestart, done) {
     var dpi = aaDensity(), card = aaCard(), crop = cropEnv(card, dpi), cropChange = readText(AA_CROP_ENV) !== crop;
     log('Android Auto: apply at ' + dpi + ' dpi, card ' + card);
     aaRunning(function (run) {
         inmemApply(AA, aaPlanArgs(), noRestart || cropChange, function (pErr, roErr, activation, conflict, why) {
-            if (!pErr && !conflict && !why) {
-                try {
-                    if (setCrop(crop) && activation !== 'deferred') { writePending(AA, 'apply', run); activation = 'deferred'; }
-                } catch (e) { pErr = new Error('writing ' + AA_CROP_ENV + ': ' + e.message); }
+            if (pErr || conflict || why) { done(pErr, roErr, activation, conflict, why, run); return; }
+            var changed;
+            try { changed = setCrop(crop); } catch (e) {
+                done(new Error('writing ' + AA_CROP_ENV + ': ' + e.message), roErr, activation, conflict, why, run);
+                return;
             }
-            done(pErr, roErr, activation, conflict, why, run);
+            renderCrop(function (running) {
+                var waits = running === null ? changed : running !== (crop || '');
+                if (waits && activation !== 'deferred') { writePending(AA, 'apply', run); activation = 'deferred'; }
+                done(null, roErr, activation, conflict, why, run);
+            });
         }, run);
     });
 }

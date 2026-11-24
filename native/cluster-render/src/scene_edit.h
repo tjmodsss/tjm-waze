@@ -113,7 +113,10 @@ public:
     /* Sequence seq of system sys, lasting `lasts` ms of the system's time,
      * played at now_ms; at: the system's time when nothing plays in it.
      * Returns the time to set now, *from the start to give the sequence.
-     * With end, it starts as long ago as it lasts: its end is shown at once. */
+     * With end, it starts as long ago as it lasts: its end is shown at once.
+     * That end is always ahead of the system's time when the sequence
+     * starts (moved 1 ms past it if need be): the renderer takes no start
+     * whose end is not. */
     uint64_t play(const void *sys, const void *seq, uint64_t at, uint64_t lasts, bool end, int64_t now_ms,
                   uint64_t *from);
     /* Each playing system's time at now_ms, at most its last sequence's end;

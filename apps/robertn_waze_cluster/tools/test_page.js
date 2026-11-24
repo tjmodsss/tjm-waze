@@ -383,22 +383,26 @@ async function main() {
             JSON.stringify(aaRow()) === JSON.stringify([true, false, false, false, false]) && byName.wocAaZoom.text === 'Zoom: —' &&
             byName.wocAaCard.text === "Hide phone's turn card" && byName.wocAaCard.selected === false);
         byName.wocAaEnable.emit('action');
+        await until('Android Auto armed, waiting for the restart; Zoom and the card offered meanwhile', () =>
+            byName.wocAaStatus.text === 'Status: Patched after restart' && JSON.stringify(aaRow()) === JSON.stringify([false, true, true, true, true]) &&
+            byName.wocRestart.visible === true);
+        patch.aaStart();
         await until('Android Auto on', () => byName.wocAaStatus.text === 'Status: Patched' &&
             JSON.stringify(aaRow()) === JSON.stringify([false, true, true, true, true]));
         byName.wocAaZoomOut.emit('action');
-        await until('zoomed out', () => patch.received.some((m) => m.cmd === 'aa-density' && m.value === 170) &&
-            byName.wocAaZoom.text === 'Zoom: 170 dpi');
+        await until('zoomed out, waiting for the restart', () => patch.received.some((m) => m.cmd === 'aa-density' && m.value === 170) &&
+            byName.wocAaZoom.text === 'Zoom: 170 dpi (after restart)' && byName.wocAaStatus.text === 'Status: Patched after restart');
         assert(status.text !== '' && !/Android Auto/.test(status.text), 'CarPlay\'s line is its own');
-        await until('the card shown', () => byName.wocAaCard.enabled === true && byName.wocAaCard.selected === false);
+        await until('the card shown, offered while the Zoom waits', () => byName.wocAaCard.enabled === true && byName.wocAaCard.selected === false);
         const card = byName.wocAaCard;
         card.ticks.length = 0;
         card.press();
-        await until('card hidden', () => patch.received.some((m) => m.cmd === 'aa-card' && m.value === 'hidden') &&
-            patch.aa.state === 'patched' && patch.aa.diskCard === 'hidden' && card.selected === true &&
-            card.text === "Hide phone's turn card");
+        await until('card hidden, waiting for the restart', () => patch.received.some((m) => m.cmd === 'aa-card' && m.value === 'hidden') &&
+            patch.aa.pending === 'apply' && patch.aa.diskCard === 'hidden' && patch.aa.runCard === 'shown' && card.selected === true &&
+            card.text === "Hide phone's turn card (after restart)");
         await sleep(100);
         assert(card.ticks.every((t) => t === true), `ticked from the press on, never unticked meanwhile: ${JSON.stringify(card.ticks)}`);
-        patch.aa = Object.assign({}, patch.aa, { state: 'unknown', pending: 'apply', aapd: 'deferred', dpi: 160, density: 160, runDpi: 170, runCard: 'shown' });
+        patch.aa = Object.assign({}, patch.aa, { state: 'unknown', pending: 'apply', aapd: 'deferred', dpi: 160, density: 160, runDpi: 180, runCard: 'shown' });
         patch.announce('patched', 'high', null);
         await until('waiting for a restart', () => byName.wocAaZoom.text === 'Zoom: 160 dpi (after restart)' &&
             byName.wocAaCard.text === "Hide phone's turn card (after restart)" && byName.wocAaCard.selected === true &&

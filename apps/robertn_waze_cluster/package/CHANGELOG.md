@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.6.16
+
+Android Auto: Patch, Remove patch, Zoom and Hide phone's turn card can be
+changed again while a change waits for the head-unit restart; one restart
+applies the last choice. The cluster map row stays on while Android Auto
+still runs its patch until that restart.
+
 ## 0.6.15
 
 When boot recovery removes the Android Auto patch because Android Auto

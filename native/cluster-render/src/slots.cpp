@@ -1871,6 +1871,17 @@ int64_t SlotManager::wake_in_ms(int64_t now_ms) const
     return best;
 }
 
+bool SlotManager::at_rest() const
+{
+    for (size_t i = 0; i < specs_.size(); i++) {
+        const Target &t = t_[i];
+        if (t.status.state != TargetState::Idle || t.wanted || loads((int)i) || t.requested || t.loaded || t.kept ||
+            t.remap || t.unmapped_ms >= 0 || t.verdict)
+            return false;
+    }
+    return true;
+}
+
 void SlotManager::verify(int i, int64_t now_ms)
 {
     Target &t = t_[i];

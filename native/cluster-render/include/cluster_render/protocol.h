@@ -37,6 +37,12 @@ const char *const kDefaultSocket = "/dev/shm/cluster-render/render.sock";
 /* The largest message: a whole 1920x720 RGBA image and its header. */
 const size_t kMaxMessage = 1920 * 720 * 4 + 64;
 
+/* A video layer's shared frame buffer (PROTOCOL.md "Shared frames"): a
+ * sealed memfd of kShmHeader bytes, one 32-bit busy word a slot at its
+ * start, then each slot's whole atlas. */
+const size_t kShmHeader = 64;
+const unsigned kShmMaxSlots = 4;
+
 const uint8_t kJson = 'J';
 const uint8_t kFrame = 'F';
 const uint8_t kMesh = 'M';
@@ -83,23 +89,32 @@ bool parse_frame(const char *body, size_t n, FrameHeader *out);
 std::string mesh_message(uint32_t ref, uint32_t part, uint32_t vertices, const float *position, const float *normal,
                          const float *texcoord, const float *color, uint32_t indices, const uint16_t *index);
 /* False with *err when the body is malformed: counts out of bounds, sizes
- * that do not add up, a value that is not finite, an index past the
- * vertices, or indices that are not whole triangles. */
+ * that do not add up, a value that is not finite, or an index past the
+ * vertices. Whether the index count fits the part's draw mode is the
+ * part's to say. */
 bool parse_mesh(const char *body, size_t n, MeshHeader *out, std::string *err);
 
 /* Flat JSON: an object of string, number, true/false/null values. The
  * values are kept as text (strings unescaped). */
 typedef std::map<std::string, std::string> Json;
 bool parse_json(const std::string &s, Json *out);
+/* A text layer's string at most (PROTOCOL.md "Text"). */
+const size_t kMaxTextBytes = 1024;
+/* s is well-formed UTF-8: no overlong form, surrogate, code point past
+ * U+10FFFF or sequence cut short. */
+bool utf8_ok(const std::string &s);
 std::string json_quote(const std::string &s);
 /* {"k":v,...} from pairs whose values are already JSON (json_quote a string). */
 std::string json_object(const std::vector<std::pair<std::string, std::string>> &kv);
 
 /* A scene edit line's key (PROTOCOL.md "edit"): its kind, --show counted as
- * --hide and --pass-on as --pass-off, and the rest of the line, up to the
- * last '=' for the kinds that take a value. A line replaces the kept line
- * with the same key. */
+ * --hide, --pass-on as --pass-off and --skip as --play, and the rest of the
+ * line, up to the last '=' for the kinds that take a value. A line replaces
+ * the kept line with the same key. */
 std::string edit_key(const std::string &line);
+/* An edit line applied once and never kept (--play, --skip): not sent
+ * again after a reconnect. */
+bool edit_once(const std::string &line);
 
 }  // namespace cr
 

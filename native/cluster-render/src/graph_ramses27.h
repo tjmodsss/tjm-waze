@@ -55,6 +55,7 @@ public:
     int effect(const char *vs, const char *fs, std::string *err) override;
     void drop_effect(int effect) override;
     unsigned attributes(int effect) const override;
+    bool inputs(int effect, std::vector<EffectInput> *out) const override;
     std::unique_ptr<Graph> scene(const TargetSpec &t, std::string *err) override;
 
     /* The scene id of the scratch scene: never published, so it collides
@@ -65,6 +66,7 @@ public:
     struct Source {
         std::string vs, fs;
         unsigned attributes = 0;
+        std::vector<EffectInput> inputs;
     };
     const Source *source(int effect) const;
     void attach(Ramses27Graph *g) { graphs_.insert(g); }

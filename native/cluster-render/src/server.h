@@ -15,6 +15,7 @@
 #include <poll.h>
 
 #include <functional>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
@@ -71,7 +72,22 @@ private:
         std::string budget_sent;
         uint32_t fps_cap_sent = 0;   /* the fps of its last fps_cap event; 0: none or none sent */
         bool closing = false;
+        /* Descriptors it passed, not taken by an op yet (oldest first). */
+        std::deque<int> fds;
+        /* By video layer ref: its shared frames (PROTOCOL.md "Shared frames"). */
+        struct Shm {
+            uint8_t *map = nullptr;
+            size_t size = 0, slot_bytes = 0;
+            unsigned slots = 0;
+            uint64_t frames = 0;   /* taken from it */
+        };
+        std::map<uint32_t, Shm> shm;
     };
+    /* A shared frame buffer for video layer ref, from the oldest descriptor
+     * c passed ("shm"); and its slot k as the layer's next frame ("slot"). */
+    void op_shm(Client &c, uint32_t ref, Layer *l, const cr::Json &j);
+    void op_slot(Client &c, uint32_t ref, Layer *l, const cr::Json &j, int64_t now_ms);
+    static void unmap(Client::Shm *m);
 
     void accept_client(int64_t now_ms);
     void read_client(Client &c, int64_t now_ms);
@@ -90,6 +106,8 @@ private:
     void op_layer(Client &c, const cr::Json &j, int64_t now_ms);
     void op_asset(Client &c, const cr::Json &j);
     void op_canvas(Client &c, const cr::Json &j);
+    void op_value(Client &c, const cr::Json &j);
+    void op_font(Client &c, const cr::Json &j);
     /* A layer in a canvas with a depth-stencil buffer may test the stencil. */
     bool stencil_ok(const LayerParams &p) const;
     /* A scene file on a target (PROTOCOL.md "Scene files"), and its edits. */

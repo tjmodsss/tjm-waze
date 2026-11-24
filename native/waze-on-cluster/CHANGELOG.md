@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.14.12
+
+The tests build with the cluster renderer's iDrive 7 log-level handling
+left out, as the map feed test does not use it. Nothing changes on the car.
+
+## 0.14.11
+
+The map's frames go to the cluster renderer through shared memory where
+the renderer takes them, which takes less CPU for each frame. The receive
+and decode threads wait without waking while no stream comes.
+
 ## 0.14.10
 
 The tests run at once: `make test` takes about a minute and a half instead

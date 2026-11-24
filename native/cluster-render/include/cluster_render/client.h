@@ -116,10 +116,17 @@ struct RenderState {
      * (-1: not sent). */
     std::string stencil_func, stencil_fail, stencil_depth_fail, stencil_pass;
     int stencil_ref = -1, stencil_mask = -1;
+    /* Parts, to a service whose hello has draw (Client::takes_draw()): draw
+     * triangles, triangle_strip, lines, line_loop or points (empty:
+     * triangles); instances 1-256 (0: not sent), gl_InstanceID in a GLSL ES
+     * 3.00 vertex shader. */
+    std::string draw;
+    unsigned instances = 0;
 };
 
-/* GLSL ES 1.00; the fragment shader gets varying vec2 v_uv (0,0 at the
- * top-left). vs empty: the service's quad vertex shader. */
+/* GLSL ES 1.00, or 3.00 (#version 300 es) with a vs of the same version;
+ * the fragment shader gets v_uv (0,0 at the top-left). vs empty: the
+ * service's quad vertex shader, GLSL ES 1.00. */
 struct EffectOptions {
     std::string fs, vs;
     unsigned time_fps = 0;   /* u_time (seconds) updated this often; 0: none */
@@ -164,6 +171,27 @@ struct CanvasOptions {
     SamplerOptions sampler;  /* no mipmaps */
 };
 
+/* A font's table over an r8 asset (PROTOCOL.md "Text"): glyphs
+ * "code:x,y,w,h,left,top,advance ..." (its box in the atlas, its offset
+ * from the pen and the line's top, in atlas pixels), kerning
+ * "first,second:amount ...", the line's height, and for a distance atlas
+ * its range in atlas pixels each side of the edge (sdf; 0: coverage).
+ * text.h's Font makes them. */
+struct FontOptions {
+    unsigned line = 0;
+    unsigned sdf = 0;
+    std::string glyphs, kerning;
+};
+
+/* How a text layer draws its line. */
+struct TextLayerOptions {
+    unsigned max = 64;               /* glyphs it holds: 1 to 256 */
+    std::string align = "left";      /* left, center or right */
+    float spacing = 0;               /* pixels between characters */
+    float size = 0;                  /* the line's height in pixels; 0: the layer's height */
+    float color[4] = {1, 1, 1, 1};   /* straight alpha, 0-1 */
+};
+
 enum class UniformType { Float, Vec2, Vec3, Vec4, Mat4 };
 
 /* A mesh layer's projection (its aspect the layer's) and camera. */
@@ -176,8 +204,9 @@ struct MeshOptions {
     float crx = 0, cry = 0, crz = 0;   /* and rotation, degrees; it looks down -z */
 };
 
-/* A mesh part's shaders (GLSL ES 1.00; attributes a_position, a_normal,
- * a_texcoord, a_color) and how it is drawn. */
+/* A mesh part's shaders (GLSL ES 1.00, or 3.00 with #version 300 es and in
+ * for attribute; a_position, a_normal, a_texcoord, a_color) and how it is
+ * drawn. */
 struct PartOptions {
     std::string vs, fs;
     bool depth = true;              /* tested (less or equal) and written */
@@ -185,7 +214,8 @@ struct PartOptions {
     std::string blend = "alpha";    /* alpha, add or none */
 };
 
-/* A part's vertices and triangles: positions and normals xyz, texture
+/* A part's vertices and indices, drawn as its draw mode says (triangles by
+ * default; RenderState::draw): positions and normals xyz, texture
  * coordinates uv, colours rgba, one per vertex (each but positions may be
  * empty), up to 65535 vertices and 196605 indices. */
 struct Geometry {
@@ -210,10 +240,11 @@ struct SceneOptions {
     bool contend = false;              /* retries a slot the stock HMI takes */
     /* The target's layers drawn over the file (PROTOCOL.md "Layers over a
      * scene file"): their passes from render order layers_order up when
-     * layers_order_set, else past the file's own. */
+     * layers_order_set, else past the file's own; the overlay and alert
+     * layers' from over_order up when over_order_set. */
     bool layers = false;
-    bool layers_order_set = false;
-    int layers_order = 0;
+    bool layers_order_set = false, over_order_set = false;
+    int layers_order = 0, over_order = 0;
 };
 
 /* A scene, or a client's layers, showing another target's content
@@ -285,6 +316,45 @@ public:
     uint32_t asset(const AssetOptions &ao);
     /* With more of its sampler (SamplerOptions). */
     uint32_t asset(const AssetOptions &ao, const SamplerOptions &so);
+    /* A cube map (PROTOCOL.md "Cube maps"), to a service whose hello has cube
+     * (takes_cube()): ao.w x ao.w faces (ao.h ignored), its pixels the six
+     * faces one after another (+x, -x, +y, -y, +z, -z), sent whole and
+     * once; no mipmapped sampling. 0 when out of range. */
+    uint32_t cube(const AssetOptions &ao, const SamplerOptions &so = SamplerOptions());
+    /* A font over the client's r8 asset, to a service whose hello has text
+     * (takes_text()): held until then, never sent to an older one, and made
+     * again after a reconnect. Dropped with drop() once no text layer draws
+     * from it. 0 when asset is not an r8 asset of this client or the font
+     * has no line or glyphs. */
+    uint32_t font(uint32_t asset, const FontOptions &fo);
+    /* A font with an atlas of its own: an r8 asset on target of w x h
+     * pixels px (sampled bilinear), sent with the font, held as it is, and
+     * dropped with it. 0 when out of range. */
+    uint32_t font(const std::string &target, unsigned w, unsigned h, const uint8_t *px, const FontOptions &fo);
+    /* A text layer (PROTOCOL.md "Text"): a line of text drawn from font
+     * over lo's rect, held as fonts are. 0 when font is not one, to is out
+     * of range, or text is past kMaxTextBytes or not UTF-8. */
+    uint32_t text(const LayerOptions &lo, uint32_t font, const TextLayerOptions &to, const std::string &text = "");
+    /* The text layer's string and how it is drawn (its max as made);
+     * false, nothing sent, the last string taken kept, for a layer that is
+     * not a text layer, a string past kMaxTextBytes or one that is not
+     * UTF-8. */
+    bool set_text(uint32_t ref, const std::string &text);
+    bool set_text_style(uint32_t ref, const TextLayerOptions &to);
+    /* A shared value (PROTOCOL.md "Shared values") on target, to a service
+     * whose hello has values (takes_values()): type Float, Vec2, Vec3 or
+     * Vec4, v its first value (as many numbers). Uniforms of the client's
+     * effect layers and mesh parts there follow it (link()); set_value()
+     * sets it, animate() with property "value" animates it, for all of them
+     * at once. 0 when v is not as many finite numbers as the type takes. */
+    uint32_t value(const std::string &target, UniformType type, const std::vector<float> &v);
+    /* False, nothing sent or kept, when v is not as many finite numbers as
+     * the value takes. */
+    bool set_value(uint32_t value, const std::vector<float> &v);
+    /* The layer's uniform (part's, for a mesh layer) follows the value, of
+     * the uniform's type; value 0: it does not, and takes its own value
+     * again. False, nothing sent, when the layer or the value is not one. */
+    bool link(uint32_t ref, const std::string &uniform, uint32_t value, uint32_t part = 0);
     /* A scene file as the target's scene; 0 without a file or a hash for
      * each file. */
     uint32_t scene(const SceneOptions &so);
@@ -292,7 +362,8 @@ public:
     void scene(uint32_t ref, const SceneOptions &so);
     /* Edit lines for a scene (PROTOCOL.md "edit"), separated by newlines;
      * kept by their key (edit_key), each replacing the kept line of its
-     * key, and sent again after a reconnect in the order last sent. */
+     * key, and sent again after a reconnect in the order last sent; --play
+     * and --skip (to a service whose hello has scene_anim) never kept. */
     void edit(uint32_t ref, const std::string &lines);
     /* The scene (made with layers) hosts h.target there (PROTOCOL.md
      * "host"), its src_* part when src_w and src_h are set (all four go),
@@ -331,6 +402,13 @@ public:
     /* With the rest of its render state; look.blend, when set, in place of
      * po.blend. */
     bool part(uint32_t ref, uint32_t part, const PartOptions &po, const RenderState &look);
+    /* To a service whose hello has nodes (takes_nodes()): the part follows
+     * parent, a part made before it (0: the view): its transform then
+     * relative to the parent's. */
+    bool part(uint32_t ref, uint32_t part, const PartOptions &po, const RenderState &look, uint32_t parent);
+    /* A pivot: a part that draws nothing, posed, animated and followed as a
+     * part (parent as above). */
+    bool pivot(uint32_t ref, uint32_t part, uint32_t parent = 0);
     /* The part's geometry; the service takes a new one at most once a
      * second. False when it is out of range. */
     bool geometry(uint32_t ref, uint32_t part, const Geometry &g);
@@ -341,6 +419,10 @@ public:
     /* Replaces the layer's animation anim (one animate() returned) with a;
      * returns anim, or 0 when the layer has no such animation. */
     uint32_t animate(uint32_t ref, const AnimationOptions &a, uint32_t anim);
+    /* With an eased curve, in place of a.step, to a service whose hello has
+     * curves (takes_curves()): ease_in, ease_out, ease_in_out or smooth
+     * (linear, step as AnimationOptions). anim 0: a new animation. */
+    uint32_t animate(uint32_t ref, const AnimationOptions &a, uint32_t anim, const std::string &interp);
     void stop(uint32_t ref, uint32_t anim);
     /* A layer or an asset; an asset a layer samples stays (the service
      * refuses it). */
@@ -419,12 +501,30 @@ public:
     bool takes_host_layers() const { return host_layers_; }
     /* The service's hello takes canvases (CanvasOptions). */
     bool takes_canvas() const { return canvas_; }
+    /* The service's hello takes eased curves (animate()'s interp). */
+    bool takes_curves() const { return curves_; }
+    /* The service's hello takes pivots and parents (pivot(), part()). */
+    bool takes_nodes() const { return nodes_; }
+    /* The service's hello takes a part's draw mode and instances (RenderState). */
+    bool takes_draw() const { return draw_; }
+    /* The service's hello takes a part's instances above 1 (RenderState). */
+    bool takes_instances() const { return instances_; }
+    /* The service's hello takes cube maps (cube()). */
+    bool takes_cube() const { return cube_; }
+    /* The service's hello takes shared values (value(), link()). */
+    bool takes_values() const { return values_; }
+    /* The service's hello takes --play and --skip edit lines (edit()). */
+    bool takes_scene_anim() const { return scene_anim_; }
+    /* The service's hello takes fonts and text layers (font(), text()). */
+    bool takes_text() const { return text_; }
+    bool takes_over_order() const { return over_order_; }
 
 private:
     struct Part {
         std::string json;        /* its part message */
         std::string geometry;    /* its M message; empty: none yet */
         std::string transform;   /* its transform message; empty: none */
+        uint64_t made = 0;       /* the order parts were made in */
     };
     struct Layer {
         std::string kind;                /* video, image, effect, mesh, asset or scene */
@@ -433,6 +533,7 @@ private:
         SamplerOptions sampler;          /* an asset's */
         CanvasOptions co;                /* a canvas's */
         uint32_t canvas = 0;             /* the canvas a layer draws in */
+        bool cube = false;               /* an asset that is a cube map */
         VideoOptions vo;
         ImageOptions io;
         EffectOptions eo;
@@ -446,6 +547,13 @@ private:
         /* The last message of each, sent again after a reconnect. */
         std::map<std::pair<uint32_t, std::string>, std::string> uniforms;            /* (part, name) */
         std::map<std::pair<uint32_t, std::string>, std::pair<uint32_t, std::string>> binds;  /* -> asset */
+        std::map<std::pair<uint32_t, std::string>, std::pair<uint32_t, std::string>> links;  /* -> value */
+        std::string value;               /* a value's message, its last v; a font's message */
+        uint32_t font = 0;               /* a text layer's font, a font's asset */
+        bool owns = false;               /* a font: its asset goes with it */
+        bool atlas = false;              /* an asset a font owns: held as fonts are */
+        TextLayerOptions to;             /* a text layer's */
+        std::string text;                /* its string */
         std::map<uint32_t, Part> parts;
         std::map<uint32_t, std::string> animations;
         uint32_t next_anim = 1;
@@ -470,16 +578,27 @@ private:
                                                             const LayerOptions &lo) const;
     void turn_fields(std::vector<std::pair<std::string, std::string>> *kv, const LayerOptions &lo) const;
     void mesh_fields(std::vector<std::pair<std::string, std::string>> *kv, const MeshOptions &mo) const;
+    static void text_fields(std::vector<std::pair<std::string, std::string>> *kv, const TextLayerOptions &to);
     std::string layer_json(uint32_t ref, const Layer &l) const;
     /* A canvas, or a layer drawn in one. */
     static bool in_canvas(const Layer &l);
-    /* Held here, not sent: one in_canvas() until a hello with canvas. */
+    /* Sent only once the hello says the service takes it: in_canvas(), a
+     * font or a text layer. */
+    static bool texty(const Layer &l) { return l.kind == "font" || l.kind == "text" || l.atlas; }
+    static bool late(const Layer &l) { return in_canvas(l) || texty(l); }
+    /* Held here, not sent: one in_canvas() until a hello with canvas, a
+     * texty() one until a hello with text. */
     bool held(uint32_t ref) const;
+    /* A part or pivot of a mesh layer, its fields after op, ref and part:
+     * false, nothing sent, when the layer, the part or the parent is not as
+     * pivot() and part() say. */
+    bool add_part(uint32_t ref, uint32_t part, uint32_t parent,
+                  std::vector<std::pair<std::string, std::string>> fields);
     /* json, about ref, queued unless ref is held. */
     void queue_for(uint32_t ref, const std::string &json);
-    /* Every layer, part, bind and animation made so far: those of canvases
-     * or the rest. */
-    void replay(bool canvases);
+    /* Every layer, part, bind and animation made so far: the late() ones
+     * not held, or the rest. */
+    void replay(bool late);
     std::string host_json(const std::pair<std::string, std::string> &by, const Host &h) const;
     /* A scene's kept edit lines as one edit message, oldest first. */
     std::string edits_json(uint32_t ref, const Layer &l) const;
@@ -530,6 +649,36 @@ private:
     /* Hosts from this client's layers: by hosted target, (into, message). */
     std::map<std::string, std::pair<std::string, std::string>> layer_hosts_;
     bool canvas_ = false;           /* and canvases */
+    bool curves_ = false;           /* and eased curves */
+    bool nodes_ = false;            /* and pivots and parents */
+    bool draw_ = false;             /* and draw modes */
+    bool instances_ = false;        /* and instances above 1 */
+    bool cube_ = false;             /* and cube maps */
+    bool values_ = false;           /* and shared values */
+    bool shm_frames_ = false;       /* and video frames in shared memory (PROTOCOL.md "Shared frames") */
+    /* A video layer's shared frames on this connection: its buffer, sent
+     * with its "shm" message, taken once the service says ok. */
+    struct Shm {
+        uint8_t *map = nullptr;
+        size_t size = 0, slot_bytes = 0;
+        unsigned slots = 0;
+        enum State { Asked, Ok, Refused } state = Asked;
+    };
+    static const unsigned kShmSlots = 2;
+    std::map<uint32_t, Shm> shm_;
+    std::set<uint32_t> shm_due_;    /* video layers whose buffer is still to be made and sent */
+    int cur_fd_ = -1;               /* a buffer's descriptor, ours until it goes with cur_'s first byte */
+    /* The buffer of shm_due_'s first layer into cur_, with its descriptor;
+     * false when none is due (or one cannot be made: frames then go whole). */
+    bool next_shm();
+    /* A frame of video layer ref through its shared buffer, its message into
+     * cur_: false when the layer has none or no slot is free. */
+    bool shm_frame(uint32_t ref, const std::vector<uint8_t> &px);
+    void shm_close(Shm *m);
+    bool scene_anim_ = false;       /* and a scene file's animation sequences played */
+    bool text_ = false;             /* and fonts and text layers */
+    bool over_order_ = false;       /* and a scene's over_order (overlay and alert layers above the file) */
+    uint64_t parts_made_ = 0;
 };
 
 }  // namespace cr

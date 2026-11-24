@@ -1,7 +1,7 @@
 {
   "id": "cluster-render",
   "kind": "tool",
-  "version": "0.8.4",
+  "version": "0.8.11",
   "title": "Cluster renderer",
   "description": "Draws every app's layers on the instrument cluster and the HUD, sharing the display slots and one upload budget",
   "mguHmi": ["ID7", "ID8"],
@@ -13,7 +13,8 @@
     { "path": "cluster-render-idrive7", "from": "build/target/cluster-render-idrive7", "mode": "0755" },
     { "path": "cluster-render-idrive8", "from": "build/target/cluster-render-idrive8", "mode": "0755" },
     { "path": "cluster-render.conf", "from": "cluster-render.conf", "mode": "0644" },
-    { "path": "cluster_render_client.js", "from": "js/cluster_render_client.js", "mode": "0644" }
+    { "path": "cluster_render_client.js", "from": "js/cluster_render_client.js", "mode": "0644" },
+    { "path": "cluster_render_text.js", "from": "js/cluster_render_text.js", "mode": "0644" }
   ],
   "units": [
     { "name": "cluster-render.socket", "from": "systemd/cluster-render.socket" },

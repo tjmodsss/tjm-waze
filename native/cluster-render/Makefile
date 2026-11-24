@@ -13,7 +13,8 @@
 #                             hidden tiles on a fake renderer, the receive buffer,
 #                             scene files and their edits, the settings and their
 #                             drop-ins, the service over its socket
-#                             with the C++ client, and the Node client
+#                             with the C++ client, its memory over a day of
+#                             idling on a simulated clock, and the Node client
 #   make test-kit             the kit's tests alone (for producers that link it)
 #   make test-x86             the C++ tests built and run with the unit's
 #                             toolchain in Docker (x86-64: the SSE2 paths)
@@ -28,6 +29,10 @@
 #                             iDrive 8's libramses 27, every import checked
 #   make test-ramses ROOTFS=… every layer kind built by the unit's own libramses,
 #                             and a scene file it saved, loaded and edited
+#   make test-dlt ROOTFS=…    RAMSES's console and DLT under the unit's own
+#                             dlt-daemon, libdlt and libramses: the console
+#                             stays live at DLT's level OFF, DLT gets RAMSES's
+#                             messages only at the level it sets
 #   make test-ramses27 ROOTFS=…  the same on an iDrive 8 unit's libramses 27
 
 CXX     ?= c++
@@ -56,25 +61,25 @@ H = $(BUILD)/host
 
 KIT_SRC  = kit/dirty_tiles.cpp kit/yuv_atlas.cpp kit/block_pack.cpp
 CORE_SRC = src/slots.cpp src/governor.cpp src/stack.cpp src/recv_buffer.cpp src/layer.cpp src/video_layer.cpp \
-           src/video_composite.cpp src/mesh_layer.cpp src/occlusion.cpp src/asset.cpp src/canvas.cpp src/compositor.cpp src/scene_file.cpp \
-           src/scene_edit.cpp \
+           src/video_composite.cpp src/mesh_layer.cpp src/occlusion.cpp src/asset.cpp src/canvas.cpp src/curves.cpp src/compositor.cpp src/scene_file.cpp \
+           src/scene_edit.cpp src/text_layer.cpp \
            src/server.cpp src/service.cpp src/dcsm2_port.cpp src/dcsm27_port.cpp src/ramses_console.cpp \
            src/ceiling_memory.cpp src/link_trace.cpp client/protocol.cpp src/log.cpp
 CORE_H   = $(wildcard src/*.h kit/*.h include/cluster_render/*.h)
-UNIT_SRC = src/main.cpp src/settings.cpp src/head_unit.cpp src/refused.cpp src/holds.cpp src/unit_idrive7.cpp src/graph_ramses19.cpp src/dcsm2_link.cpp src/config.cpp dcsm/dcsm_client.cpp
+UNIT_SRC = src/main.cpp src/settings.cpp src/head_unit.cpp src/refused.cpp src/holds.cpp src/unit_idrive7.cpp src/ramses_dlt.cpp src/graph_ramses19.cpp src/dcsm2_link.cpp src/config.cpp dcsm/dcsm_client.cpp
 UNIT8_SRC = src/main.cpp src/settings.cpp src/head_unit.cpp src/refused.cpp src/holds.cpp src/unit_idrive8.cpp src/graph_ramses27.cpp src/config.cpp
 LAUNCH_SRC = src/main.cpp src/settings.cpp src/head_unit.cpp src/refused.cpp src/holds.cpp src/launch.cpp src/generation.cpp src/config.cpp client/protocol.cpp src/log.cpp src/ceiling_memory.cpp
-CLIENT_SRC = client/client.cpp client/protocol.cpp
+CLIENT_SRC = client/client.cpp client/protocol.cpp client/text.cpp
 
 .PHONY: all test test-cpp test-js test-kit test-kit-bin test-x86 test-x86-in-docker test-kit-x86 image target target-in-docker \
-	test-ramses test-ramses27 clean
+	test-ramses test-ramses27 test-dlt clean
 
 KIT_TESTS = $(H)/map_upload_test $(H)/yuv_atlas_test $(H)/frame_clock_test $(H)/block_pack_test
 CPP_TESTS = $(H)/log_test $(H)/slots_test $(H)/governor_test $(H)/ceiling_test $(H)/compositor_test $(H)/video_composite_test \
 	$(H)/occlusion_test \
-	$(H)/service_test \
-	$(H)/dcsm2_port_test $(H)/ramses_console_test $(H)/dcsm27_port_test $(H)/generation_test $(H)/holds_test \
-	$(H)/head_unit_test $(H)/refused_test $(H)/recv_buffer_test $(H)/scene_test $(H)/settings_test
+	$(H)/service_test $(H)/idle_memory_test \
+	$(H)/dcsm2_port_test $(H)/ramses_console_test $(H)/ramses_dlt_test $(H)/dcsm27_port_test $(H)/generation_test $(H)/holds_test \
+	$(H)/head_unit_test $(H)/refused_test $(H)/recv_buffer_test $(H)/scene_test $(H)/settings_test $(H)/text_gl_check
 
 all: test
 
@@ -82,8 +87,9 @@ all: test
 # target (--output-sync keeps a test's lines together); occlusion_test, the
 # longest, in parts (its --part I/N), one per entry of OCC_PART_IDS.
 OCC_PART_IDS = 0 1 2 3 4 5 6 7
-CPP_RUNS = $(patsubst $(H)/%_test,run-%,$(filter-out $(H)/occlusion_test,$(CPP_TESTS))) \
-	$(addprefix run-occlusion.,$(OCC_PART_IDS))
+IDLE_PARTS = alone clients session
+CPP_RUNS = $(patsubst $(H)/%_test,run-%,$(filter-out $(H)/occlusion_test $(H)/idle_memory_test $(H)/text_gl_check,$(CPP_TESTS))) \
+	$(addprefix run-occlusion.,$(OCC_PART_IDS)) $(addprefix run-idle_memory.,$(IDLE_PARTS)) run-text_gl_check
 RUN_JOBS ?= $(JOBS)
 
 test:
@@ -99,11 +105,17 @@ run-%: $(H)/%_test
 run-occlusion.%: $(H)/occlusion_test
 	$(H)/occlusion_test --part $*/$(words $(OCC_PART_IDS))
 
+run-idle_memory.%: $(H)/idle_memory_test
+	$(H)/idle_memory_test $*
+
 run-head_unit: $(H)/head_unit_test
 	$(H)/head_unit_test test/head_unit_cases.jsonl
 
 run-refused: $(H)/refused_test
 	$(H)/refused_test $(H)/cluster-render
+
+run-text_gl_check: $(H)/text_gl_check
+	$(H)/text_gl_check
 
 test-js: $(H)/host_service
 	$(NODE) js/test/client_test.js $(H)/host_service
@@ -158,6 +170,9 @@ $(H)/slots_test: $(O)/test/slots_test.o $(O)/src/slots.o $(O)/src/governor.o $(O
 $(H)/ramses_console_test: $(O)/test/ramses_console_test.o $(O)/src/ramses_console.o $(O)/src/log.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
+$(H)/ramses_dlt_test: $(O)/test/ramses_dlt_test.o $(O)/src/ramses_dlt.o $(O)/src/log.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread -ldl
+
 $(H)/governor_test: $(O)/test/governor_test.o $(O)/src/governor.o $(O)/src/log.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
@@ -207,7 +222,15 @@ $(H)/scene_test: $(O)/test/scene_test.o $(CORE_OBJ)
 $(H)/settings_test: $(O)/test/settings_test.o $(O)/src/settings.o $(O)/src/config.o $(O)/src/holds.o $(O)/src/log.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/service_test: $(O)/test/service_test.o $(CORE_OBJ) $(O)/client/client.o
+# The text layers' glyph runs drawn on the host, EGL loaded at run time
+# (skipped without it).
+$(H)/text_gl_check: $(O)/test/text_gl_check.o $(CORE_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ -ldl -lpthread
+
+$(H)/service_test: $(O)/test/service_test.o $(CORE_OBJ) $(O)/client/client.o $(O)/client/text.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
+
+$(H)/idle_memory_test: $(O)/test/idle_memory_test.o $(CORE_OBJ) $(O)/client/client.o $(O)/client/text.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
 $(H)/host_service: $(O)/test/host_service.o $(CORE_OBJ)
@@ -284,8 +307,11 @@ $(T)/cluster-render: $(addprefix $(T)/launch/,$(LAUNCH_SRC:.cpp=.o))
 	g++ $(LAUNCH_FLAGS) $(LD_UNIT) -o $@ $^
 	$(PYTHON) tools/ramses_abi.py check-imports $@ abi/libramses19.symbols
 
-$(T)/cluster-render-idrive7: $(addprefix $(T)/idrive7/,$(CORE_SRC:.cpp=.o) $(KIT_SRC:.cpp=.o) $(UNIT_SRC:.cpp=.o)) $(STUBS)
-	g++ $(IDRIVE7_FLAGS) $(LD_UNIT) -o $@ $^
+# Exports dlt_register_log_level_changed_callback for libramses to bind to
+# (src/ramses_dlt.h).
+$(T)/cluster-render-idrive7: $(addprefix $(T)/idrive7/,$(CORE_SRC:.cpp=.o) $(KIT_SRC:.cpp=.o) $(UNIT_SRC:.cpp=.o)) $(STUBS) \
+		src/ramses_dlt.list
+	g++ $(IDRIVE7_FLAGS) $(LD_UNIT) -Wl,--dynamic-list=src/ramses_dlt.list -o $@ $(filter-out %.list,$^) -ldl
 	$(PYTHON) tools/ramses_abi.py check-imports $@ abi/libramses19.symbols
 	$(PYTHON) dcsm/tools/abi.py check $@ dcsm/abi/libvsomeip3.so.3.symbols
 
@@ -306,9 +332,31 @@ test-ramses:
 		if grep -q "\[ Error \]" $(T)/ramses_check.log; then echo "FAIL libramses logged errors"; exit 1; fi; exit $$rc'
 
 $(T)/ramses_check: test/ramses_check.cpp test/fake_port.h src/graph_ramses19.cpp $(CORE_SRC) $(KIT_SRC) $(CORE_H) \
+		$(wildcard abi/include/ramses19/*.h) \
 		$(T)/stub/$(RAMSES_SONAME)
 	g++ $(CXXFLAGS) $(CPPFLAGS) -Wl,--dynamic-linker=/lib/ld-linux-x86-64.so.2 -pthread -o $@ test/ramses_check.cpp \
 		src/graph_ramses19.cpp $(CORE_SRC) $(KIT_SRC) $(T)/stub/$(RAMSES_SONAME)
+
+# RAMSES's console and DLT under the unit's own dlt-daemon (test/dlt_check.py).
+# ROOTFS has the unit's libramses and its libraries, /usr/bin/dlt-daemon,
+# /usr/bin/dlt-control, /usr/lib/libdlt.so.2.15.0 and /etc/dlt.conf.
+test-dlt:
+	@test -n "$(ROOTFS)" || { echo "set ROOTFS to a copy of the unit's root filesystem"; exit 2; }
+	$(DOCKER_IMAGE)
+	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w/cluster-render" \
+		-w /w/cluster-render $(IMAGE) make -s BUILD=$(BUILD) $(T)/dlt_check $(T)/dlt_check_plain
+	docker run --rm --platform linux/amd64 --network none -v "$(CURDIR):/w/cluster-render:ro" \
+		-v "$(ROOTFS):/rootfs:ro" -w /w/cluster-render $(IMAGE) python3 test/dlt_check.py $(T)
+
+DLT_CHECK = test/dlt_check.cpp src/ramses_console.cpp src/log.cpp
+$(T)/dlt_check: $(DLT_CHECK) src/ramses_dlt.cpp src/ramses_dlt.h src/ramses_console.h test/dlt_check.list \
+		$(T)/stub/$(RAMSES_SONAME)
+	g++ $(CXXFLAGS) $(CPPFLAGS) $(LD_UNIT) -Wl,--dynamic-list=test/dlt_check.list -pthread -o $@ \
+		$(DLT_CHECK) src/ramses_dlt.cpp $(T)/stub/$(RAMSES_SONAME) -ldl
+
+$(T)/dlt_check_plain: $(DLT_CHECK) src/ramses_console.h test/dlt_check.list $(T)/stub/$(RAMSES_SONAME)
+	g++ $(CXXFLAGS) $(CPPFLAGS) $(LD_UNIT) -Wl,--dynamic-list=test/dlt_check.list -pthread -o $@ \
+		$(DLT_CHECK) $(T)/stub/$(RAMSES_SONAME) -ldl
 
 # The same on iDrive 8's libramses 27 (TCP, no renderer).
 test-ramses27:
@@ -322,16 +370,20 @@ test-ramses27:
 		if grep -q "\[ Error \]" $(T)/ramses_check27.log; then echo "FAIL libramses logged errors"; exit 1; fi; exit $$rc'
 
 $(T)/ramses_check27: test/ramses_check.cpp test/fake_port.h src/graph_ramses27.cpp $(CORE_SRC) $(KIT_SRC) $(CORE_H) \
+		$(wildcard abi/include/ramses27/ramses-client-api/*.h) \
 		$(T)/stub/$(RAMSES27_SONAME)
 	g++ $(CXXFLAGS) $(CPPFLAGS27) -DCRS_RAMSES27 -Wl,--dynamic-linker=/lib/ld-linux-x86-64.so.2 -pthread -o $@ \
-		test/ramses_check.cpp src/graph_ramses27.cpp $(CORE_SRC) $(KIT_SRC) $(T)/stub/$(RAMSES27_SONAME)
+		test/ramses_check.cpp src/graph_ramses27.cpp $(CORE_SRC) $(KIT_SRC) \
+		$(T)/stub/$(RAMSES27_SONAME)
 
 # The C++ client for native producers on the unit, as a static library.
-$(T)/libcluster_render_client.a: $(CLIENT_SRC) include/cluster_render/client.h include/cluster_render/protocol.h
+$(T)/libcluster_render_client.a: $(CLIENT_SRC) include/cluster_render/client.h include/cluster_render/protocol.h \
+		include/cluster_render/text.h
 	mkdir -p $(T)/client
 	g++ $(CXXFLAGS) -Iinclude -c client/client.cpp -o $(T)/client/client.o
 	g++ $(CXXFLAGS) -Iinclude -c client/protocol.cpp -o $(T)/client/protocol.o
-	ar rcs $@ $(T)/client/client.o $(T)/client/protocol.o
+	g++ $(CXXFLAGS) -Iinclude -c client/text.cpp -o $(T)/client/text.o
+	ar rcs $@ $(T)/client/client.o $(T)/client/protocol.o $(T)/client/text.o
 
 clean:
 	rm -rf $(BUILD)

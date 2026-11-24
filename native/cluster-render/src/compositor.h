@@ -181,6 +181,7 @@
 #include "scene_file.h"
 #include "slots.h"
 #include "stack.h"
+#include "text_layer.h"
 #include "video_composite.h"
 #include "video_layer.h"
 
@@ -210,11 +211,12 @@ struct CompositorLimits {
 
 /* A scene content's layers drawn over its file (PROTOCOL.md "Layers over a
  * scene file"): their passes from render order `order` up, or past the
- * file's own without it. */
+ * file's own without it; with over_set, the overlay and alert layers' from
+ * `over` up (Graph::band). */
 struct SceneLayers {
     bool on = false;
-    bool order_set = false;
-    int32_t order = 0;
+    bool order_set = false, over_set = false;
+    int32_t order = 0, over = 0;
 };
 
 /* A scene content showing another target's content (PROTOCOL.md "host"): at
@@ -251,12 +253,53 @@ public:
                         const std::string &fs, uint32_t time_fps, int64_t now_ms, std::string *err);
     uint32_t add_mesh(uint64_t owner, int target, const LayerParams &lp, const MeshParams &mp, int64_t now_ms,
                       std::string *err);
-    /* A mesh layer's part, its effect compiled here; false with *err. */
+    /* A mesh layer's part, its effect compiled here, following parent (0:
+     * the view); with no vs and fs a pivot (MeshLayer::add_part()). False
+     * with *err, nothing made. */
     bool add_part(uint64_t owner, uint32_t layer, uint32_t part, const std::string &vs, const std::string &fs,
-                  const PartLook &look, std::string *err);
+                  const PartLook &look, uint32_t parent, std::string *err);
+    /* Animation keys go to the renderer as scene data, out of a share of
+     * the upload cap of their own: 1/kKeyShare of it, the rest pacing the
+     * writes (pacer()) while an animation waits for its keys on a target
+     * that flushes; with none waiting the writes have the whole cap. The
+     * keys' share is split evenly into a bucket per target, refilled every
+     * tick whatever the order targets flush in, but only for the time the
+     * writes ran at the cap less the share, and holding at most kKeyHeldMs
+     * of its rate; the pacer is brought up to the time at its old rate
+     * before it takes a new one. A target's flush makes its due animations
+     * while its bucket is above 0 (Graph::key_allowance()), so the bucket
+     * goes below 0 by less than one animation: at most kMaxKeyBytes. Keys
+     * never touch the writes' pacer, nor writes a bucket: neither starves
+     * the other, nor one target's keys another's. So over any span, writes
+     * and keys together take at most the cap for the span, plus the
+     * pacer's burst and one write past it, plus for each target kKeyHeldMs
+     * of its share and kMaxKeyBytes. */
+    static const uint64_t kKeyShare = 8;
+    static const int64_t kKeyHeldMs = 100;
+    /* One animation's keys at most: 1,024 keys of a time and four values. */
+    static const int64_t kMaxKeyBytes = 1024 * (4 + 4 * 4);
+    /* Target ti's key bucket (for tests). */
+    int64_t key_bucket(int ti) const { return targets_[ti].key_tokens; }
+    /* The writes' rate: the cap less the keys' share. */
+    static uint64_t writes_rate(uint64_t cap) { return cap - cap / kKeyShare; }
     /* A part's geometry, within the service's memory; false with *err. */
     bool geometry(uint64_t owner, uint32_t layer, uint32_t part, MeshData &&data, int64_t now_ms,
                   std::string *err);
+
+    /* A font (text_layer.h) over the client's r8 asset, its table in the
+     * service's memory, at most kClientFonts a client; dropped as an asset
+     * (remove_asset()), refused while a text layer draws from it, as its
+     * asset is while it is there. 0 with *err when refused. */
+    uint32_t add_font(uint64_t owner, uint32_t asset, Font &&f, std::string *err);
+    static const uint32_t kClientFonts = 8;
+    /* A text layer drawing a line from the client's font, whose atlas is on
+     * target; capacity glyphs (1 to TextLayer::kMaxGlyphs), their buffers in
+     * the service's memory. 0 with *err when refused. */
+    uint32_t add_text(uint64_t owner, int target, const LayerParams &lp, uint32_t font, uint32_t capacity,
+                      int64_t now_ms, std::string *err);
+    /* Text layers can be made: the renderer compiled their shaders, at the
+     * first call. */
+    bool texts();
 
     /* A new asset, owned by a client; 0 with *err when refused. */
     uint32_t add_asset(uint64_t owner, int target, const AssetParams &ap, std::string *err);
@@ -271,6 +314,40 @@ public:
     const Canvas *canvas(uint32_t id) const;
     std::vector<const Canvas *> canvases() const;
     static const uint32_t kClientCanvases = 4, kCanvases = 8;
+    /* A shared value: its width and value, its handle in its target's
+     * scene (0: none), and its animations, made again in each new scene. */
+    struct ValueEntry {
+        uint64_t owner = 0;
+        int target = 0;
+        uint32_t width = 1;
+        float v[4] = {0, 0, 0, 0};
+        int handle = 0;
+        struct Played {
+            Animation a;
+            int handle = 0;
+        };
+        std::map<uint32_t, Played> anims;
+    };
+    /* A shared value (PROTOCOL.md "Shared values") of the client's on
+     * target: width floats (1-4), at most kClientValues a client and
+     * kValues in all, dropped as an asset (remove_asset(): its links go).
+     * 0 with *err when refused. */
+    uint32_t add_value(uint64_t owner, int target, uint32_t width, const float *v, std::string *err);
+    static const uint32_t kClientValues = 32, kValues = 128, kMaxLinks = 32;
+    /* The client's value id; null when none. */
+    const ValueEntry *value(uint64_t owner, uint32_t id) const;
+    bool set_value(uint64_t owner, uint32_t id, const float *v, std::string *err);
+    /* Animation anim of the value (its width 1, 3 or 4), replacing one of
+     * that number; one animation for every uniform linked to it. */
+    bool animate_value(uint64_t owner, uint32_t id, uint32_t anim, const Animation &a, std::string *err);
+    bool stop_value(uint64_t owner, uint32_t id, uint32_t anim);
+    /* The layer's uniform (of part, for a mesh layer) follows the client's
+     * value on its target, of the uniform's type; value 0: it does not, and
+     * takes its own value again. False with *err. */
+    bool link(uint64_t owner, uint32_t layer, uint32_t part, const std::string &name, uint32_t value,
+              std::string *err);
+    /* Whether it follows one. */
+    bool linked(uint64_t owner, uint32_t layer, uint32_t part, const std::string &name) const;
     /* The asset if it exists and belongs to owner. */
     Asset *asset(uint64_t owner, uint32_t id);
     /* False with *err while a layer samples it. */
@@ -440,6 +517,12 @@ public:
     void set_file_tick_ms(int ms) { file_tick_ms_ = ms; }
     /* How long a fade in or out takes; 0: none. */
     void set_fade_ms(int ms) { fade_ms_ = ms; }
+    /* Parts drawn more than once (instances); off refuses a part of
+     * instances above 1 (cluster-render.conf instancing, id8_instancing). */
+    void set_instancing(bool on) { instancing_ = on; }
+    bool instancing() const { return instancing_; }
+    /* Scene files' animation sequences can be played (Gpu::sequences). */
+    bool sequences() { return gpu_->sequences(); }
     static const int64_t kFadeStepMs = 50;
     /* A composite is made again for its videos' rect growing past it, or a
      * joining video's settings, at most this often; it is then made over
@@ -500,6 +583,13 @@ private:
         /* Its look may differ from flushed: in its target's touched list. */
         bool touched = false;
         std::map<std::pair<uint32_t, std::string>, uint32_t> binds;   /* (part, sampler) -> asset */
+        std::map<std::pair<uint32_t, std::string>, uint32_t> links;   /* (part, uniform) -> value */
+        uint32_t font = 0;     /* a text layer's font */
+    };
+    struct FontEntry {
+        uint64_t owner = 0;
+        uint32_t asset = 0;
+        std::shared_ptr<const Font> font;
     };
     struct AssetEntry {
         std::unique_ptr<Asset> asset;
@@ -526,6 +616,7 @@ private:
     };
     struct Target {
         bool flushing = false;   /* slots_->flushing() at the last render() */
+        int64_t key_tokens = 0;  /* its key bucket's bytes (refill_keys()) */
         std::unique_ptr<Graph> graph;
         /* Or the scene of a scene content's file: which content's, its
          * serial, and its files' bytes. */
@@ -533,6 +624,7 @@ private:
         uint32_t file_of = 0, file_serial = 0;
         uint64_t file_bytes = 0;
         int64_t file_flush_ms = -1;   /* its edits' last flush */
+        bool over = false;            /* its graph has the file's over band (SceneLayers over) */
         Arrangement arr;
         bool dirty = false;    /* changed outside a layer's stage(): flush */
         bool held_back = false;   /* the last render held a layer's write for the budget */
@@ -681,8 +773,9 @@ private:
      * flushes it. */
     void render_file(int ti, Target &t, int64_t now_ms);
     /* The content's due edits staged into the target's file scene, at most
-     * once a tick unless the target is dirty; whether any were. */
-    bool stage_edits(Target &t, int64_t now_ms);
+     * once a tick unless the target is dirty, and the sequences it plays
+     * moved on while the upload budget is not overdrawn; whether any were. */
+    bool stage_edits(int ti, Target &t, int64_t now_ms);
     /* The target's layers wait for its scene content: it has one, and its
      * layers are not drawn over the file. */
     bool layers_wait(int target) const;
@@ -739,7 +832,19 @@ private:
      * flush that goes. */
     void mark(Entry &e, uint32_t id, Target &t);
     void apply_binds(Entry &e);
+    /* A client's effect, compiled, and its uniforms' kinds as the library
+     * compiled it noted (inputs_); dropped with them. */
+    int compile(const std::string &vs, const std::string &fs, std::string *err);
+    void drop_effect(int fx);
     void drop_effects(Entry &e);
+public:
+    /* Effects whose uniforms are noted (for tests). */
+    size_t compiled_effects() const { return inputs_.size(); }
+private:
+    /* By effect: its uniforms' kinds as the library compiled it (Gpu::inputs()). */
+    std::map<int, std::map<std::string, EffectInput>> inputs_;
+    /* Every canvas a layer of which follows the value drawn again. */
+    void touch_linked(uint32_t value);
     /* Every asset the layer samples has pixels; and its buffer holds them. */
     bool assets_have(const Entry &e) const;
     bool assets_clean(const Entry &e) const;
@@ -755,6 +860,7 @@ private:
     int64_t slow_flush_us_ = 150000;
     int64_t file_tick_ms_ = 0;
     int fade_ms_ = 0;
+    bool instancing_ = true;
     /* Bytes written this second, flushed or not: the link counts as
      * carrying load (for the governor's evidence and healthy time) from
      * kLoadBytes a second. */
@@ -764,6 +870,12 @@ private:
     int64_t second_ms_ = 0;
     int64_t (*clock_us_)() = nullptr;
     int atlas_fx_ = 0, block_fx_ = 0, image_fx_ = 0;
+    int text_fx_ = 0;   /* the text layers' (text_layer.h); 0: none */
+    bool text_tried_ = false;
+    int sdf_fx_ = 0;    /* distance fonts' in GLSL ES 3.00, compiled at the first; 0: none */
+    bool sdf_tried_ = false;
+    bool sdf_effect();
+    std::map<uint32_t, FontEntry> fonts_;
     int edge_fx_[2] = {0, 0};   /* kEdgeAtlasFragmentShader, kEdgeBlockFragmentShader; 0: no edges */
     bool edge_tried_ = false;
     bool edge_effects();
@@ -775,6 +887,18 @@ private:
     std::vector<int> render_order_, render_later_;   /* kept to save allocating them each tick */
     std::map<uint32_t, AssetEntry> assets_;
     std::map<uint32_t, CanvasEntry> canvases_;
+    int64_t keys_refilled_ms_ = -1;   /* the key buckets' last refill */
+    bool keys_waiting_ = false;       /* an animation waits for its keys: the writes at writes_rate() */
+    /* The writes' pacer at the whole cap, or less the keys' share while an
+     * animation waits for its keys; settled at its old rate up to now_ms
+     * first. */
+    void pace_writes(int64_t now_ms);
+    /* Every target's key bucket brought up to now_ms, for the time since
+     * the last refill that the writes ran at writes_rate(). */
+    void refill_keys(int64_t now_ms);
+    std::map<uint32_t, ValueEntry> values_;
+    /* The value made in the target's scene, set, its animations started. */
+    void make_value(Target &t, ValueEntry &ve);
     /* A layer's entry, in the stack or a canvas (*in, null for the stack);
      * null when none. */
     Entry *find(uint32_t id, CanvasEntry **in = nullptr);

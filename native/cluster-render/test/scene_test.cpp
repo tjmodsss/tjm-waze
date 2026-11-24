@@ -71,7 +71,9 @@ static const char *const kGauge = "scene 0x01000400\n"
                                   "camera main_cam -\n"
                                   "pass main_pass\n"
                                   "pass glow_pass\n"
-                                  "data level 1\n";
+                                  "data level 1\n"
+                                  "sequence sweep 1000\n"
+                                  "rtsequence glow\n";
 
 static void checks(const std::string &dir)
 {
@@ -160,9 +162,13 @@ static void parsing()
     ok("--viewport x,y,w,h", parse_edit("--viewport cam=0,0,1920,720", &e, &err) && e.v.size() == 4);
     ok("--set", parse_edit("--set level=0.25", &e, &err) && e.op == SceneEdit::Set && e.pattern == "level");
     ok("--pass-on", parse_edit("--pass-on glow", &e, &err) && e.op == SceneEdit::PassOn);
+    ok("--play, --skip: a sequence's name, taken as it is",
+       parse_edit("--play intro (a)\\1", &e, &err) && e.op == SceneEdit::Play && e.pattern == "intro (a)\\1" &&
+           parse_edit("--skip intro", &e, &err) && e.op == SceneEdit::Skip && e.pattern == "intro");
     const char *const bad[] = {"--hide",          "--spin x=1,2,3",  "--move x=1,2",       "--rotate x",
                                "--uniform x=1",   "--uniform x:=1",  "--viewport c=0,0,0,1", "--viewport c=1.5,0,1,1",
-                               "--set =1",        "--move x=1,2,nan", "hide x",             "--hide (a)\\1"};
+                               "--set =1",        "--move x=1,2,nan", "hide x",             "--hide (a)\\1",
+                               "--play",          "--skip "};
     bool refused = true;
     for (const char *b : bad)
         refused = parse_edit(b, &e, &err) ? (std::printf("     accepted: %s\n", b), false) : refused;
@@ -174,6 +180,10 @@ static void parsing()
     ok("keys: the value left out", cr::edit_key("--uniform m:u=1") == cr::edit_key("--uniform m:u=2,3") &&
                                        cr::edit_key("--uniform m:u=1") != cr::edit_key("--uniform m:v=1") &&
                                        cr::edit_key("--move a=b=1,2,3") == cr::edit_key("--move a=b=4,5,6"));
+    ok("keys: --skip is --play's; both applied once, never kept",
+       cr::edit_key("--skip a") == cr::edit_key("--play a") && cr::edit_key("--play a") != cr::edit_key("--play b") &&
+           cr::edit_once("--play a") && cr::edit_once("--skip a") && !cr::edit_once("--set a=1") &&
+           !cr::edit_once("--playx a"));
 }
 
 static void edits(const std::string &dir)
@@ -231,6 +241,37 @@ static void edits(const std::string &dir)
     ed.add("--hide ^nothing$");
     ed.stage(s);
     ok("and once per scene", ed.take_problems().empty());
+
+    /* Animation sequences: a line applied once, then gone. */
+    const size_t kept = ed.kept();
+    ed.add("--play sweep");
+    ok("--play: the sequence started at the next stage, the line not kept",
+       ed.stage(s, 5000) && s->played == std::vector<std::string>({"play sweep"}) && ed.kept() == kept &&
+           !ed.due() && !ed.stage(s, 5000));
+    ok("its system's time set by the service, from 10 minutes up", s->times == std::vector<uint64_t>({600000}) &&
+                                                                      s->started.at("sweep") == 600000 && s->ticking());
+    ok("ticked on with the service's clock, the last tick at its end, then none",
+       s->tick(5400) && s->times.back() == 600400 && s->tick(6500) && s->times.back() == 601000 && !s->ticking() &&
+           !s->tick(6600));
+    ed.add("--play sweep");
+    ed.stage(s, 7000);
+    ed.add("--skip sweep");
+    ed.stage(s, 7300);
+    ok("played again from its start (its system's time then), then skipped to its end at once",
+       s->played == std::vector<std::string>({"play sweep", "play sweep", "skip sweep"}) &&
+           s->started.at("sweep") == 600300 && s->times.back() == 601300 && !s->ticking());
+    ed.add("--play sweep\n--skip sweep");
+    ok("a --skip replaces the --play of its sequence waiting", ed.stage(s, 8000) && s->played.size() == 4 &&
+                                                                    s->played.back() == "skip sweep");
+    ed.add("--play glow");
+    ok("a real-time system's sequence: started, its time not the service's to set",
+       ed.stage(s, 8100) && s->played.back() == "play glow" && s->times.back() == 601300 && !s->ticking());
+    ed.add("--play nowhere");
+    ok("an unknown sequence: nothing to flush", !ed.stage(s) && ed.kept() == kept);
+    const std::vector<EditProblem> unknown = ed.take_problems();
+    ok("an unknown sequence reported, named",
+       unknown.size() == 1 && unknown[0].reason == "'--play nowhere' changed nothing: no animation sequence nowhere");
+
     ed.add("--show ^gauge$\n--hide ^nothing$\n--hide ^needle_pivot$");
     ok("with one that changes something: a flush", ed.stage(s));
     s->flush(2);
@@ -247,6 +288,44 @@ static void edits(const std::string &dir)
        s->shown.visible == first.visible && s->shown.pose == first.pose && s->shown.values == first.values &&
            s->shown.viewport == first.viewport && s->shown.enabled == first.enabled && s->listed == 4);
     ok("its problems reported again", ed.take_problems().size() == 4);
+    ok("and no sequence played again", s->played.empty());
+}
+
+/* The time of systems the service sets (SequenceClock). */
+static void sequence_clock()
+{
+    SequenceClock c;
+    const int sys = 0, other = 0, a = 0, b = 0;
+    uint64_t from = 0;
+    ok("a fresh system: its time from 10 minutes up, the sequence from there",
+       c.play(&other, &a, 0, 400, false, 0, &from) == 600000 && from == 600000 && c.ticking());
+    c.tick(400);
+    ok("a play: from the system's time, ticking", c.play(&sys, &a, 700000, 1000, false, 10000, &from) == 700000 &&
+                                                     from == 700000 && c.ticking());
+    auto t = c.tick(10400);
+    ok("a tick: the time moved on with the service's clock", t.size() == 1 && t[0].first == &sys &&
+                                                                 t[0].second == 700400);
+    t = c.tick(11700);
+    ok("the last tick at the sequence's end exactly, then none",
+       t.size() == 1 && t[0].second == 701000 && !c.ticking() && c.tick(11800).empty());
+    c.play(&sys, &a, 701000, 1000, false, 20000, &from);
+    c.tick(20300);
+    ok("played again while it plays: from the time then, to a new end",
+       c.play(&sys, &a, 0, 1000, false, 20500, &from) == 701500 && from == 701500 && c.tick(21600)[0].second == 702500 &&
+           !c.ticking());
+    ok("a skip with nothing playing: one time, its end; its start as long ago as it lasts; no tick",
+       c.play(&sys, &b, 702500, 400, true, 30000, &from) == 702500 && from == 702100 && !c.ticking());
+    c.play(&sys, &a, 702500, 1000, false, 40000, &from);
+    c.tick(40200);
+    ok("a skip while another plays: the time not moved, the other plays on",
+       c.play(&sys, &b, 0, 100, true, 40300, &from) == 702800 && from == 702700 && c.ticking());
+    ok("the one playing skipped: its end at once, nothing ticks",
+       c.play(&sys, &a, 0, 1000, true, 40400, &from) == 702900 && from == 701900 && !c.ticking());
+    c.play(&sys, &a, 702900, 1000, false, 50000, &from);
+    t = c.tick(50900);
+    ok("ticks left out (the link busy): the next one at its own time", t.size() == 1 && t[0].second == 703800);
+    t = c.tick(52000);
+    ok("and one late past the end: the end", t.size() == 1 && t[0].second == 703900 && !c.ticking());
 }
 
 int main()
@@ -257,6 +336,7 @@ int main()
     checks(dir);
     parsing();
     edits(dir);
+    sequence_clock();
     const int removed = std::system(("rm -rf " + dir).c_str());
     (void)removed;
     std::printf(failures ? "%d FAILED\n" : "all ok\n", failures);

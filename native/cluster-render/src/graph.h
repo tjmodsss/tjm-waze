@@ -18,6 +18,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <algorithm>
+#include <deque>
+#include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -249,6 +253,31 @@ inline bool operator==(const StencilState &a, const StencilState &b)
     return a.func == b.func && a.ref == b.ref && a.mask == b.mask && a.fail == b.fail &&
            a.depth_fail == b.depth_fail && a.pass == b.pass;
 }
+/* How a part's indices are drawn: the modes RAMSES 19 and RAMSES 27 share.
+ * Lines are a pixel wide (neither sets the GL line width). */
+enum class Draw { Triangles, TriangleStrip, Lines, LineLoop, Points };
+/* The fewest indices a mode draws, and the multiple its count is of. */
+inline uint32_t draw_min(Draw d) { return d == Draw::Points ? 1 : d == Draw::Lines || d == Draw::LineLoop ? 2 : 3; }
+inline uint32_t draw_step(Draw d) { return d == Draw::Triangles ? 3 : d == Draw::Lines ? 2 : 1; }
+/* Which of an enum's n values forward maps to lib, or -1: a backend's
+ * table read backwards (Graph::read_look). */
+template <class E, class L, class F> int unmap(L lib, int n, F forward)
+{
+    for (int i = 0; i < n; i++)
+        if (forward((E)i) == lib)
+            return i;
+    return -1;
+}
+
+/* Instances a part draws at most. */
+const uint32_t kMaxInstances = 256;
+/* What the GPU draws, in indices drawn (a part's indices times its
+ * instances): a part at most kMaxPartIndices (as many as one part's
+ * geometry holds, 65,535 triangles), a mesh layer's parts together
+ * kMaxLayerIndices, and every mesh layer on a target, of every client and
+ * canvas, kMaxTargetIndices (262,144 triangles a frame). */
+const uint64_t kMaxPartIndices = 196605, kMaxLayerIndices = 393216, kMaxTargetIndices = 786432;
+
 /* Colour channels written, as bits. */
 const uint8_t kMaskR = 1, kMaskG = 2, kMaskB = 4, kMaskA = 8, kMaskRGBA = 15;
 /* How a part (or a quad, with style()) is drawn: depth tested with
@@ -265,6 +294,8 @@ struct PartLook {
     BlendState custom;
     uint8_t color_mask = kMaskRGBA;
     StencilState stencil;
+    Draw draw = Draw::Triangles;   /* a part's; a quad's is its two triangles */
+    uint32_t instances = 1;        /* a part's: gl_InstanceID 0 to instances - 1 */
 
     BlendState blending() const { return has_custom ? custom : blend_state(blend); }
     DepthFunc depth_test() const { return depth ? depth_func : DepthFunc::Off; }
@@ -273,7 +304,8 @@ struct PartLook {
 inline bool operator==(const PartLook &a, const PartLook &b)
 {
     return a.depth_test() == b.depth_test() && a.depth_writes() == b.depth_writes() && a.cull == b.cull &&
-           a.blending() == b.blending() && a.color_mask == b.color_mask && a.stencil == b.stencil;
+           a.blending() == b.blending() && a.color_mask == b.color_mask && a.stencil == b.stencil &&
+           a.draw == b.draw && a.instances == b.instances;
 }
 inline bool operator!=(const PartLook &a, const PartLook &b) { return !(a == b); }
 /* A quad's look unless styled: blended at source alpha, no depth, no
@@ -299,7 +331,8 @@ struct Geometry {
     const uint16_t *index = nullptr;
 };
 
-enum class Animated { Rotate, Translate, Scale, Uniform };
+/* Value: a shared value's (Graph::value), its node a value's handle. */
+enum class Animated { Rotate, Translate, Scale, Uniform, Value };
 /* Keys the renderer interpolates by itself: width floats a key, at times in
  * milliseconds from the start, ascending. */
 struct Animation {
@@ -310,6 +343,244 @@ struct Animation {
     bool step = false;     /* each key's value held until the next */
     std::vector<uint32_t> t;
     std::vector<float> v;
+    uint64_t owner = 0;    /* its connection's: whose turn it takes (KeyGate) */
+};
+
+/* The bytes an animation's keys take to the renderer: a time and the
+ * values, a key. */
+inline uint64_t key_bytes(const Animation &a) { return a.t.size() * (4 + 4 * uint64_t(a.width)); }
+
+/* The animation keys a graph makes (every graph's, Graph::keys_): due
+ * animations made at a flush, the owners (connections) taking turns, each
+ * owner's due longest first, one after another until the bytes made reach
+ * the allowance; the flush passes it by less than one animation, and what
+ * is left waits for the next flushes. So one owner's many animations never
+ * hold back another's, nor a replacement sent every flush its own others. */
+class KeyGate {
+public:
+    struct Due {
+        uint64_t seq = 0;   /* when it fell due (next_seq()) */
+        uint64_t owner = 0;
+        int handle = 0;
+    };
+    void allow(uint64_t bytes) { allowance_ = bytes; }
+    uint64_t take()
+    {
+        const uint64_t b = made_;
+        made_ = 0;
+        return b;
+    }
+    uint64_t next_seq() { return ++seq_; }
+    /* make(handle): the bytes it sent (0: nothing). */
+    template <typename Make> void run(std::vector<Due> due, Make make)
+    {
+        std::sort(due.begin(), due.end(), [](const Due &a, const Due &b) { return a.seq < b.seq; });
+        std::map<uint64_t, std::deque<int>> by;
+        for (const Due &d : due)
+            by[d.owner].push_back(d.handle);
+        uint64_t made = 0;
+        auto it = by.upper_bound(last_);
+        while (!by.empty() && made < allowance_) {
+            if (it == by.end())
+                it = by.begin();
+            const uint64_t b = make(it->second.front());
+            made += b;
+            made_ += b;
+            last_ = it->first;
+            it->second.pop_front();
+            it = it->second.empty() ? by.erase(it) : std::next(it);
+        }
+    }
+
+private:
+    uint64_t allowance_ = UINT64_MAX;   /* until allow() */
+    uint64_t made_ = 0;                 /* since take() */
+    uint64_t seq_ = 0;
+    uint64_t last_ = 0;                 /* the owner whose turn came last */
+};
+
+/* What every graph keeps of an animation (AnimTable); a backend's adds the
+ * objects of the one playing. */
+struct AnimState {
+    int node = 0;
+    Animation a;            /* what plays, or will once made */
+    bool made = false;      /* its objects play */
+    bool due = false;       /* to make at a flush: new, replaced, or made again */
+    uint64_t due_seq = 0;   /* when it fell due (KeyGate::Due::seq) */
+    /* A replacement waiting for its flush, the one made playing on until
+     * then: only the newest of several is kept, and one restore, the one
+     * the playing animation's target needs (it gives the target its own
+     * value back once a replacement elsewhere is made, or this stops). */
+    bool replacing = false;
+    int next_node = 0;
+    Animation next;
+    std::function<void()> restore;
+};
+
+/* The animations of a graph, as every graph (both backends, the fake one)
+ * keeps them, over its map of A (an AnimState with its backend's objects):
+ * made at flushes through the key gate; a replacement waiting in place of
+ * the one playing, which plays on until the replacement is made; a node
+ * going taking what plays on it. The backend makes and tears down its own
+ * objects, through the callbacks. */
+template <typename A> class AnimTable {
+public:
+    AnimTable(std::map<int, A> &m, KeyGate &keys) : m_(m), keys_(keys) {}
+
+    void add(int handle, int node, const Animation &a)
+    {
+        A an;
+        an.node = node;
+        an.a = a;
+        fall_due(an);
+        m_[handle] = std::move(an);
+    }
+
+    /* handle's replaced by a on node; false when there is none. Not made
+     * yet: a in its place. Made: a waits for a flush, the one made playing
+     * on, and replaces any replacement waiting before it. restore is the
+     * target's of the one playing: kept from the first replacement while
+     * one waits (what plays does not change until then), never chained, and
+     * called only when the replacement made plays on another target, or
+     * when this stops while one waits. */
+    bool replace(int handle, int node, const Animation &a, std::function<void()> restore)
+    {
+        auto it = m_.find(handle);
+        if (it == m_.end())
+            return false;
+        A &an = it->second;
+        if (!an.made) {
+            an.node = node;
+            an.a = a;
+        } else {
+            if (!an.replacing)
+                an.restore = std::move(restore);
+            an.replacing = true;
+            an.next_node = node;
+            an.next = a;
+        }
+        fall_due(an);
+        return true;
+    }
+
+    /* To make again at a flush (a backend's move to new objects), keeping
+     * its place among those due when it is due already. */
+    void again(A &an) { fall_due(an); }
+
+    /* Whether any of m is due: what animations_due() says. */
+    static bool any_due(const std::map<int, A> &m)
+    {
+        for (const auto &kv : m)
+            if (kv.second.due)
+                return true;
+        return false;
+    }
+
+    /* down(A &): tears down what plays (called made or not). */
+    template <typename Down> bool stop(int handle, Down down)
+    {
+        auto it = m_.find(handle);
+        if (it == m_.end())
+            return false;
+        down(it->second);
+        std::function<void()> owed;
+        if (it->second.replacing)
+            owed = std::move(it->second.restore);
+        m_.erase(it);
+        if (owed)
+            owed();
+        return true;
+    }
+
+    /* A node going: what plays on it goes, the old target of one waiting to
+     * move to it given its own value back; one waiting to move away from it
+     * loses what plays, and waits unmade for its flush. */
+    template <typename Down> void stop_on(int node, Down down)
+    {
+        std::vector<std::function<void()>> owed;
+        for (auto it = m_.begin(); it != m_.end();) {
+            A &an = it->second;
+            if (an.replacing && an.node == node && an.next_node != node) {
+                down(an);
+                an.node = an.next_node;
+                an.a = std::move(an.next);
+                an.next = Animation();
+                an.made = an.replacing = false;
+                an.restore = nullptr;
+                ++it;
+            } else if (an.node == node || (an.replacing && an.next_node == node)) {
+                down(an);
+                if (an.replacing && an.node != node && an.restore)
+                    owed.push_back(std::move(an.restore));
+                it = m_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto &f : owed)
+            f();
+    }
+
+    /* What build() did: made, and the bytes it sent (a half-made one may
+     * have sent some). */
+    struct Built {
+        bool ok = false;
+        uint64_t bytes = 0;
+    };
+    /* Before a flush: the due ones made through the key gate. build(A &an,
+     * A &was, bool replaced) makes an's objects for an.node and an.a; was
+     * is an as it was (what played, its objects and animation), whose
+     * objects build tears down; replaced: a replacement is being made. One
+     * build refuses goes. The restore a replacement owes runs after it. */
+    template <typename Build> void make(Build build)
+    {
+        std::vector<KeyGate::Due> due;
+        for (const auto &kv : m_)
+            if (kv.second.due)
+                due.push_back(KeyGate::Due{kv.second.due_seq,
+                                           kv.second.replacing ? kv.second.next.owner : kv.second.a.owner, kv.first});
+        keys_.run(due, [&](int handle) -> uint64_t {
+            auto it = m_.find(handle);
+            A &an = it->second;
+            const bool replaced = an.replacing;
+            Animation incoming;
+            std::function<void()> owed;
+            if (replaced) {
+                incoming = std::move(an.next);
+                an.next = Animation();
+                if (an.node != an.next_node || an.a.property != incoming.property || an.a.uniform != incoming.uniform)
+                    owed = std::move(an.restore);
+                an.restore = nullptr;
+                an.replacing = false;
+            }
+            A was = an;
+            if (replaced) {
+                an.node = an.next_node;
+                an.a = std::move(incoming);
+            }
+            const Built b = build(an, was, replaced);
+            if (b.ok) {
+                an.made = true;
+                an.due = false;
+            } else {
+                m_.erase(it);
+            }
+            if (owed)
+                owed();
+            return b.bytes;
+        });
+    }
+
+private:
+    void fall_due(A &an)
+    {
+        if (!an.due)
+            an.due_seq = keys_.next_seq();   /* one due already keeps its place */
+        an.due = true;
+    }
+
+    std::map<int, A> &m_;
+    KeyGate &keys_;
 };
 
 /* An off-screen canvas (Graph::canvas): w x h RGBA8 the scene's own passes
@@ -373,6 +644,15 @@ public:
     {
         return 0;
     }
+    /* An immutable cube texture, size x size a face, data its six faces of
+     * face bytes each one after another (+x, -x, +y, -y, +z, -z), and its
+     * sampler; a buffer as immutable_texture()'s, sampled by a samplerCube.
+     * 0 where the backend has none. */
+    virtual int cube_texture(TexFormat, uint32_t, const Sampler &, const uint8_t *, size_t) { return 0; }
+    /* A cube texture's size and format as the library holds them, its data
+     * saved to file as the library writes resources (tests); false where
+     * the backend cannot. */
+    virtual bool read_cube(int, uint32_t *, int *, const char *) { return false; }
     /* A quad over r drawn by effect, hidden until show(). Blended over what
      * is below (source alpha), no depth test. */
     virtual int quad(int effect, const Rect &r) = 0;
@@ -383,6 +663,17 @@ public:
      * culling are not used: a quad tests no depth and culls nothing). False
      * where the backend has no such state. */
     virtual bool style(int, const PartLook &) { return false; }
+    /* A glyph run (text_layer.h): the quad draws up to capacity glyphs, two
+     * triangles each, from vertex buffers the scene keeps, in place of its
+     * unit quad. Its effect reads a_position (vec2, the quad's unit square,
+     * as the unit quad's) and a_texcoord (vec2). The buffers are made once,
+     * at their whole size, and written in place by glyphs(). False where the
+     * backend has none. */
+    virtual bool glyph_buffer(int, uint32_t) { return false; }
+    /* The quad's run draws n glyphs (n at most its capacity; 0: nothing):
+     * v holds 16 floats a glyph, x, y, u, v at its bottom-left,
+     * bottom-right, top-left and top-right corners. */
+    virtual bool glyphs(int, const float *, uint32_t) { return false; }
     /* texture(), uniform() and uniform_array() take a quad or a part. */
     virtual bool texture(int quad, const char *uniform, int buf) = 0;
     /* A float, vec2, vec3 or vec4 uniform (n 1-4). */
@@ -412,6 +703,16 @@ public:
     virtual bool geometry(int part, const Geometry &g) = 0;
     virtual bool pose(int part, const Pose &p) = 0;
     virtual void drop_part(int part) = 0;
+    /* A node of the view that draws nothing: a pivot parts follow
+     * (parent()), posed, animated and dropped as a part. 0 where the backend
+     * has none. */
+    virtual int node(int) { return 0; }
+    /* The part (or node) follows parent's pose: its own is then relative to
+     * parent's. Both of one view. */
+    virtual bool parent(int, int) { return false; }
+    /* The part (or node) it follows as the library holds it, 0 for the
+     * view; false where the backend cannot say (tests). */
+    virtual bool read_parent(int, int *) { return false; }
 
     /* Plays a by the renderer, nothing sent per frame, on:
      * - a quad: Rotate 1 value (degrees clockwise about its pivot), Translate
@@ -422,12 +723,45 @@ public:
      * - the uniform of a quad or a part: 1, 3 or 4 values (float, vec3,
      *   vec4).
      * Returns the animation's handle, 0 when refused. A stopped animation
-     * leaves its property at its last value; dropping its node stops it. */
+     * leaves its property at its last value; dropping its node stops it.
+     * A graph may make it at a flush within its key allowance (below). */
     virtual int animate(int node, const Animation &a) = 0;
     virtual void stop(int anim) = 0;
 
     /* Sends everything changed since the last flush as one update, tagged. */
     virtual bool flush(uint64_t tag) = 0;
+
+    /* Animation anim (animate()'s) replaced by a on node: its handle, the
+     * same or a new one; 0 when refused, anim then stopped. A graph may make
+     * it at a flush, keeping only the newest of several replacements, the
+     * old one playing until then (AnimTable). restore gives the target of
+     * the one playing its own value back: called when the replacement made
+     * plays on another target, or when it is stopped while one waits; of
+     * several replacements before a flush, the first's is the one kept. */
+    virtual int replace(int anim, int node, const Animation &a, std::function<void()> restore = nullptr)
+    {
+        stop(anim);
+        if (restore)
+            restore();
+        return animate(node, a);
+    }
+    /* Bytes of animation keys made since the last call, which the next
+     * flush sends to the renderer. */
+    virtual uint64_t take_animation_bytes() { return keys_.take(); }
+    /* The bytes of animation keys the next flushes may make (set before
+     * each; unlimited until set): due animations (animate(), replace(),
+     * those a graph makes again) are made through keys_; the rest wait
+     * for a later flush, while animations_due(). */
+    virtual void key_allowance(uint64_t bytes) { keys_.allow(bytes); }
+    virtual bool animations_due() const { return false; }
+    /* When the animation started, in the renderer's clock; false where the
+     * backend cannot say, or it is not made yet (tests). */
+    virtual bool read_animation(int, uint64_t *) { return false; }
+
+protected:
+    KeyGate keys_;
+
+public:
 
     /* A canvas: its handle is a buffer handle too (texture(), not
      * drop_buffer()). 0 where the backend has none. Quads and views drawn
@@ -439,6 +773,27 @@ public:
     virtual int canvas(const CanvasSpec &) { return 0; }
     virtual void drop_canvas(int) {}
     virtual bool redraw(int) { return false; }
+
+    /* A shared value (PROTOCOL.md "Shared values"): width floats (1-4),
+     * set (set_value()) and animated (animate() with Animated::Value) once
+     * for every quad and part uniform that follows it (link()). 0 where the
+     * backend has none. */
+    virtual int value(uint32_t) { return 0; }
+    virtual bool set_value(int, const float *) { return false; }
+    /* The drawable's (a quad's or part's) uniform follows the value, which
+     * must be of its type; value 0: it does not any more. */
+    virtual bool link(int, const char *, int) { return false; }
+    /* Its links undone first; its animations stopped. */
+    virtual void drop_value(int) {}
+    /* A part's render state as the library holds it, read back with its
+     * getters through the backend's own tables (instances aside); with
+     * fresh, a new appearance of the part's effect, as the library makes
+     * it. False where it cannot say (tests). */
+    virtual bool read_look(int, PartLook *, bool = false) { return false; }
+    /* The same as the library's own numbers: draw mode, cull mode, depth
+     * function, the four blend factors, the two blend operations, stencil
+     * function and its three operations (tests). */
+    virtual bool read_look_raw(int, std::vector<int> *) { return false; }
     /* A canvas not drawn once: drawn each frame while enabled (as it is
      * made), not drawn at all while not, keeping its last picture. */
     virtual bool enable_canvas(int, bool) { return false; }
@@ -449,7 +804,21 @@ public:
     {
         return canvas ? 0 : view(r, p, camera);
     }
+
+    /* A graph over a scene file (FileScene::layers): quads and views ordered
+     * at kOverBand or past it are drawn in passes of their own from render
+     * order base up, one a pass, so a file's pass between the two bands
+     * draws over the first and under this one. False where the backend has
+     * no such band (the orders then hold as one band). */
+    virtual bool band(int32_t base)
+    {
+        (void)base;
+        return false;
+    }
 };
+
+/* order() at or past this: the graph's over band (Graph::band). */
+const int32_t kOverBand = 1 << 28;
 
 /* A target's scene loaded from a scene file (Gpu::load): drawn as the file
  * has it, with its own cameras and passes, its objects changed by name
@@ -475,6 +844,17 @@ public:
     virtual bool uniform(int mesh, const std::string &name, const std::vector<float> &v, std::string *why) = 0;
     /* The data object called name: 1 to 4 values, as its type takes. */
     virtual bool data(const std::string &name, const std::vector<float> &v, std::string *why) = 0;
+    /* The animation sequence called name, of an animation system the file
+     * has, played from now: from its start, again from there when it is
+     * playing or played; with end, its last values at once. A system
+     * without a clock of its own has its time set by the service
+     * (SequenceClock: now_ms, then tick()); a real-time one plays on the
+     * renderer's clock. False with *why: no such sequence. */
+    virtual bool play(const std::string &name, bool end, int64_t now_ms, std::string *why) = 0;
+    /* Systems whose sequences play (play()) moved on to now_ms; true when
+     * any was (then it wants a flush). */
+    virtual bool tick(int64_t now_ms) = 0;
+    virtual bool ticking() const = 0;
     virtual bool flush(uint64_t tag) = 0;
     /* A Graph that draws in this scene, over the file (PROTOCOL.md "Layers
      * over a scene file"): a camera and passes of its own, which never clear,
@@ -487,6 +867,16 @@ public:
         *err = "this display draws no layers over scene files";
         return nullptr;
     }
+};
+
+/* A uniform of a compiled effect, as the library reflects it; Sampler: a
+ * sampler whose kind the backend cannot tell; elements: an array's (1 for
+ * a plain uniform). */
+struct EffectInput {
+    enum Kind { Other, Sampler2D, SamplerCube, Sampler, Float, Vec2, Vec3, Vec4 };
+    std::string name;
+    Kind kind = Other;
+    uint32_t elements = 1;
 };
 
 /* The participant: effects (shared by every scene) and the scenes. */
@@ -502,6 +892,9 @@ public:
         *err = "this display takes no scene files";
         return nullptr;
     }
+    /* Whether a loaded file's animation sequences can be played
+     * (FileScene::play). */
+    virtual bool sequences() { return false; }
     /* Compiles an effect: GLSL ES 1.00 (the HMI's own effects are). The
      * renderer fills these uniforms where a shader declares them: u_mvp,
      * u_mv, u_m, u_v, u_p (mat4: model-view-projection, model-view, model,
@@ -512,6 +905,15 @@ public:
     virtual void drop_effect(int effect) = 0;
     /* The vertex attributes the effect reads (kAttr* bits). */
     virtual unsigned attributes(int effect) const = 0;
+    /* The effect's uniforms as the library compiled it: declarations in
+     * lists, defines and the branches its preprocessor took, those it left
+     * out absent. False where the backend cannot say. */
+    virtual bool inputs(int effect, std::vector<EffectInput> *out) const
+    {
+        (void)effect;
+        (void)out;
+        return false;
+    }
     /* The target's scene, empty, flushed and published. */
     virtual std::unique_ptr<Graph> scene(const TargetSpec &t, std::string *err) = 0;
 };

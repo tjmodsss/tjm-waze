@@ -38,6 +38,23 @@ int hex(char c)
     return -1;
 }
 
+/* The four hex digits at s[*i] into *cp, *i past them. */
+bool hex4(const std::string &s, size_t *i, unsigned *cp)
+{
+    if (*i + 4 > s.size())
+        return false;
+    unsigned v = 0;
+    for (int k = 0; k < 4; k++) {
+        const int h = hex(s[*i + k]);
+        if (h < 0)
+            return false;
+        v = v << 4 | (unsigned)h;
+    }
+    *i += 4;
+    *cp = v;
+    return true;
+}
+
 bool parse_string(const std::string &s, size_t *i, std::string *out)
 {
     if (*i >= s.size() || s[*i] != '"')
@@ -63,24 +80,34 @@ bool parse_string(const std::string &s, size_t *i, std::string *out)
         case 'b': out->push_back('\b'); break;
         case 'f': out->push_back('\f'); break;
         case 'u': {
-            if (*i + 4 > s.size())
-                return false;
             unsigned cp = 0;
-            for (int k = 0; k < 4; k++) {
-                int h = hex(s[*i + k]);
-                if (h < 0)
+            if (!hex4(s, i, &cp))
+                return false;
+            /* A high surrogate and the low one after it are one code point
+             * past U+FFFF; a surrogate alone is no character: refused. */
+            if (cp >= 0xdc00 && cp <= 0xdfff)
+                return false;
+            if (cp >= 0xd800 && cp <= 0xdbff) {
+                unsigned lo = 0;
+                if (*i + 2 > s.size() || s[*i] != '\\' || s[*i + 1] != 'u')
                     return false;
-                cp = cp << 4 | (unsigned)h;
+                *i += 2;
+                if (!hex4(s, i, &lo) || lo < 0xdc00 || lo > 0xdfff)
+                    return false;
+                cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
             }
-            *i += 4;
-            /* UTF-8 of the code point; a surrogate half stands alone. */
             if (cp < 0x80) {
                 out->push_back((char)cp);
             } else if (cp < 0x800) {
                 out->push_back((char)(0xc0 | cp >> 6));
                 out->push_back((char)(0x80 | (cp & 0x3f)));
-            } else {
+            } else if (cp < 0x10000) {
                 out->push_back((char)(0xe0 | cp >> 12));
+                out->push_back((char)(0x80 | ((cp >> 6) & 0x3f)));
+                out->push_back((char)(0x80 | (cp & 0x3f)));
+            } else {
+                out->push_back((char)(0xf0 | cp >> 18));
+                out->push_back((char)(0x80 | ((cp >> 12) & 0x3f)));
                 out->push_back((char)(0x80 | ((cp >> 6) & 0x3f)));
                 out->push_back((char)(0x80 | (cp & 0x3f)));
             }
@@ -227,8 +254,10 @@ bool parse_mesh(const char *body, size_t n, MeshHeader *out, std::string *err)
         *err = "a mesh has 1 to 65535 vertices";
         return false;
     }
-    if (m.indices < 3 || m.indices > kMaxMeshIndices || m.indices % 3) {
-        *err = "a mesh's indices are whole triangles, at most 196605";
+    /* Whole triangles, lines or points: the part's draw mode decides
+     * (MeshLayer::set_geometry). */
+    if (m.indices < 1 || m.indices > kMaxMeshIndices) {
+        *err = "a mesh has 1 to 196605 indices";
         return false;
     }
     const size_t floats = (size_t)m.vertices * mesh_floats(m.mask);
@@ -268,6 +297,38 @@ bool parse_mesh(const char *body, size_t n, MeshHeader *out, std::string *err)
         m.color = a;
     m.index = idx;
     *out = m;
+    return true;
+}
+
+bool utf8_ok(const std::string &s)
+{
+    for (size_t i = 0; i < s.size();) {
+        const uint8_t b = (uint8_t)s[i];
+        uint32_t cp, min;
+        int n;
+        if (b < 0x80) {
+            cp = b, n = 1, min = 0;
+        } else if ((b & 0xe0) == 0xc0) {
+            cp = b & 0x1f, n = 2, min = 0x80;
+        } else if ((b & 0xf0) == 0xe0) {
+            cp = b & 0x0f, n = 3, min = 0x800;
+        } else if ((b & 0xf8) == 0xf0) {
+            cp = b & 0x07, n = 4, min = 0x10000;
+        } else {
+            return false;
+        }
+        if (i + n > s.size())
+            return false;
+        for (int k = 1; k < n; k++) {
+            const uint8_t c = (uint8_t)s[i + k];
+            if ((c & 0xc0) != 0x80)
+                return false;
+            cp = (cp << 6) | (c & 0x3f);
+        }
+        if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+            return false;
+        i += n;
+    }
     return true;
 }
 
@@ -352,10 +413,17 @@ std::string edit_key(const std::string &line)
         kind = "--hide";
     else if (kind == "--pass-on")
         kind = "--pass-off";
+    else if (kind == "--skip")
+        kind = "--play";
     else if (kind == "--uniform" || kind == "--move" || kind == "--scale" || kind == "--rotate" ||
              kind == "--viewport" || kind == "--set")
         rest = rest.substr(0, rest.rfind('='));
     return kind + " " + rest;
+}
+
+bool edit_once(const std::string &line)
+{
+    return edit_key(line).compare(0, 7, "--play ") == 0;
 }
 
 }  // namespace cr

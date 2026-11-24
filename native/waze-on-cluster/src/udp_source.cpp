@@ -77,7 +77,8 @@ void UdpSource::loop()
     std::vector<uint8_t> buf(65536);   /* one UDP datagram; preserves boundaries */
     while (running_.load()) {
         struct pollfd p[2] = {{fd_, POLLIN, 0}, {wake_[0], POLLIN, 0}};
-        int n = poll(p, 2, 500);
+        /* Data or stop()'s byte on wake_ wakes it; nothing else is waited for. */
+        int n = poll(p, 2, -1);
         if (n < 0) {
             if (errno == EINTR)
                 continue;

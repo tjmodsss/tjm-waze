@@ -55,11 +55,17 @@ public:
     bool camera(int view, const Projection &p, const Pose &camera) override { return g_->camera(view, p, camera); }
     void drop_view(int view) override { g_->drop_view(view); }
     int part(int view, int effect, const PartLook &look) override { return g_->part(view, effect, look); }
+    int node(int view) override { return g_->node(view); }
+    bool parent(int part, int parent) override { return g_->parent(part, parent); }
     bool geometry(int part, const Geometry &g) override { return g_->geometry(part, g); }
     bool pose(int part, const Pose &p) override { return g_->pose(part, p); }
     void drop_part(int part) override { g_->drop_part(part); }
     int animate(int node, const Animation &a) override { return g_->animate(node, a); }
     void stop(int anim) override { g_->stop(anim); }
+    int replace(int anim, int node, const Animation &a, std::function<void()> restore) override
+    {
+        return g_->replace(anim, node, a, restore);
+    }
     /* The target's flush carries the canvas's changes. */
     bool flush(uint64_t) override { return true; }
 

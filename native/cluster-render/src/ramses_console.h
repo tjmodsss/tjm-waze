@@ -50,7 +50,9 @@
  * in their order; going back to INFO it reaches ramses.Client before
  * ramses.Ramsh, so that line is never printed (VERIFIED in the emulator with
  * the car's dlt-daemon). A subscription made while the console was not live
- * is never read.
+ * is never read. cluster-render-idrive7 passes RAMSES no DLT level below
+ * INFO (ramses_dlt.h), so there the console stays live while DLT is off;
+ * live_since() still tells when it is not.
  * fd() is readable while something waits to be taken. If the pipe cannot be
  * set up, stdout is left as it was and nothing is ever read; if reading it
  * fails, the original stdout goes back onto fd 1 (so RAMSES never blocks on

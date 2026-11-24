@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,9 @@ public:
     bool set(const std::string &name, UniformType t, const float *v, uint32_t elements);
     void dirty_all();
     void dirty(const std::string &name);
+    /* name follows a shared value (on) and is not staged, or does not any
+     * more and goes again with its own value, if it has one. */
+    void link(const std::string &name, bool on);
     /* Sends the changed ones to drawable; whether any went. One the shader
      * does not have is the client's mistake: dropped, not retried every
      * tick. */
@@ -114,6 +118,7 @@ private:
         bool dirty = true;
     };
     std::map<std::string, Value> values_;
+    std::set<std::string> linked_;
     size_t floats_ = 0;
 };
 
@@ -154,6 +159,14 @@ public:
     bool stop(uint32_t anim);
     /* The quad or part a sampler of part is bound on; 0: none. */
     virtual int drawable(uint32_t) const { return 0; }
+    /* The uniforms of the quad (part 0) or of a mesh layer's part; null
+     * when it has none. */
+    virtual Uniforms *uniforms_of(uint32_t) { return nullptr; }
+    /* An animation of the part's uniform name plays (or waits). */
+    bool animating(uint32_t part, const std::string &name) const;
+    /* The largest x or y scale an animation of the part's scale reaches
+     * (absolute); 1 with none. */
+    float animated_scale(uint32_t part) const;
     /* What the renderer refused of the layer's content after it was
      * attached; empty: nothing. */
     virtual std::string refusal() const { return std::string(); }
@@ -387,6 +400,7 @@ public:
     void committed(bool ok, int64_t now_ms) override;
     int64_t wake_in_ms(int64_t now_ms) const override;
     int drawable(uint32_t part) const override { return part ? 0 : quad_; }
+    Uniforms *uniforms_of(uint32_t part) override { return part ? nullptr : &uniforms_; }
 
 protected:
     int animated(uint32_t part) const override { return part ? 0 : quad_; }
@@ -395,6 +409,8 @@ protected:
         return quad_animation_error(part, a);
     }
     void restore(uint32_t part, const Animation &a) override;
+    /* Its quad in the attached scene; 0: none. */
+    int quad_handle() const { return quad_; }
 
 private:
     int effect_;

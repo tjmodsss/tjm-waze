@@ -83,12 +83,16 @@ public:
     }
 
     /* The oldest packet into *out (its buffer goes back to the queue),
-     * waiting up to timeout_ms; false when there is none or the queue is
-     * closed. */
+     * waiting up to timeout_ms (negative: until a push, wake() or close());
+     * false when there is none or the queue is closed. */
     bool pop(Packet *out, int timeout_ms)
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] { return count_ > 0 || closed_ || woken_; });
+        auto ready = [this] { return count_ > 0 || closed_ || woken_; };
+        if (timeout_ms < 0)
+            cv_.wait(lock, ready);
+        else
+            cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready);
         woken_ = false;
         if (closed_ || count_ == 0)
             return false;

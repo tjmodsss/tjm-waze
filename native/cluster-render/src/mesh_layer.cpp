@@ -39,7 +39,7 @@ MeshLayer::MeshLayer(uint32_t id, int target, uint64_t seq, crk::UploadPacer &pa
 
 bool MeshLayer::create(uint32_t number, Part &p)
 {
-    p.handle = g_->part(view_, p.effect, p.look);
+    p.handle = p.pivot ? g_->node(view_) : g_->part(view_, p.effect, p.look);
     if (!p.handle || !g_->pose(p.handle, p.pose)) {
         log_error("layer %u: part %u refused", id_, number);
         return false;
@@ -49,7 +49,8 @@ bool MeshLayer::create(uint32_t number, Part &p)
     return true;
 }
 
-bool MeshLayer::add_part(uint32_t part, int effect, unsigned attributes, const PartLook &look, std::string *err)
+bool MeshLayer::add_part(uint32_t part, int effect, unsigned attributes, const PartLook &look, uint32_t parent,
+                         std::string *err)
 {
     if (parts_.count(part)) {
         *err = "part " + std::to_string(part) + " exists";
@@ -59,18 +60,34 @@ bool MeshLayer::add_part(uint32_t part, int effect, unsigned attributes, const P
         *err = "at most " + std::to_string(kMaxParts) + " parts a mesh layer";
         return false;
     }
+    auto up = parts_.find(parent);
+    if (parent && up == parts_.end()) {
+        *err = "a part's parent is another part of the layer, made before it";
+        return false;
+    }
     Part &p = parts_[part];
     p.effect = effect;
+    p.pivot = effect == 0;
     p.attributes = attributes;
     p.look = look;
-    if (g_ && !create(part, p)) {
+    p.parent = parent;
+    if (g_ && (!create(part, p) || (parent && !g_->parent(p.handle, up->second.handle)))) {
         if (p.handle)
             g_->drop_part(p.handle);
         parts_.erase(part);
-        *err = "the renderer refused the part";
+        *err = std::string("the renderer refused the ") + (effect ? "part" : "pivot");
         return false;
     }
     return true;
+}
+
+uint64_t MeshLayer::drawn_indices(uint32_t except) const
+{
+    uint64_t n = 0;
+    for (const auto &kv : parts_)
+        if (kv.first != except && kv.second.have)
+            n += (uint64_t)kv.second.data.index.size() * kv.second.look.instances;
+    return n;
 }
 
 size_t MeshLayer::part_bytes(uint32_t part) const
@@ -79,7 +96,8 @@ size_t MeshLayer::part_bytes(uint32_t part) const
     return it == parts_.end() ? 0 : it->second.data.bytes();
 }
 
-bool MeshLayer::set_geometry(uint32_t part, MeshData &&data, int64_t now_ms, std::string *err)
+bool MeshLayer::set_geometry(uint32_t part, MeshData &&data, int64_t now_ms, std::string *err,
+                             uint64_t target_room)
 {
     auto it = parts_.find(part);
     if (it == parts_.end()) {
@@ -87,6 +105,30 @@ bool MeshLayer::set_geometry(uint32_t part, MeshData &&data, int64_t now_ms, std
         return false;
     }
     Part &p = it->second;
+    if (p.pivot) {
+        *err = "a pivot draws nothing: it has no geometry";
+        return false;
+    }
+    static const char *const kinds[] = {"whole triangles", "a triangle strip of 3 or more",
+                                        "whole lines", "a line loop of 2 or more", "points"};
+    const size_t indices = data.index.size();
+    if (indices < draw_min(p.look.draw) || indices % draw_step(p.look.draw)) {
+        *err = std::string("the part's indices are ") + kinds[(int)p.look.draw];
+        return false;
+    }
+    const uint64_t drawn = (uint64_t)indices * p.look.instances;
+    if (drawn > kMaxPartIndices) {
+        *err = "a part draws at most 196605 indices: its indices times its instances";
+        return false;
+    }
+    if (drawn_indices(part) + drawn > kMaxLayerIndices) {
+        *err = "a mesh layer's parts draw at most 393216 indices together";
+        return false;
+    }
+    if (drawn_indices(part) + drawn > target_room) {
+        *err = "a target's mesh layers draw at most 786432 indices together";
+        return false;
+    }
     static const struct { unsigned bit; const char *name; } attrs[] = {
         {kAttrNormal, "a_normal"}, {kAttrTexcoord, "a_texcoord"}, {kAttrColor, "a_color"}};
     for (const auto &a : attrs)
@@ -139,7 +181,8 @@ std::vector<int> MeshLayer::effects() const
 {
     std::vector<int> out;
     for (const auto &kv : parts_)
-        out.push_back(kv.second.effect);
+        if (!kv.second.pivot)
+            out.push_back(kv.second.effect);
     return out;
 }
 
@@ -158,6 +201,10 @@ bool MeshLayer::attach(Graph *g, int64_t, std::string *err)
     bool good = view_ && g->show(view_, false) && g->order(view_, order_);
     for (auto it = parts_.begin(); good && it != parts_.end(); ++it)
         good = create(it->first, it->second);
+    /* each part after them all: a parent may have a higher number */
+    for (auto it = parts_.begin(); good && it != parts_.end(); ++it)
+        if (it->second.parent)
+            good = g->parent(it->second.handle, parts_[it->second.parent].handle);
     if (!good) {
         *err = "mesh view or part refused";
         detach(true);
@@ -281,9 +328,12 @@ void MeshLayer::restore(uint32_t part, const Animation &a)
     auto it = parts_.find(part);
     if (it == parts_.end())
         return;
-    if (a.property == Animated::Uniform)
+    if (a.property == Animated::Uniform) {
+        /* written now: a replacement made at a flush restores in that flush */
         it->second.uniforms.dirty(a.uniform);
-    else if (it->second.handle)
+        if (it->second.handle)
+            it->second.uniforms.stage(g_, it->second.handle);
+    } else if (it->second.handle)
         g_->pose(it->second.handle, it->second.pose);
 }
 

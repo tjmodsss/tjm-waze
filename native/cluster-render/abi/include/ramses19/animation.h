@@ -89,6 +89,9 @@ namespace ramses
         status_t setAnimationRelative(const Animation& animation);
         status_t setAnimationAbsolute(const Animation& animation);
         status_t setPlaybackSpeed(float playbackSpeed);
+        float getPlaybackSpeed() const;
+        // the latest stop time of its animations, in sequence time
+        sequenceTimeStamp_t getAnimationSequenceStopTime() const;
         status_t start(timeMilliseconds_t offset = 0);
         status_t startAt(globalTimeStamp_t timeStamp);
         status_t startReverse(timeMilliseconds_t offset = 0);
@@ -121,6 +124,8 @@ namespace ramses
         SplineStepVector4f* createSplineStepVector4f(const char* name = nullptr);
         SplineBezierFloat* createSplineBezierFloat(const char* name = nullptr);
         status_t destroy(AnimationObject& animationObject);
+        // its animation objects are its own, not the scene's (Scene::findObjectByName)
+        RamsesObject* findObjectByName(const char* name);
         status_t setTime(globalTimeStamp_t timeStamp);
         globalTimeStamp_t getTime() const;
         RAMSES19_LIBRARY_OWNED(AnimationSystem);

@@ -13,9 +13,9 @@ namespace crs {
 
 Asset::Asset(uint32_t id, int target, crk::UploadPacer &pacer, const AssetParams &p)
     : id_(id), target_(target), pacer_(pacer), p_(p),
-      px_(tex_compressed(p.format) ? tex_chain_bytes(p.format, p.w, p.h, p.levels()) : tex_bytes(p.format, p.w, p.h), 0)
+      px_(p.immutable() ? p.bytes() : tex_bytes(p.format, p.w, p.h), 0)
 {
-    if (!compressed())
+    if (!immutable())
         for (uint32_t l = 1; l < p_.levels(); l++) {
             mips_.push_back(std::vector<uint8_t>(tex_level_bytes(p_.format, p_.w, p_.h, l), 0));
             mip_dirty_.push_back({});
@@ -37,6 +37,12 @@ const char *Asset::size_error(const AssetParams &p)
         return "an asset's pixels must fit one frame message (5,529,600 bytes)";
     if (tex_compressed(f) && tex_chain_bytes(f, w, h, p.levels()) + 64 > cr::kMaxMessage)
         return "an asset's pixels and mip levels must fit one frame message (5,529,600 bytes)";
+    if (p.cube && w != h)
+        return "a cube map's faces are square: w and h the same";
+    if (p.cube && sampling_mips(p.sampler.sampling))
+        return "a cube map has no mip levels";
+    if (p.cube && p.bytes() + 64 > cr::kMaxMessage)
+        return "a cube map's six faces must fit one frame message (5,529,600 bytes)";
     if (p.sampler.anisotropy < 1 || p.sampler.anisotropy > 16)
         return "anisotropy is 1 to 16";
     return nullptr;
@@ -45,12 +51,13 @@ const char *Asset::size_error(const AssetParams &p)
 bool Asset::update(const std::vector<crk::PixelRect> &rects, const uint8_t *data, size_t n, std::string *err)
 {
     const uint32_t b = bpp();
-    if (compressed() && !rects.empty()) {
-        *err = std::string("an ") + tex_format_name(p_.format) + " asset is sent whole, with no rects";
+    const std::string what = p_.cube ? std::string("a cube map") : std::string("an ") + tex_format_name(p_.format) + " asset";
+    if (immutable() && !rects.empty()) {
+        *err = what + " is sent whole, with no rects";
         return false;
     }
-    if (compressed() && have_) {
-        *err = std::string("an ") + tex_format_name(p_.format) + " asset is sent once";
+    if (immutable() && have_) {
+        *err = what + " is sent once";
         return false;
     }
     if (rects.empty()) {
@@ -189,7 +196,7 @@ void Asset::make_mips(const std::vector<crk::PixelRect> &rects)
 
 bool Asset::attach(Graph *g)
 {
-    if (compressed()) {   /* its texture is made at its first stage, from its pixels */
+    if (immutable()) {   /* its texture is made at its first stage, from its pixels */
         g_ = g;
         buf_ = 0;
         clean_ = false;
@@ -227,15 +234,17 @@ void Asset::detach(bool drop)
 Stage Asset::stage(int64_t now_ms)
 {
     staged_ = 0;
-    if (compressed()) {
+    if (immutable()) {
         /* Made once a scene; flushed again until a flush carries it. */
         if (!g_ || !have_ || clean_ || !refused_.empty() || !pacer_.ready(now_ms))
             return Stage::Idle;
         if (!buf_) {
-            buf_ = g_->immutable_texture(p_.format, p_.w, p_.h, p_.sampler, p_.levels(), px_.data(), px_.size());
+            buf_ = p_.cube ? g_->cube_texture(p_.format, p_.w, p_.sampler, px_.data(), px_.size() / 6)
+                           : g_->immutable_texture(p_.format, p_.w, p_.h, p_.sampler, p_.levels(), px_.data(),
+                                                   px_.size());
             if (!buf_) {
                 refused_ = "the renderer refused its " + std::to_string(p_.w) + "x" + std::to_string(p_.h) + " " +
-                           tex_format_name(p_.format) + " texture";
+                           tex_format_name(p_.format) + (p_.cube ? " cube map" : " texture");
                 if (p_.levels() > 1)
                     refused_ += " of " + std::to_string(p_.levels()) + " mip levels";
                 log_error("asset %u: %s", id_, refused_.c_str());
@@ -282,7 +291,7 @@ Stage Asset::stage(int64_t now_ms)
 
 void Asset::committed(bool ok)
 {
-    if (compressed()) {
+    if (immutable()) {
         if (ok) {
             writes_++;
             bytes_ += staged_;

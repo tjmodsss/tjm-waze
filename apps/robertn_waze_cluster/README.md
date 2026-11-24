@@ -38,8 +38,9 @@ Android Auto. The app's **Status** for each tells you.
 No. Leave them alone unless something is wrong.
 
 - Press **Patch** when that phone type's **Status** says `Not patched`,
-  `Update needed` or `Removed — head unit kept restarting`. For any other
-  Status, see [If the map doesn't show](#if-the-map-doesnt-show).
+  `Update needed`, `Removed — head unit kept restarting` or
+  `Removed — Android Auto crashed`. For any other Status, see
+  [If the map doesn't show](#if-the-map-doesnt-show).
 - **Remove patch** turns the map off for that phone type. Use it only if
   you want the map off, or to troubleshoot. It stays off, also after
   updates, until you press **Patch**.
@@ -96,6 +97,7 @@ apply the change.
 | `Status: Update needed` | Press **Patch**. |
 | `Status: Patched after restart` or `Removed after restart` | Restart the head unit. If **Restart head unit** shows on the app's page, press it. |
 | `Status: Removed — head unit kept restarting` | The patch was removed because the head unit kept restarting. Press **Patch** to try again. If it happens again, [report it](#logs-and-reporting-a-problem). |
+| `Status: Removed — Android Auto crashed` | The patch was removed because Android Auto crashed with it. Press **Patch** to try again. If it happens again, [report it](#logs-and-reporting-a-problem). |
 | `Status: Not supported on this car` | Your car doesn't support the map for this phone type. |
 | `Status: Unavailable` | If it stays once the head unit has fully started, [report it](#logs-and-reporting-a-problem). |
 | `Status: Failed`, `Partly patched` or `Changed by another tool` | [Report it](#logs-and-reporting-a-problem). |

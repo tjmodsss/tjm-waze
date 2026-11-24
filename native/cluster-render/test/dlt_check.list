@@ -1,0 +1,5 @@
+/* Symbols test/dlt_check exports for its libraries to bind to. */
+{
+    dlt_register_log_level_changed_callback;
+    dlt_user_log_write_finish;
+};

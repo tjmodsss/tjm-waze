@@ -3,6 +3,7 @@
 #include "graph_ramses19.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -11,6 +12,7 @@
 
 #include "log.h"
 #include "ramses19/ramses.h"
+#include "scene_edit.h"
 
 namespace crs {
 
@@ -77,21 +79,35 @@ ramses::EDepthFunc depth19(DepthFunc d)
     }
 }
 
-/* The same values as RAMSES 19's (VERIFIED, the get*String tables,
+/* The same values as RAMSES 19's (VERIFIED from each setter to the GL call,
  * ../abi/ABI.md): Disabled 0, then Never ... GreaterEqual; Keep 0 ... Invert. */
 ramses::EStencilFunc stencil_func(StencilFunc f) { return (ramses::EStencilFunc)(int)f; }
 ramses::EStencilOperation stencil_op(StencilOp o) { return (ramses::EStencilOperation)(int)o; }
+
+ramses::ECullMode cull_mode(Cull c)
+{
+    return c == Cull::Back ? ramses::ECullMode_BackFacing
+           : c == Cull::Front ? ramses::ECullMode_FrontFacing
+                              : ramses::ECullMode_Disabled;
+}
+
+ramses::EDrawMode draw_mode(Draw d)
+{
+    static const ramses::EDrawMode modes[] = {ramses::EDrawMode_Triangles, ramses::EDrawMode_TriangleStrip,
+                                              ramses::EDrawMode_Lines, ramses::EDrawMode_LineLoop,
+                                              ramses::EDrawMode_Points};
+    return modes[(int)d];
+}
 
 /* The appearance draws as look has it (graph.h PartLook). */
 bool apply_look(ramses::Appearance &app, const PartLook &look)
 {
     const BlendState b = look.blending();
     bool good = ok(app.setDepthFunction(depth19(look.depth_test()))) && ok(app.setDepthWrite(look.depth_writes())) &&
-                ok(app.setCullingMode(look.cull == Cull::Back    ? ramses::ECullMode_BackFacing
-                                      : look.cull == Cull::Front ? ramses::ECullMode_FrontFacing
-                                                                 : ramses::ECullMode_Disabled)) &&
+                ok(app.setCullingMode(cull_mode(look.cull))) &&
                 ok(app.setColorWriteMask(look.color_mask & kMaskR, look.color_mask & kMaskG, look.color_mask & kMaskB,
                                          look.color_mask & kMaskA));
+    good = good && ok(app.setDrawMode(draw_mode(look.draw)));
     const StencilState &st = look.stencil;
     good = good && ok(app.setStencilFunction(stencil_func(st.func), st.ref, st.mask)) &&
            ok(app.setStencilOperation(stencil_op(st.fail), stencil_op(st.depth_fail), stencil_op(st.pass)));
@@ -100,6 +116,65 @@ bool apply_look(ramses::Appearance &app, const PartLook &look)
     return good &&
            ok(app.setBlendingFactors(factor19(b.src), factor19(b.dst), factor19(b.src_alpha), factor19(b.dst_alpha))) &&
            ok(app.setBlendingOperations(op19(b.op), op19(b.op_alpha)));
+}
+
+/* app's render state as look_of() would set it (Graph::read_look). */
+bool look_of(const ramses::Appearance &app, PartLook *out)
+{
+    ramses::EDrawMode draw;
+    ramses::ECullMode cull;
+    ramses::EDepthFunc depth;
+    ramses::EDepthWrite write;
+    ramses::EBlendFactor bs, bd, bsa, bda;
+    ramses::EBlendOperation oc, oa;
+    ramses::EStencilFunc sf;
+    ramses::EStencilOperation fail, dfail, pass;
+    uint32_t ref = 0;
+    uint8_t mask = 0;
+    bool r = false, g = false, b = false, a = false;
+    if (!ok(app.getDrawMode(draw)) || !ok(app.getCullingMode(cull)) || !ok(app.getDepthFunction(depth)) ||
+        !ok(app.getDepthWriteMode(write)) || !ok(app.getBlendingFactors(bs, bd, bsa, bda)) ||
+        !ok(app.getBlendingOperations(oc, oa)) || !ok(app.getColorWriteMask(r, g, b, a)) ||
+        !ok(app.getStencilFunction(sf, ref, mask)) || !ok(app.getStencilOperation(fail, dfail, pass)))
+        return false;
+    PartLook l;
+    const int d = unmap<Draw>(draw, 5, [](Draw x) { return draw_mode(x); });
+    const int c = unmap<Cull>(cull, 3, [](Cull x) { return cull_mode(x); });
+    const int df = unmap<DepthFunc>(depth, 9, [](DepthFunc x) { return depth19(x); });
+    const int s = unmap<StencilFunc>(sf, 9, [](StencilFunc x) { return stencil_func(x); });
+    auto f = [](ramses::EBlendFactor x) { return unmap<BlendFactor>(x, 6, [](BlendFactor y) { return factor19(y); }); };
+    auto o = [](ramses::EStencilOperation x) { return unmap<StencilOp>(x, 8, [](StencilOp y) { return stencil_op(y); }); };
+    if (d < 0 || c < 0 || df < 0 || s < 0 || f(bs) < 0 || f(bd) < 0 || f(bsa) < 0 || f(bda) < 0 || o(fail) < 0 ||
+        o(dfail) < 0 || o(pass) < 0)
+        return false;
+    l.draw = (Draw)d;
+    l.cull = (Cull)c;
+    l.depth = df != (int)DepthFunc::Off;
+    l.depth_func = l.depth ? (DepthFunc)df : DepthFunc::LessEqual;
+    l.depth_write = write == ramses::EDepthWrite_Enabled;
+    l.has_custom = true;
+    l.custom.on = !(oc == ramses::EBlendOperation_Disabled && oa == ramses::EBlendOperation_Disabled);
+    if (l.custom.on) {
+        const int opc = unmap<BlendOp>(oc, 5, [](BlendOp x) { return op19(x); });
+        const int opa = unmap<BlendOp>(oa, 5, [](BlendOp x) { return op19(x); });
+        if (opc < 0 || opa < 0)
+            return false;
+        l.custom.src = (BlendFactor)f(bs);
+        l.custom.dst = (BlendFactor)f(bd);
+        l.custom.src_alpha = (BlendFactor)f(bsa);
+        l.custom.dst_alpha = (BlendFactor)f(bda);
+        l.custom.op = (BlendOp)opc;
+        l.custom.op_alpha = (BlendOp)opa;
+    }
+    l.color_mask = (uint8_t)((r ? kMaskR : 0) | (g ? kMaskG : 0) | (b ? kMaskB : 0) | (a ? kMaskA : 0));
+    l.stencil.func = (StencilFunc)s;
+    l.stencil.ref = (uint8_t)ref;
+    l.stencil.mask = mask;
+    l.stencil.fail = (StencilOp)o(fail);
+    l.stencil.depth_fail = (StencilOp)o(dfail);
+    l.stencil.pass = (StencilOp)o(pass);
+    *out = l;
+    return true;
 }
 
 /* name appears in src as a whole identifier. */
@@ -118,6 +193,56 @@ const struct {
     unsigned bit;
 } kAttributes[] = {{"a_position", kAttrPosition}, {"a_normal", kAttrNormal}, {"a_texcoord", kAttrTexcoord},
                    {"a_color", kAttrColor}};
+
+/* The sampler types name is declared with in src (sampler2D, samplerCube),
+ * comments skipped: RAMSES 19 reflects both kinds as one data type, so a
+ * sampler the library reports takes its kind from its declarations where
+ * they agree, and none (a type behind a define, other kinds in other #if
+ * branches) where they do not. */
+void declared_samplers(const std::string &src, const std::string &name, std::set<std::string> *kinds)
+{
+    std::string text;
+    for (size_t i = 0; i < src.size(); i++) {
+        if (src.compare(i, 2, "//") == 0) {
+            const size_t e = src.find('\n', i);
+            i = e == std::string::npos ? src.size() : e;
+            text += '\n';   /* the line ends with its comment: "#else// x" stays apart from the next */
+        } else if (src.compare(i, 2, "/*") == 0) {
+            const size_t e = src.find("*/", i + 2);
+            i = e == std::string::npos ? src.size() : e + 1;
+            text += ' ';
+        } else {
+            text += src[i];
+        }
+    }
+    std::vector<std::string> w;
+    std::string cur;
+    for (char c : text + " ") {
+        if (std::isalnum((unsigned char)c) || c == '_') {
+            cur += c;
+            continue;
+        }
+        if (!cur.empty())
+            w.push_back(cur);
+        cur.clear();
+        if (c == ';' || c == ',' || c == '[' || c == '#')
+            w.push_back(std::string(1, c));
+    }
+    for (size_t i = 0; i < w.size(); i++) {
+        if (w[i] != "uniform")
+            continue;
+        size_t t = i + 1;
+        while (t < w.size() && (w[t] == "lowp" || w[t] == "mediump" || w[t] == "highp"))
+            t++;
+        if (t >= w.size())
+            break;
+        bool listed = false;
+        for (size_t n = t + 1; n < w.size() && w[n] != ";" && w[n] != "#"; n++)
+            listed = listed || w[n] == name;
+        if (listed)
+            kinds->insert(w[t]);
+    }
+}
 
 unsigned effect_attributes(const ramses::Effect &fx)
 {
@@ -141,6 +266,10 @@ public:
         : client_(client), effects_(effects), pos_(pos), idx_(idx)
     {
     }
+
+    /* The library's uniform types (learn()), for animate() and link(); null:
+     * unknown. */
+    void set_types(const Ramses19Types *t) { types_ = t; }
 
     ~Ramses19Graph() override
     {
@@ -286,6 +415,48 @@ public:
         b.tex = tex;
         buffers_[next_] = b;
         return next_++;
+    }
+
+    /* A cube texture: a client resource, as an ETC2 texture is. */
+    int cube_texture(TexFormat f, uint32_t size, const Sampler &s, const uint8_t *data, size_t face) override
+    {
+        if (!size || face != tex_bytes(f, size, size) || sampling_mips(s.sampling))
+            return 0;
+        const ramses::CubeMipLevelData mip((uint32_t)face, data, data + face, data + 2 * face, data + 3 * face,
+                                           data + 4 * face, data + 5 * face);
+        const ramses::ETextureFormat format = f == TexFormat::ETC2RGB    ? ramses::ETextureFormat_ETC2RGB
+                     : f == TexFormat::ETC2RGBA ? ramses::ETextureFormat_ETC2RGBA
+                     : f == TexFormat::R8       ? ramses::ETextureFormat_R8
+                                                : ramses::ETextureFormat_RGBA8;
+        ramses::TextureCube *tex = client_.createTextureCube(size, format, 1, &mip, false);
+        ramses::TextureSampler *smp =
+            tex ? scene_->createTextureSampler(wrap19(s.u), wrap19(s.v), sampling19(s.sampling), *tex, s.anisotropy)
+                : nullptr;
+        if (!smp) {
+            log_error("ramses: %u-pixel %s cube texture refused by %s", size, tex_format_name(f),
+                      tex ? "createTextureSampler" : "createTextureCube");
+            if (tex)
+                client_.destroy(*tex);
+            return 0;
+        }
+        Buffer b{nullptr, smp, 0};
+        b.tex = tex;
+        b.cube = true;
+        buffers_[next_] = b;
+        return next_++;
+    }
+
+    bool read_cube(int buf, uint32_t *size, int *format, const char *file) override
+    {
+        auto it = buffers_.find(buf);
+        if (it == buffers_.end() || !it->second.cube)
+            return false;
+        const ramses::TextureCube *t = static_cast<const ramses::TextureCube *>(it->second.tex);
+        *size = t->getSize();
+        *format = (int)t->getTextureFormat();
+        ramses::ResourceFileDescription d(file);
+        d.add(t);
+        return ok(client_.saveResources(d, false));
     }
 
     bool write(int buf, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *px) override
@@ -478,8 +649,71 @@ public:
         scene_->destroy(*q->second.turned);
         scene_->destroy(*q->second.placed);
         scene_->destroy(*q->second.geo);
+        drop_glyph_buffers(q->second);
         scene_->destroy(*q->second.app);
         quads_.erase(q);
+    }
+
+    bool glyph_buffer(int quad, uint32_t capacity) override
+    {
+        auto it = quads_.find(quad);
+        if (it == quads_.end() || it->second.glyph_cap || !capacity || capacity > 16383)
+            return false;
+        Quad &q = it->second;
+        q.glyph_pos = scene_->createVertexDataBuffer(capacity * 32, ramses::EDataType_Vector2F);
+        q.glyph_uv = scene_->createVertexDataBuffer(capacity * 32, ramses::EDataType_Vector2F);
+        q.glyph_idx = scene_->createIndexDataBuffer(capacity * 12, ramses::EDataType_UInt16);
+        std::vector<uint16_t> idx(capacity * 6);
+        for (uint32_t i = 0; i < capacity; i++) {
+            const uint16_t b = (uint16_t)(i * 4);
+            const uint16_t six[6] = {b, (uint16_t)(b + 1), (uint16_t)(b + 2), (uint16_t)(b + 2), (uint16_t)(b + 1),
+                                     (uint16_t)(b + 3)};
+            std::copy(six, six + 6, idx.begin() + i * 6);
+        }
+        const float zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        ramses::AttributeInput pos, uv;
+        /* a binding of its own, made with the buffers, in place of the unit quad's */
+        ramses::GeometryBinding *geo = scene_->createGeometryBinding(*q.effect);
+        const bool good =
+            geo && q.glyph_pos && q.glyph_uv && q.glyph_idx &&
+            ok(q.glyph_idx->setData(reinterpret_cast<const char *>(idx.data()), capacity * 12, 0)) &&
+            ok(q.glyph_pos->setData(reinterpret_cast<const char *>(zero), 32, 0)) &&
+            ok(q.glyph_uv->setData(reinterpret_cast<const char *>(zero), 32, 0)) &&
+            ok(q.effect->findAttributeInput("a_position", pos)) && ok(q.effect->findAttributeInput("a_texcoord", uv)) &&
+            ok(geo->setInputBuffer(pos, *q.glyph_pos)) && ok(geo->setInputBuffer(uv, *q.glyph_uv)) &&
+            ok(geo->setIndices(*q.glyph_idx)) && ok(q.mesh->setGeometryBinding(*geo)) && ok(q.mesh->setIndexCount(6));
+        if (good) {
+            scene_->destroy(*q.geo);
+            q.geo = geo;
+        } else if (geo) {
+            scene_->destroy(*geo);
+        }
+        if (!good) {
+            log_error("ramses: a glyph run of %u glyphs refused", capacity);
+            return false;   /* the quad is dropped, its buffers with it */
+        }
+        q.glyph_cap = capacity;
+        return true;
+    }
+
+    bool glyphs(int quad, const float *v, uint32_t n) override
+    {
+        auto it = quads_.find(quad);
+        if (it == quads_.end() || !it->second.glyph_cap || n > it->second.glyph_cap)
+            return false;
+        Quad &q = it->second;
+        /* nothing to draw: one glyph of no area */
+        std::vector<float> pos(std::max<uint32_t>(n, 1) * 8, 0.0f), uv(pos.size(), 0.0f);
+        for (uint32_t i = 0; i < n * 4; i++) {
+            pos[i * 2] = v[i * 4];
+            pos[i * 2 + 1] = v[i * 4 + 1];
+            uv[i * 2] = v[i * 4 + 2];
+            uv[i * 2 + 1] = v[i * 4 + 3];
+        }
+        const uint32_t bytes = (uint32_t)(pos.size() * 4);
+        return ok(q.glyph_pos->setData(reinterpret_cast<const char *>(pos.data()), bytes, 0)) &&
+               ok(q.glyph_uv->setData(reinterpret_cast<const char *>(uv.data()), bytes, 0)) &&
+               ok(q.mesh->setIndexCount(std::max<uint32_t>(n, 1) * 6));
     }
 
     void drop_buffer(int buf) override
@@ -562,7 +796,8 @@ public:
         ramses::GeometryBinding *geo = scene_->createGeometryBinding(*fx->second);
         ramses::MeshNode *mesh = scene_->createMeshNode();
         if (!app || !geo || !mesh || !apply_look(*app, look) || !ok(mesh->setAppearance(*app)) ||
-            !ok(mesh->setGeometryBinding(*geo)) || !ok(mesh->setParent(*v->second.root))) {
+            !ok(mesh->setGeometryBinding(*geo)) || !ok(mesh->setParent(*v->second.root)) ||
+            (look.instances > 1 && !ok(mesh->setInstanceCount(look.instances)))) {
             if (mesh) scene_->destroy(*mesh);
             if (geo) scene_->destroy(*geo);
             if (app) scene_->destroy(*app);
@@ -580,10 +815,56 @@ public:
         return next_++;
     }
 
+    int node(int view) override
+    {
+        auto v = views_.find(view);
+        if (v == views_.end())
+            return 0;
+        ramses::Node *n = scene_->createGroupNode();
+        if (!n || !ok(n->setParent(*v->second.root))) {
+            if (n)
+                scene_->destroy(*n);
+            return 0;
+        }
+        Part p;
+        p.view = view;
+        p.pivot = n;
+        parts_[next_] = p;
+        return next_++;
+    }
+
+    bool parent(int part, int parent) override
+    {
+        auto c = parts_.find(part);
+        auto p = parts_.find(parent);
+        if (c == parts_.end() || p == parts_.end() || part == parent || c->second.view != p->second.view)
+            return false;
+        ramses::Node &n = node_of(c->second);
+        return ok(n.removeParent()) && ok(n.setParent(node_of(p->second)));
+    }
+    bool read_parent(int part, int *parent) override
+    {
+        auto c = parts_.find(part);
+        if (c == parts_.end())
+            return false;
+        const ramses::Node *up = node_of(c->second).getParent();
+        auto v = views_.find(c->second.view);
+        if (v != views_.end() && up == v->second.root) {
+            *parent = 0;
+            return true;
+        }
+        for (auto &kv : parts_)
+            if (up == &node_of(kv.second)) {
+                *parent = kv.first;
+                return true;
+            }
+        return false;
+    }
+
     bool geometry(int part, const Geometry &g) override
     {
         auto it = parts_.find(part);
-        if (it == parts_.end())
+        if (it == parts_.end() || !it->second.mesh)
             return false;
         Part &p = it->second;
         const unsigned reads = effect_attributes(*p.effect);
@@ -644,7 +925,7 @@ public:
         auto it = parts_.find(part);
         if (it == parts_.end())
             return false;
-        ramses::MeshNode &m = *it->second.mesh;
+        ramses::Node &m = node_of(it->second);
         return ok(m.setTranslation(p.t[0], p.t[1], p.t[2])) && ok(m.setRotation(-p.r[0], -p.r[1], -p.r[2])) &&
                ok(m.setScaling(p.s[0], p.s[1], p.s[2]));
     }
@@ -656,6 +937,15 @@ public:
             return;
         stop_on(part);
         Part &p = it->second;
+        /* what follows it, a pivot or a mesh, follows the view again */
+        for (auto &kv : parts_)
+            if (&kv.second != &p && node_of(kv.second).getParent() == &node_of(p))
+                node_of(kv.second).setParent(*views_[p.view].root);
+        if (p.pivot) {
+            scene_->destroy(*p.pivot);
+            parts_.erase(it);
+            return;
+        }
         auto v = views_.find(p.view);
         if (p.grouped && v != views_.end())
             v->second.group->removeMeshNode(*p.mesh);
@@ -670,34 +960,44 @@ public:
             clear_depth(v->second, view);
     }
 
+    /* Made at a flush within the key allowance (settle_animations()). */
     int animate(int node, const Animation &a) override
     {
-        if (a.t.empty() || a.v.size() != a.t.size() * a.width)
+        ramses::Node *target = nullptr;
+        ramses::Appearance *app = nullptr;
+        ramses::UniformInput in;
+        if (a.t.empty() || a.v.size() != a.t.size() * a.width || !resolve(node, a, &target, &app, &in))
             return 0;
-        Anim an;
-        an.node = node;
-        an.a = a;
-        bool made = false;
-        if (!build(an, &made)) {
-            log_error("ramses: animation refused");
-            if (made)
-                rebuild();
-            return 0;
-        }
-        anims_[next_] = an;
+        table().add(next_, node, a);
         return next_++;
     }
 
-    /* The animation system goes whole, its objects with it, and the
-     * animations that stay are made again in a new one, each from when it
-     * started. VERIFIED on the unit's libramses 19: a destroyed spline or
-     * animated property leaves its animation system one the library cannot
-     * describe, and it crashes the process when a renderer subscribes to
-     * the scene again, or when the scene is saved. */
+    /* Made at a flush, where the newest of several replacements is made
+     * alone (AnimTable); the old one plays until then, then retires
+     * (retire()). */
+    int replace(int anim, int node, const Animation &a, std::function<void()> restore) override
+    {
+        if (!anims_.count(anim))
+            return animate(node, a);
+        ramses::Node *target = nullptr;
+        ramses::Appearance *app = nullptr;
+        ramses::UniformInput in;
+        if (a.t.empty() || a.v.size() != a.t.size() * a.width || !resolve(node, a, &target, &app, &in)) {
+            stop(anim);
+            return 0;
+        }
+        table().replace(anim, node, a, std::move(restore));
+        return anim;
+    }
+
     void stop(int anim) override
     {
-        if (anims_.erase(anim))
-            rebuild();
+        table().stop(anim, [this](Anim &an) { retire(an); });
+    }
+
+    bool animations_due() const override
+    {
+        return AnimTable<Anim>::any_due(anims_);
     }
 
     /* A canvas (graph.h): a colour render buffer, a depth-stencil one with
@@ -844,6 +1144,119 @@ public:
         return true;
     }
 
+    bool read_look_raw(int part, std::vector<int> *out) override
+    {
+        auto it = parts_.find(part);
+        if (it == parts_.end() || !it->second.app)
+            return false;
+        const ramses::Appearance &app = *it->second.app;
+        ramses::EDrawMode draw;
+        ramses::ECullMode cull;
+        ramses::EDepthFunc depth;
+        ramses::EBlendFactor bs, bd, bsa, bda;
+        ramses::EBlendOperation oc, oa;
+        ramses::EStencilFunc sf;
+        ramses::EStencilOperation fail, dfail, pass;
+        uint32_t ref = 0;
+        uint8_t mask = 0;
+        if (!ok(app.getDrawMode(draw)) || !ok(app.getCullingMode(cull)) || !ok(app.getDepthFunction(depth)) ||
+            !ok(app.getBlendingFactors(bs, bd, bsa, bda)) || !ok(app.getBlendingOperations(oc, oa)) ||
+            !ok(app.getStencilFunction(sf, ref, mask)) || !ok(app.getStencilOperation(fail, dfail, pass)))
+            return false;
+        *out = {(int)draw, (int)cull, (int)depth, (int)bs, (int)bd, (int)bsa, (int)bda,
+                (int)oc,   (int)oa,   (int)sf,    (int)fail, (int)dfail, (int)pass};
+        return true;
+    }
+
+    bool read_look(int part, PartLook *out, bool fresh) override
+    {
+        auto it = parts_.find(part);
+        if (it == parts_.end() || !it->second.app)
+            return false;
+        if (!fresh)
+            return look_of(*it->second.app, out);
+        ramses::Appearance *app = scene_->createAppearance(*it->second.effect);
+        const bool good = app && look_of(*app, out);
+        if (app)
+            scene_->destroy(*app);
+        return good;
+    }
+
+    int value(uint32_t width) override
+    {
+        ramses::DataObject *d = width == 1   ? (ramses::DataObject *)scene_->createDataFloat()
+                                : width == 2 ? (ramses::DataObject *)scene_->createDataVector2f()
+                                : width == 3 ? (ramses::DataObject *)scene_->createDataVector3f()
+                                : width == 4 ? (ramses::DataObject *)scene_->createDataVector4f()
+                                             : nullptr;
+        if (!d)
+            return 0;
+        Value nv;
+        nv.data = d;
+        nv.width = width;
+        values_[next_] = nv;
+        return next_++;
+    }
+
+    bool set_value(int value, const float *v) override
+    {
+        auto it = values_.find(value);
+        if (it == values_.end())
+            return false;
+        ramses::DataObject *d = it->second.data;
+        switch (it->second.width) {
+        case 1: return ok(static_cast<ramses::DataFloat *>(d)->setValue(v[0]));
+        case 2: return ok(static_cast<ramses::DataVector2f *>(d)->setValue(v[0], v[1]));
+        case 3: return ok(static_cast<ramses::DataVector3f *>(d)->setValue(v[0], v[1], v[2]));
+        default: return ok(static_cast<ramses::DataVector4f *>(d)->setValue(v[0], v[1], v[2], v[3]));
+        }
+    }
+
+    /* The library refuses a data object of another type than the uniform. */
+    bool link(int drawable, const char *name, int value) override
+    {
+        ramses::Appearance *app = nullptr;
+        const ramses::Effect *fx = look(drawable, &app);
+        ramses::UniformInput in;
+        auto it = values_.find(value);
+        if (!fx || !ok(fx->findUniformInput(name, in)) || (value && it == values_.end()))
+            return false;
+        /* the library refuses an array uniform (logging an error) */
+        if (value && in.getElementCount() != 1)
+            return false;
+        /* the uniform a float, vec2, vec3 or vec4 as the value: the library
+         * logs an error for another */
+        if (value && (!types_ || (uint32_t)in.getDataType() != types_->uniform[it->second.width - 1]))
+            return false;
+        if (app->isInputBound(in) && !ok(app->unbindInput(in)))
+            return false;
+        return !value || ok(app->bindInput(in, *it->second.data));
+    }
+
+    /* Its animations retired (retire()); its data object kept while an
+     * animation system that animated it lasts, as a retired animation there
+     * may still name it, and taken away with the last such: no system made
+     * again for it, so dropping one costs no other animation's keys. */
+    void drop_value(int value) override
+    {
+        auto it = values_.find(value);
+        if (it == values_.end())
+            return;
+        for (auto a = anims_.begin(); a != anims_.end();) {
+            if (a->second.node != value) {
+                ++a;
+                continue;
+            }
+            retire(a->second);
+            a = anims_.erase(a);
+        }
+        if (it->second.systems.empty())
+            scene_->destroy(*it->second.data);
+        else
+            orphans_.push_back(it->second);
+        values_.erase(it);
+    }
+
     /* A canvas drawn once draws once more, with its next flush. */
     bool redraw(int canvas) override
     {
@@ -865,6 +1278,7 @@ public:
     {
         if (layout_dirty_)
             relayout();
+        settle_animations();
         const ramses::status_t s = scene_->flush(ramses::ESceneFlushMode_Synchronous, tag);
         if (!ok(s) && !flush_failing_)
             log_error("ramses: flush %llu: %s", (unsigned long long)tag, client_.getStatusMessage(s));
@@ -872,13 +1286,23 @@ public:
         return ok(s);
     }
 
+    bool band(int32_t base) override
+    {
+        if (!borrowed_)
+            return false;
+        over_base_ = std::min<int32_t>(base, INT32_MAX - 1024);
+        band_ = layout_dirty_ = true;
+        return true;
+    }
+
 private:
     struct Buffer {
         ramses::Texture2DBuffer *buffer;   /* null for an immutable texture */
         ramses::TextureSampler *sampler;
         uint32_t bpp;
-        const ramses::Texture2D *tex = nullptr;
+        const ramses::Resource *tex = nullptr;   /* an immutable texture: Texture2D or TextureCube */
         uint32_t levels = 1;   /* mip levels */
+        bool cube = false;     /* tex a TextureCube */
     };
     struct Quad {
         ramses::MeshNode *mesh = nullptr;
@@ -886,6 +1310,10 @@ private:
         ramses::Appearance *app = nullptr;
         ramses::GeometryBinding *geo = nullptr;
         ramses::Effect *effect = nullptr;
+        /* A glyph run's buffers (glyph_buffer()), its capacity in glyphs. */
+        ramses::VertexDataBuffer *glyph_pos = nullptr, *glyph_uv = nullptr;
+        ramses::IndexDataBuffer *glyph_idx = nullptr;
+        uint32_t glyph_cap = 0;
         int32_t order = 0;
         int32_t grouped_order = 0;   /* its order within its segment's group */
         size_t segment = 0;
@@ -893,6 +1321,16 @@ private:
         Rect r;
         Turn t;
     };
+    /* A glyph run's buffers go with its quad. */
+    void drop_glyph_buffers(Quad &q)
+    {
+        if (q.glyph_pos) scene_->destroy(*q.glyph_pos);
+        if (q.glyph_uv) scene_->destroy(*q.glyph_uv);
+        if (q.glyph_idx) scene_->destroy(*q.glyph_idx);
+        q.glyph_pos = q.glyph_uv = nullptr;
+        q.glyph_idx = nullptr;
+        q.glyph_cap = 0;
+    }
     /* A 2D pass: the quads between two views. */
     struct Segment {
         ramses::RenderPass *pass = nullptr;
@@ -1005,43 +1443,201 @@ private:
         ramses::Effect *effect = nullptr;
         bool depth = false, grouped = false;
         std::vector<const ramses::Resource *> res;
+        ramses::Node *pivot = nullptr;   /* a node(): draws nothing */
     };
-    struct Anim {
-        int node = 0;
-        Animation a;
+    ramses::Node &node_of(Part &p) { return p.mesh ? *(ramses::Node *)p.mesh : *p.pivot; }
+    /* Its state (AnimTable) and the objects of the one playing. */
+    struct Anim : AnimState {
         ramses::globalTimeStamp_t start = 0;   /* 0: not started yet */
         ramses::AnimationSequence *seq = nullptr;
         ramses::Animation *anim = nullptr;
         ramses::AnimatedProperty *prop = nullptr;
         ramses::Spline *spline = nullptr;
+        ramses::AnimationSystemRealTime *sys = nullptr;   /* the system its objects are in */
+        bool moving = false;   /* playing in old_: made again in anim_ at a flush */
     };
+    AnimTable<Anim> table() { return AnimTable<Anim>(anims_, keys_); }
+
+    /* What animation a on node plays: the node a quad, part or view turns,
+     * and for a uniform its appearance and input, of a's width (where the
+     * types are known). False when there is none. */
+    bool resolve(int node, const Animation &a, ramses::Node **target, ramses::Appearance **app,
+                 ramses::UniformInput *in)
+    {
+        if (a.property == Animated::Value) {
+            *target = nullptr;
+            *app = nullptr;
+            return values_.count(node) && values_.at(node).width == a.width;
+        }
+        auto q = quads_.find(node);
+        auto p = parts_.find(node);
+        auto v = views_.find(node);
+        *target = q != quads_.end()   ? (ramses::Node *)q->second.turned
+                  : p != parts_.end() ? &node_of(p->second)
+                  : v != views_.end() ? (ramses::Node *)v->second.cam
+                                      : nullptr;
+        *app = nullptr;
+        const ramses::Effect *fx = look(node, app);
+        /* a uniform's only where its type is known (learn()), so a width
+         * the library would refuse at the flush is refused here */
+        return *target && (a.property != Animated::Uniform ||
+                           (fx && types_ && ok(fx->findUniformInput(a.uniform.c_str(), *in)) && a.width >= 1 &&
+                            a.width <= 4 && (uint32_t)in->getDataType() == types_->uniform[a.width - 1]));
+    }
+
+    bool read_animation(int anim, uint64_t *start) override
+    {
+        auto it = anims_.find(anim);
+        if (it == anims_.end() || !it->second.anim)
+            return false;
+        *start = it->second.anim->getStartTime();
+        return true;
+    }
+
+    /* An animation that goes: stopped and taken out of its sequence, its
+     * objects left in the system (destroying them alone leaves a system the
+     * library cannot describe, VERIFIED on the unit's libramses 19: it
+     * crashes the process when a renderer subscribes to the scene again, or
+     * when the scene is saved). Their keys count until settle_animations()
+     * has moved the animations to a new system, or until nothing plays in
+     * the system; those of a system dropped go with it. */
+    void retire(Anim &an)
+    {
+        if (an.seq && an.sys == anim_)
+            retired_keys_ += an.a.t.size();
+        unplay(an);
+    }
+    void unplay(Anim &an)
+    {
+        if (an.seq && an.anim && (!ok(an.seq->stop()) || !ok(an.seq->removeAnimation(*an.anim))))
+            log_warn("ramses: an animation not stopped");
+        an.seq = nullptr;
+        an.anim = nullptr;
+        an.prop = nullptr;
+        an.spline = nullptr;
+        an.sys = nullptr;
+        an.moving = false;
+    }
+
+    /* Before a flush: due animations made, owners in turn, until the bytes
+     * made reach the key allowance. Once the retired keys outnumber the
+     * live ones (and kRetiredKeys), a new system: each playing animation
+     * keeps playing in the old one until made again in the new one, from
+     * when it started, within the allowance like any other, and the old
+     * system goes once none is left in it. A replacement makes its own
+     * keys, and the moves it brings at most as many again. */
+    void settle_animations()
+    {
+        size_t live = 0;
+        for (const auto &kv : anims_)
+            live += kv.second.a.t.size();
+        if (!old_ && anim_ && retired_keys_ > kRetiredKeys && retired_keys_ > live) {
+            old_ = anim_;
+            anim_ = nullptr;
+            retired_keys_ = 0;
+            AnimTable<Anim> t = table();
+            for (auto &kv : anims_) {
+                kv.second.moving = kv.second.sys == old_;
+                if (kv.second.moving)
+                    t.again(kv.second);
+            }
+        }
+        table().make([this](Anim &an, Anim &was, bool replaced) { return make(an, was, replaced); });
+        if (old_) {
+            bool left = false;
+            for (const auto &kv : anims_)
+                left = left || kv.second.moving;
+            if (!left) {
+                drop_system(old_);
+                old_ = nullptr;
+            }
+        }
+        /* Nothing plays in the system any more (its animations stopped, or
+         * their layers or their client gone), only retired ones are left
+         * there: the whole system goes with them, and the next animation
+         * makes a new one. Kept, they would stay until a later client's
+         * animations outnumbered them, a whole session's worth after it
+         * ended. */
+        if (!old_ && anim_ && retired_keys_ > 0) {
+            bool plays = false;
+            for (const auto &kv : anims_)
+                plays = plays || kv.second.sys == anim_;
+            if (!plays) {
+                drop_system(anim_);
+                anim_ = nullptr;
+                retired_keys_ = 0;
+            }
+        }
+    }
+    /* sys destroyed with every object in it, and the data objects of values
+     * gone that only it still named. */
+    void drop_system(ramses::AnimationSystemRealTime *sys)
+    {
+        scene_->destroy(*sys);
+        for (auto &kv : values_)
+            kv.second.systems.erase(sys);
+        for (auto o = orphans_.begin(); o != orphans_.end();) {
+            o->systems.erase(sys);
+            if (!o->systems.empty()) {
+                ++o;
+                continue;
+            }
+            scene_->destroy(*o->data);
+            o = orphans_.erase(o);
+        }
+    }
+    /* An animation made at a flush (AnimTable::make): a replacement in
+     * place of the one playing (was), which retires then (unplayed where it
+     * was moving); one moving made again in the new system from when it
+     * started. */
+    AnimTable<Anim>::Built make(Anim &an, Anim &was, bool replaced)
+    {
+        if (replaced)
+            an.start = 0;
+        an.seq = nullptr;
+        an.anim = nullptr;
+        an.prop = nullptr;
+        an.spline = nullptr;
+        an.sys = nullptr;
+        an.moving = false;
+        bool half = false;
+        AnimTable<Anim>::Built b;
+        b.ok = build(an, &half);
+        if (was.seq) {
+            if (was.moving)
+                unplay(was);
+            else
+                retire(was);
+        }
+        b.bytes = b.ok || half ? key_bytes(an.a) : 0;
+        if (!b.ok) {
+            log_error("ramses: an animation refused");
+            if (half)
+                retired_keys_ = SIZE_MAX;   /* half made: the system goes */
+        }
+        return b;
+    }
 
     /* Makes an's objects in the animation system (made when there is none)
      * and starts it at an.start, or now. An unknown node or uniform is
      * refused before anything is made; *made: objects were made, which a
-     * refusal leaves to a new system (rebuild()) to take away. */
+     * refusal leaves to a new system (settle_animations()) to take away. */
     bool build(Anim &an, bool *made)
     {
         const int node = an.node;
         const Animation &a = an.a;
-        auto q = quads_.find(node);
-        auto p = parts_.find(node);
-        auto v = views_.find(node);
-        ramses::Node *target = q != quads_.end()   ? (ramses::Node *)q->second.turned
-                               : p != parts_.end() ? (ramses::Node *)p->second.mesh
-                               : v != views_.end() ? (ramses::Node *)v->second.cam
-                                                   : nullptr;
+        ramses::Node *target = nullptr;
         ramses::Appearance *app = nullptr;
-        const ramses::Effect *fx = look(node, &app);
         ramses::UniformInput in;
-        if (!target || (a.property == Animated::Uniform && (!fx || !ok(fx->findUniformInput(a.uniform.c_str(), in)))))
+        if (!resolve(node, a, &target, &app, &in))
             return false;
+        auto dv = values_.find(node);
         if (!anim_)
             anim_ = scene_->createRealTimeAnimationSystem(ramses::EAnimationSystemFlags_Default, "anim");
         if (!anim_)
             return false;
         *made = true;
-        const bool on_quad = q != quads_.end();
+        const bool on_quad = quads_.count(node) != 0;
         /* The renderer's conventions: y up, so down is negative y, and its
          * rotations are left-handed, so a quad's clockwise turn is positive
          * z and the right-handed angles of parts and cameras are negated. */
@@ -1054,7 +1650,10 @@ private:
                 vals[k] = -vals[k];
 
         an.spline = spline(a, vals);
-        if (an.spline && a.property == Animated::Uniform) {
+        if (an.spline && a.property == Animated::Value) {
+            an.prop = anim_->createAnimatedProperty(*dv->second.data);
+            dv->second.systems.insert(anim_);
+        } else if (an.spline && a.property == Animated::Uniform) {
             an.prop = anim_->createAnimatedProperty(in, *app);
         } else if (an.spline) {
             const ramses::EAnimatedProperty prop = a.property == Animated::Rotate      ? ramses::EAnimatedProperty_Rotation
@@ -1070,30 +1669,11 @@ private:
             !ok(anim_->updateLocalTime()))
             return false;
         const ramses::globalTimeStamp_t at = an.start ? an.start : anim_->getTime();
+        an.sys = anim_;
         if (!ok(an.seq->startAt(at)))
             return false;
         an.start = at;
         return true;
-    }
-
-    void rebuild()
-    {
-        if (anim_)
-            scene_->destroy(*anim_);
-        anim_ = nullptr;
-        bool left = false;
-        for (auto it = anims_.begin(); it != anims_.end();) {
-            bool made = false;
-            if (build(it->second, &made)) {
-                ++it;
-                continue;
-            }
-            log_error("ramses: animation %d refused in a new animation system", it->first);
-            left = left || made;
-            it = anims_.erase(it);
-        }
-        if (left)
-            rebuild();
     }
 
     /* The appearance and effect of a quad or a part. */
@@ -1238,13 +1818,15 @@ private:
         return nullptr;
     }
 
+    /* A node going: what plays on it retired, as stop() does
+     * (AnimTable::stop_on), the system made again only once the retired
+     * keys outnumber the live ones. */
     void stop_on(int node)
     {
-        const size_t before = anims_.size();
-        for (auto it = anims_.begin(); it != anims_.end();)
-            it = it->second.node == node ? anims_.erase(it) : std::next(it);
-        if (anims_.size() != before)
-            rebuild();
+        table().stop_on(node, [this](Anim &an) {
+            retire(an);
+            an.start = 0;
+        });
     }
 
     /* Puts every quad and view in its pass, in draw order (plan_passes). */
@@ -1278,7 +1860,19 @@ private:
         std::vector<bool> kinds;
         for (const Item &it : items)
             kinds.push_back(it.view);
-        const std::vector<int> pass = plan_passes(kinds);
+        std::vector<int> pass = plan_passes(kinds);
+        /* The over band (band()), the target's own surface only: from its
+         * first item on, passes of its own at render orders from over_base_ up. */
+        int over = -1;
+        for (size_t i = 0; band_ && canvas == 0 && i < items.size() && over < 0; i++) {
+            if (items[i].order < kOverBand)
+                continue;
+            if (i && pass[i] == pass[i - 1])   /* a quad sharing the band below's pass: a new one */
+                for (size_t k = i; k < items.size(); k++)
+                    pass[k]++;
+            over = pass[i];
+        }
+        auto at = [&](int p) { return over >= 0 && p >= over ? over_base_ + (p - over) : sf.base + p; };
         /* 2D passes in order of appearance; pass 0 is always the first
          * segment. */
         std::map<int, size_t> segment_of;
@@ -1302,14 +1896,14 @@ private:
         }
         for (const auto &kv : segment_of) {
             Segment &s = sf.segments[kv.second];
-            if (s.render_order != sf.base + kv.first && ok(s.pass->setRenderOrder(sf.base + kv.first)))
-                s.render_order = sf.base + kv.first;
+            if (s.render_order != at(kv.first) && ok(s.pass->setRenderOrder(at(kv.first))))
+                s.render_order = at(kv.first);
         }
         for (size_t i = 0; i < items.size(); i++) {
             if (items[i].view) {
                 View &v = views_[items[i].handle];
-                if (v.render_order != sf.base + pass[i] && ok(v.pass->setRenderOrder(sf.base + pass[i])))
-                    v.render_order = sf.base + pass[i];
+                if (v.render_order != at(pass[i]) && ok(v.pass->setRenderOrder(at(pass[i]))))
+                    v.render_order = at(pass[i]);
                 continue;
             }
             Quad &q = quads_[items[i].handle];
@@ -1344,13 +1938,32 @@ private:
     const ramses::UInt16Array &idx_;
     ramses::Scene *scene_ = nullptr;
     ramses::AnimationSystemRealTime *anim_ = nullptr;
+    const Ramses19Types *types_ = nullptr;
+    ramses::AnimationSystemRealTime *old_ = nullptr;   /* being left: its animations move to anim_ */
+    /* Shared values: a data object each, of width floats; systems: the
+     * animation systems an animation of it was made in, which may name it
+     * while they last. */
+    struct Value {
+        ramses::DataObject *data = nullptr;
+        uint32_t width = 1;
+        std::set<ramses::AnimationSystemRealTime *> systems;
+    };
+    std::map<int, Value> values_;
+    /* Dropped values' data objects, kept while a system that animated them
+     * lasts (settle_animations() takes them away with it). */
+    std::vector<Value> orphans_;
+    /* Keys of retired animations still in anim_. */
+    size_t retired_keys_ = 0;
+    static const size_t kRetiredKeys = 4096;
     /* The target's own surface, and the canvases', by handle. */
     Surface main_;
     std::map<int, Surface> canvases_;
     int32_t canvas_seq_ = 0;
     /* In a scene file's scene (over()): not ours to publish or destroy; the
-     * passes' render orders start at base_. */
-    bool borrowed_ = false;
+     * passes' render orders start at main_.base, the over band's (band())
+     * at over_base_. */
+    bool borrowed_ = false, band_ = false;
+    int32_t over_base_ = 0;
     bool write_failing_ = false, flush_failing_ = false;   /* log the first of a run */
     bool layout_dirty_ = false;
     std::map<int, Buffer> buffers_;
@@ -1383,7 +1996,8 @@ const char *const kProbeVs =
     "  float s = u_f1 + u_f2.x + u_f3.x + u_f4.x + float(u_i1 + u_i2.x + u_i3.x + u_i4.x) + u_m2[0][0] + u_m3[0][0];\n"
     "  gl_Position = u_m4 * vec4(a_p * s, 1.0);\n"
     "}\n";
-const char *const kProbeFs = "precision mediump float;\nvoid main() { gl_FragColor = vec4(1.0); }\n";
+const char *const kProbeFs = "precision mediump float;\nuniform sampler2D u_s2;\nuniform samplerCube u_sc;\n"
+                             "void main() { gl_FragColor = texture2D(u_s2, vec2(0.5)) + textureCube(u_sc, vec3(1.0)); }\n";
 const char *const kProbeUniforms[11] = {"u_f1", "u_f2", "u_f3", "u_f4", "u_i1", "u_i2",
                                         "u_i3", "u_i4", "u_m2", "u_m3", "u_m4"};
 /* Floats or ints in one element of each, in Ramses19Types::uniform's order. */
@@ -1406,6 +2020,10 @@ bool learn(ramses::RamsesClient &client, Ramses19Types *t, std::string *err)
         good = ok(fx->findUniformInput(kProbeUniforms[i], u));
         t->uniform[i] = good ? (uint32_t)u.getDataType() : 0;
     }
+    ramses::UniformInput s2, scube;
+    good = good && ok(fx->findUniformInput("u_s2", s2)) && ok(fx->findUniformInput("u_sc", scube));
+    t->sampler2d = good ? (uint32_t)s2.getDataType() : 0;
+    t->sampler_cube = good ? (uint32_t)scube.getDataType() : 0;
     const ramses::RamsesObject *nodes[4] = {}, *others[8] = {};
     if (good) {
         const ramses::RamsesObject *n[4] = {s->createGroupNode(), s->createMeshNode(), s->createPerspectiveCamera(),
@@ -1448,6 +2066,16 @@ bool learn(ramses::RamsesClient &client, Ramses19Types *t, std::string *err)
         }
         good = t->node && t->resource;
     }
+    /* A scene file's animation sequences (Ramses19FileScene::play): without
+     * these none plays, and the rest stands. */
+    if (good) {
+        ramses::AnimationSystem *sys = s->createAnimationSystem();
+        ramses::AnimationSystemRealTime *clock = s->createRealTimeAnimationSystem();
+        ramses::AnimationSequence *seq = sys ? sys->createAnimationSequence() : nullptr;
+        t->system = sys ? (uint32_t)sys->getType() : 0;
+        t->realtime = clock ? (uint32_t)clock->getType() : 0;
+        t->sequence = seq ? (uint32_t)seq->getType() : 0;
+    }
     if (s)
         client.destroy(*s);
     if (fx)
@@ -1459,8 +2087,9 @@ bool learn(ramses::RamsesClient &client, Ramses19Types *t, std::string *err)
         log_error("%s", err->c_str());
         return false;
     }
-    log_info("ramses: object types node %u mesh %u cameras %u %u pass %u resource %u", t->node, t->mesh, t->persp,
-             t->ortho, t->pass, t->resource);
+    log_info("ramses: object types node %u mesh %u cameras %u %u pass %u resource %u animation systems %u %u "
+             "sequence %u",
+             t->node, t->mesh, t->persp, t->ortho, t->pass, t->resource, t->system, t->realtime, t->sequence);
     return true;
 }
 
@@ -1499,8 +2128,9 @@ public:
     /* effects, pos and idx: the participant's, for layers() */
     Ramses19FileScene(ramses::RamsesClient &client, const Ramses19Types &types,
                       const std::map<int, ramses::Effect *> &effects, const ramses::Vector2fArray &pos,
-                      const ramses::UInt16Array &idx)
-        : client_(client), types_(types), effects_(effects), pos_(pos), idx_(idx)
+                      const ramses::UInt16Array &idx, int64_t realtime_offset_ms)
+        : client_(client), types_(types), effects_(effects), pos_(pos), idx_(idx),
+          realtime_offset_ms_(realtime_offset_ms)
     {
     }
 
@@ -1545,12 +2175,23 @@ public:
         collect(Camera, types_.persp);
         collect(Camera, types_.ortho);
         collect(Pass, types_.pass);
+        /* Both kinds of system, whether the iterator takes a base type or
+         * not: a real-time one told by its own type. */
+        for (uint32_t type : {types_.system, types_.realtime}) {
+            if (!type)
+                continue;
+            ramses::SceneObjectIterator it(*scene_, ramses::ERamsesObjectType(type));
+            while (ramses::RamsesObject *o = it.getNext())
+                systems_[static_cast<ramses::AnimationSystem *>(o)] = (uint32_t)o->getType() == types_.realtime;
+        }
         if (!ok(scene_->flush()) || !ok(scene_->publish(ramses::EScenePublicationMode_LocalAndRemote))) {
             *err = "publish failed";
             return false;
         }
-        log_info("ramses: scene file of %zu nodes, %zu meshes, %zu cameras, %zu passes, %zu resources made",
-                 objs_[Node].size(), objs_[Mesh].size(), objs_[Camera].size(), objs_[Pass].size(), made_.size());
+        log_info("ramses: scene file of %zu nodes, %zu meshes, %zu cameras, %zu passes, %zu animation systems, %zu "
+                 "resources made",
+                 objs_[Node].size(), objs_[Mesh].size(), objs_[Camera].size(), objs_[Pass].size(), systems_.size(),
+                 made_.size());
         return true;
     }
 
@@ -1654,6 +2295,37 @@ public:
         }
     }
 
+    bool play(const std::string &name, bool end, int64_t now_ms, std::string *why) override
+    {
+        for (const auto &kv : systems_) {
+            ramses::AnimationSystem *sys = kv.first;
+            ramses::RamsesObject *o = sys->findObjectByName(name.c_str());
+            if (!o || (uint32_t)o->getType() != types_.sequence)
+                continue;
+            ramses::AnimationSequence *seq = static_cast<ramses::AnimationSequence *>(o);
+            const float speed = seq->getPlaybackSpeed();
+            const uint64_t stop = seq->getAnimationSequenceStopTime();
+            const uint64_t lasts = speed > 0 ? (uint64_t)std::ceil(stop / (double)speed) : stop;
+            return kv.second ? play_realtime(name, static_cast<ramses::AnimationSystemRealTime *>(sys), seq, lasts,
+                                             end, why)
+                             : play_driven(name, sys, seq, lasts, end, now_ms, why);
+        }
+        *why = "no animation sequence " + name;
+        return false;
+    }
+
+    bool tick(int64_t now_ms) override
+    {
+        bool any = false;
+        for (const auto &st : clock_.tick(now_ms)) {
+            ramses::AnimationSystem *sys = static_cast<ramses::AnimationSystem *>(const_cast<void *>(st.first));
+            any = ok(sys->setTime(st.second)) || any;
+        }
+        return any;
+    }
+
+    bool ticking() const override { return clock_.ticking(); }
+
     bool flush(uint64_t tag) override
     {
         const ramses::status_t s = scene_->flush(ramses::ESceneFlushMode_Synchronous, tag);
@@ -1675,6 +2347,7 @@ public:
         /* ponytail: room for 1024 passes above it; a file at the top of the range draws nothing over itself */
         base = std::min<int64_t>(base, INT32_MAX - 1024);
         std::unique_ptr<Ramses19Graph> g(new Ramses19Graph(client_, effects_, pos_, idx_));
+        g->set_types(&types_);
         if (!g->over(scene_, w_, h_, (int32_t)base, err))
             return nullptr;
         log_info("ramses: layers over the scene file from render order %lld", (long long)base);
@@ -1682,6 +2355,54 @@ public:
     }
 
 private:
+    /* A sequence of a system without a clock of its own: its time set by
+     * the service from now on (clock_, tick()), the renderer interpolating
+     * at the time each flush gives it, whatever its own clock says. */
+    bool play_driven(const std::string &name, ramses::AnimationSystem *sys, ramses::AnimationSequence *seq,
+                     uint64_t lasts, bool end, int64_t now_ms, std::string *why)
+    {
+        /* ponytail: ticked for at most 10 minutes; a looping one has no end. */
+        if (lasts > SequenceClock::kMaxLasts) {
+            *why = name + " lasts over 10 minutes (one that loops has no end), too long for its system's time to be "
+                          "set by the service";
+            return false;
+        }
+        uint64_t from = 0;
+        const uint64_t t = clock_.play(sys, seq, sys->getTime(), lasts, end, now_ms, &from);
+        if (!ok(seq->startAt(from)) || !ok(sys->setTime(t))) {
+            *why = "the renderer refused it";
+            return false;
+        }
+        log_info("ramses: sequence %s %s at %llu ms of its system's time, %llu ms long", name.c_str(),
+                 end ? "skipped to its end" : "played", (unsigned long long)from, (unsigned long long)lasts);
+        return true;
+    }
+
+    /* A sequence of a real-time system: the renderer plays it on its own
+     * clock, against the start stamped here from this side's clock moved
+     * by realtime_offset_ms_; a renderer whose clock differs by more starts
+     * it that much early or late. */
+    bool play_realtime(const std::string &name, ramses::AnimationSystemRealTime *rt, ramses::AnimationSequence *seq,
+                       uint64_t lasts, bool end, std::string *why)
+    {
+        if (!ok(rt->updateLocalTime()) ||
+            (realtime_offset_ms_ &&
+             !ok(rt->updateLocalTime((uint64_t)((int64_t)rt->getTime() + realtime_offset_ms_))))) {
+            *why = "the animation system's time was not updated";
+            return false;
+        }
+        const uint64_t now = rt->getTime();
+        /* The end: started as long ago as it lasts, its stop passed. */
+        const uint64_t from = end ? now - std::min(now, lasts + 1) : now;
+        if (!ok(seq->startAt(from))) {
+            *why = "the renderer refused it";
+            return false;
+        }
+        log_info("ramses: sequence %s of a real-time system %s at %llu ms (this side's clock %+lld ms)", name.c_str(),
+                 end ? "skipped to its end" : "played", (unsigned long long)from, (long long)realtime_offset_ms_);
+        return true;
+    }
+
     void collect(Kind k, uint32_t type)
     {
         ramses::SceneObjectIterator it(*scene_, ramses::ERamsesObjectType(type));
@@ -1704,6 +2425,9 @@ private:
     std::vector<ramses::RamsesObject *> objs_[kKinds];
     std::vector<std::string> names_[kKinds];
     std::map<std::string, ramses::RamsesObject *> data_;
+    std::map<ramses::AnimationSystem *, bool> systems_;   /* the file's animation systems: real-time? */
+    SequenceClock clock_;                                 /* the others' time, while they play */
+    int64_t realtime_offset_ms_;
     bool flush_failing_ = false;
 };
 
@@ -1756,6 +2480,42 @@ int Ramses19Gpu::effect(const char *vs, const char *fs, std::string *err)
         *err = "effect did not compile";
         return 0;
     }
+    std::string why;
+    if (!typed_)
+        typed_ = learn(client_, &types_, &why);
+    if (typed_) {
+        std::vector<EffectInput> &in = inputs_[next_];
+        const uint32_t n = fx->getUniformInputCount();
+        for (uint32_t i = 0; i < n; i++) {
+            ramses::UniformInput u;
+            if (!ok(fx->getUniformInput(i, u)) || !u.getName())
+                continue;
+            EffectInput e;
+            e.name = u.getName();
+            e.elements = u.getElementCount();
+            const uint32_t type = (uint32_t)u.getDataType();
+            static const EffectInput::Kind floats[] = {EffectInput::Float, EffectInput::Vec2, EffectInput::Vec3,
+                                                       EffectInput::Vec4};
+            int f = 0;
+            while (f < 4 && types_.uniform[f] != type)
+                f++;
+            if (f < 4) {
+                e.kind = floats[f];
+            } else if (type != types_.sampler2d && type != types_.sampler_cube) {
+                e.kind = EffectInput::Other;
+            } else if (types_.sampler2d != types_.sampler_cube) {
+                e.kind = type == types_.sampler2d ? EffectInput::Sampler2D : EffectInput::SamplerCube;
+            } else {
+                std::set<std::string> kinds;
+                declared_samplers(std::string(vs) + "\n" + fs, e.name, &kinds);
+                e.kind = kinds.size() != 1          ? EffectInput::Sampler
+                         : *kinds.begin() == "sampler2D"   ? EffectInput::Sampler2D
+                         : *kinds.begin() == "samplerCube" ? EffectInput::SamplerCube
+                                                           : EffectInput::Sampler;
+            }
+            in.push_back(e);
+        }
+    }
     effects_[next_] = fx;
     return next_++;
 }
@@ -1767,6 +2527,16 @@ void Ramses19Gpu::drop_effect(int effect)
         return;
     client_.destroy(*it->second);
     effects_.erase(it);
+    inputs_.erase(effect);
+}
+
+bool Ramses19Gpu::inputs(int effect, std::vector<EffectInput> *out) const
+{
+    auto it = inputs_.find(effect);
+    if (it == inputs_.end())
+        return false;
+    *out = it->second;
+    return true;
 }
 
 unsigned Ramses19Gpu::attributes(int effect) const
@@ -1778,6 +2548,10 @@ unsigned Ramses19Gpu::attributes(int effect) const
 std::unique_ptr<Graph> Ramses19Gpu::scene(const TargetSpec &t, std::string *err)
 {
     std::unique_ptr<Ramses19Graph> g(new Ramses19Graph(client_, effects_, *pos_, *idx_));
+    std::string why;
+    if (!typed_)
+        typed_ = learn(client_, &types_, &why);
+    g->set_types(typed_ && !untyped_ ? &types_ : nullptr);
     if (!g->build(t, err))
         return nullptr;
     return std::unique_ptr<Graph>(g.release());
@@ -1790,10 +2564,19 @@ std::unique_ptr<FileScene> Ramses19Gpu::load(const TargetSpec &t, const std::str
         typed_ = learn(client_, &types_, err);
     if (!typed_)
         return nullptr;
-    std::unique_ptr<Ramses19FileScene> s(new Ramses19FileScene(client_, types_, effects_, *pos_, *idx_));
+    std::unique_ptr<Ramses19FileScene> s(
+        new Ramses19FileScene(client_, types_, effects_, *pos_, *idx_, realtime_offset_ms_));
     if (!s->load(t, file, res, err))
         return nullptr;
     return std::unique_ptr<FileScene>(s.release());
+}
+
+bool Ramses19Gpu::sequences()
+{
+    std::string why;
+    if (!typed_)
+        typed_ = learn(client_, &types_, &why);
+    return typed_ && types_.sequence && (types_.system || types_.realtime);
 }
 
 }  // namespace crs

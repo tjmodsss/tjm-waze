@@ -96,6 +96,9 @@ public:
     bool stopping() const;
     /* A content of the scene is offered or its offer is stopping. */
     bool holds(uint64_t scene_id) const;
+    /* No content offered or stopping and no answer or stop to deliver:
+     * the provider has no event of ours to dispatch. */
+    bool idle() const { return contents_.empty() && answers_.empty() && stopped_.empty(); }
 
     /* A released target's offer is gone (its stop accepted, or none to
      * stop): its scene may go now (Ramses27Gpu::drop_retired). Called from

@@ -16,9 +16,13 @@
  * line that changes nothing (no object matches, or none takes it) is
  * reported once per scene, and a tick whose lines all change nothing has
  * nothing to flush (a flush of no change still sends the renderer its
- * flush). */
+ * flush). A line that starts an animation (--play, --skip) is an event, not
+ * a value: it waits like the others (one of its key replacing it), is
+ * applied once, and goes, so a scene loaded again plays nothing by itself. */
 #ifndef CRS_SCENE_EDIT_H
 #define CRS_SCENE_EDIT_H
+
+#include <stdint.h>
 
 #include <list>
 #include <map>
@@ -31,9 +35,11 @@
 namespace crs {
 
 struct SceneEdit {
-    enum Op { Hide, Show, Uniform, Move, Scale, Rotate, Viewport, PassOff, PassOn, Set };
+    enum Op { Hide, Show, Uniform, Move, Scale, Rotate, Viewport, PassOff, PassOn, Set, Play, Skip };
     Op op = Hide;
-    std::string pattern;   /* a regular expression of names; Set: the data object's name */
+    /* a regular expression of names; Set: the data object's name; Play,
+     * Skip: the animation sequence's */
+    std::string pattern;
     std::string name;      /* Uniform: the uniform's */
     std::vector<float> v;
     std::string line;      /* as it came */
@@ -59,9 +65,10 @@ public:
     std::vector<EditProblem> add(const std::string &lines);
     /* A new scene: every kept line due again, every name resolved again. */
     void reset();
-    /* Applies the due lines to s, in order; true when any changed s (then
-     * it wants a flush). */
-    bool stage(FileScene *s);
+    /* Applies the due lines to s, in order, at now_ms (the service's clock,
+     * which a sequence played from now counts from); true when any changed
+     * s (then it wants a flush). */
+    bool stage(FileScene *s, int64_t now_ms = 0);
     /* The lines that changed nothing since the last call. */
     std::vector<EditProblem> take_problems();
     size_t kept() const { return lines_.size(); }
@@ -77,7 +84,7 @@ private:
         std::vector<int> hits;
         std::string error;
     };
-    bool apply(FileScene *s, const SceneEdit &e, std::string *why);
+    bool apply(FileScene *s, const SceneEdit &e, int64_t now_ms, std::string *why);
     const Match &resolve(FileScene *s, FileScene::Kind k, const std::string &pattern);
 
     std::list<Kept> lines_;
@@ -87,6 +94,43 @@ private:
     std::map<std::pair<int, std::string>, Match> cache_;
     std::set<std::string> reported_;
     std::vector<EditProblem> problems_;
+};
+
+/* The time of the animation systems without a clock of their own (not
+ * real-time) whose sequences the service plays (FileScene::play, tick()):
+ * the renderer interpolates at the time the service sets, so nothing
+ * depends on the renderer's clock. A system's time moves on with the
+ * service's clock while a sequence plays in it, is last set to the end of
+ * the last one, and stays there; it never goes back, so a play again starts
+ * the sequence at the system's time then. Systems and sequences are the
+ * backend's, only compared. */
+class SequenceClock {
+public:
+    /* The longest a sequence may last (the backend refuses a longer one,
+     * and one that loops: it has no end). */
+    static const uint64_t kMaxLasts = 600000;
+
+    /* Sequence seq of system sys, lasting `lasts` ms of the system's time,
+     * played at now_ms; at: the system's time when nothing plays in it.
+     * Returns the time to set now, *from the start to give the sequence.
+     * With end, it starts as long ago as it lasts: its end is shown at once. */
+    uint64_t play(const void *sys, const void *seq, uint64_t at, uint64_t lasts, bool end, int64_t now_ms,
+                  uint64_t *from);
+    /* Each playing system's time at now_ms, at most its last sequence's end;
+     * a system set to that end plays nothing more. A tick left out (the link
+     * busy) is caught up by the next. */
+    std::vector<std::pair<const void *, uint64_t>> tick(int64_t now_ms);
+    bool ticking() const { return !drives_.empty(); }
+
+private:
+    struct Drive {
+        uint64_t base;      /* the system's time at base_ms */
+        int64_t base_ms;
+        uint64_t last;      /* the time last set */
+        std::map<const void *, uint64_t> ends;   /* its sequences' ends */
+    };
+    static uint64_t now(const Drive &d, int64_t now_ms);
+    std::map<const void *, Drive> drives_;
 };
 
 }  // namespace crs

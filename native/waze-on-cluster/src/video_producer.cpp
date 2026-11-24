@@ -219,10 +219,12 @@ void VideoProducer::decode_loop()
 
 int VideoProducer::late_wait_ms() const
 {
-    if (!picture_fps_.load() && !paced_.load())
-        return 500;
+    /* Nothing paced: only a packet, a paced frame or a new picture_fps
+     * (each wakes the queue) gives the decode thread work. */
+    if (!paced_.load())
+        return -1;
     std::lock_guard<std::mutex> lock(decode_mutex_);
-    return paced_ ? (int)std::min<int64_t>(pace_.late_in_ms(cld::now_ms()), 500) : 500;
+    return paced_ ? (int)std::min<int64_t>(pace_.late_in_ms(cld::now_ms()), 500) : -1;
 }
 
 void VideoProducer::picture_paced()

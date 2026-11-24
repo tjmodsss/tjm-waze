@@ -222,10 +222,13 @@ namespace ramses
         status_t setCullingMode(ECullMode mode);
         status_t getCullingMode(ECullMode& mode) const;
         status_t setDrawMode(EDrawMode mode);
+        status_t getDrawMode(EDrawMode& mode) const;
         status_t setColorWriteMask(bool writeRed, bool writeGreen, bool writeBlue, bool writeAlpha);
         status_t getColorWriteMask(bool& writeRed, bool& writeGreen, bool& writeBlue, bool& writeAlpha) const;
         status_t setStencilFunction(EStencilFunc func, uint32_t ref, uint8_t mask);
+        status_t getStencilFunction(EStencilFunc& func, uint32_t& ref, uint8_t& mask) const;
         status_t setStencilOperation(EStencilOperation sfail, EStencilOperation dpfail, EStencilOperation dppass);
+        status_t getStencilOperation(EStencilOperation& sfail, EStencilOperation& dpfail, EStencilOperation& dppass) const;
 
         const Effect& getEffect() const;
 
@@ -255,9 +258,26 @@ namespace ramses
         RAMSES19_LIBRARY_OWNED(Appearance);
     };
 
+    // Mutable geometry a scene keeps: setData writes numberOfBytes at
+    // offsetInBytes, within the size made.
+    class VertexDataBuffer : public SceneObject
+    {
+    public:
+        status_t setData(const char* data, uint32_t numberOfBytes, uint32_t offsetInBytes = 0u);
+        RAMSES19_LIBRARY_OWNED(VertexDataBuffer);
+    };
+    class IndexDataBuffer : public SceneObject
+    {
+    public:
+        status_t setData(const char* data, uint32_t numberOfBytes, uint32_t offsetInBytes = 0u);
+        RAMSES19_LIBRARY_OWNED(IndexDataBuffer);
+    };
+
     class GeometryBinding : public SceneObject
     {
     public:
+        status_t setIndices(const IndexDataBuffer& indicesDataBuffer);
+        status_t setInputBuffer(const AttributeInput& attributeInput, const VertexDataBuffer& dataBuffer, uint32_t instancingDivisor = 0);
         status_t setIndices(const UInt16Array& indicesResource);
         status_t setIndices(const UInt32Array& indicesResource);
         status_t setInputBuffer(const AttributeInput& attributeInput, const FloatArray& resource, uint32_t instancingDivisor = 0);
@@ -314,6 +334,8 @@ namespace ramses
         RenderGroup* createRenderGroup(const char* name = nullptr);
         Appearance* createAppearance(const Effect& effect, const char* name = nullptr);
         GeometryBinding* createGeometryBinding(const Effect& effect, const char* name = nullptr);
+        VertexDataBuffer* createVertexDataBuffer(uint32_t maximumSizeInBytes, EDataType dataType, const char* name = nullptr);
+        IndexDataBuffer* createIndexDataBuffer(uint32_t maximumSizeInBytes, EDataType dataType, const char* name = nullptr);
 
         TextureSampler* createTextureSampler(ETextureAddressMode wrapUMode, ETextureAddressMode wrapVMode,
                                              ETextureSamplingMethod samplingMethod, const Texture2D& texture,
@@ -325,6 +347,9 @@ namespace ramses
                                                ETextureFormat textureFormat, const char* name = nullptr);
         TextureSampler* createTextureSampler(ETextureAddressMode wrapUMode, ETextureAddressMode wrapVMode,
                                              ETextureSamplingMethod samplingMethod, const RenderBuffer& renderBuffer,
+                                             uint32_t anisotropyLevel = 1, const char* name = nullptr);
+        TextureSampler* createTextureSampler(ETextureAddressMode wrapUMode, ETextureAddressMode wrapVMode,
+                                             ETextureSamplingMethod samplingMethod, const TextureCube& texture,
                                              uint32_t anisotropyLevel = 1, const char* name = nullptr);
         // sampleCount 0: not multisampled.
         RenderBuffer* createRenderBuffer(uint32_t width, uint32_t height, ERenderBufferType bufferType,

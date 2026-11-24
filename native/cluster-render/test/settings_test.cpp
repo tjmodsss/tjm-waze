@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 IterioDev */
 /* Host test for the settings (settings.h, config.h): the shipped
- * cluster-render.conf loads with every key known; id8_<name>_<field> taken
+ * cluster-render.conf loads with every key known; instances on by default
+ * on iDrive 7 and off on iDrive 8, as shipped too; id8_<name>_<field> taken
  * for any target name and each generation-8 field, every other unknown key
  * still refused, and by a Config without the family (waze-on-cluster's)
  * too; key += adding each entry once; a target declared by its keys alone
@@ -144,6 +145,16 @@ int main()
         ok("the shipped cluster-render.conf loads", c.load("cluster-render.conf", &err));
         ok("drop_ins as shipped",
            c.str("drop_ins") == "/var/opt/cluster-render/conf.d/*.conf /var/opt/*/current/cluster-render.d/*.conf");
+        ok("instances as shipped: on on iDrive 7, off on iDrive 8",
+           c.num("instancing") == 1 && c.num("id8_instancing") == 0);
+    }
+
+    {
+        cld::Config c;
+        define_keys(&c);
+        ok("instances by default: on on iDrive 7, off on iDrive 8",
+           c.num("instancing") == 1 && c.num("id8_instancing") == 0);
+        ok("instancing = 0 taken", c.set_pair("instancing = 0", &err) && c.num("instancing") == 0);
     }
 
     {

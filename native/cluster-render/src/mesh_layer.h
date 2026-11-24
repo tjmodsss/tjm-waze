@@ -50,16 +50,26 @@ public:
     MeshParams mesh;
 
     /* Part number part (1 or more) drawn by effect, which reads attributes
-     * (kAttr* bits). False with *err when it exists, past kMaxParts, or
-     * refused by the renderer. */
-    bool add_part(uint32_t part, int effect, unsigned attributes, const PartLook &look, std::string *err);
+     * (kAttr* bits), or with effect 0 a pivot, which draws nothing and which
+     * parts follow; following parent, a part made before it (0: the view;
+     * made before, so parents never loop). False with *err, and nothing
+     * made, when it exists, past kMaxParts, its parent is not there, or the
+     * renderer refuses it. */
+    bool add_part(uint32_t part, int effect, unsigned attributes, const PartLook &look, uint32_t parent,
+                  std::string *err);
     bool has_part(uint32_t part) const { return parts_.count(part) != 0; }
+    /* Indices its parts draw (indices times instances), but part except's. */
+    uint64_t drawn_indices(uint32_t except = 0) const;
     /* Bytes the part's geometry holds. */
     size_t part_bytes(uint32_t part) const;
-    /* Replaces the part's geometry. False with *err when it lacks an
-     * attribute the part's vertex shader reads, or the part's last geometry
-     * came less than kGeometryMs ago. */
-    bool set_geometry(uint32_t part, MeshData &&data, int64_t now_ms, std::string *err);
+    /* Replaces the part's geometry. False with *err when its index count
+     * does not fit the part's draw mode, it lacks an attribute the part's
+     * vertex shader reads, the part, the layer or (target_room: what the
+     * target's other mesh layers leave) the target would draw past its
+     * bound (graph.h kMaxPartIndices), or the part's last geometry came less
+     * than kGeometryMs ago. */
+    bool set_geometry(uint32_t part, MeshData &&data, int64_t now_ms, std::string *err,
+                      uint64_t target_room);
     bool set_pose(uint32_t part, const Pose &p);
     /* The part's pose as the client set it. */
     Pose pose(uint32_t part) const;
@@ -67,6 +77,12 @@ public:
     bool set_uniform(uint32_t part, const std::string &name, UniformType t, const float *v, uint32_t elements);
     /* The effects its parts are drawn by. */
     std::vector<int> effects() const;
+    /* The part's effect; 0 for a pivot or no such part. */
+    int part_effect(uint32_t part) const
+    {
+        auto it = parts_.find(part);
+        return it == parts_.end() ? 0 : it->second.effect;
+    }
 
     bool ready(int64_t now_ms) const override;
     bool attach(Graph *g, int64_t now_ms, std::string *err) override;
@@ -78,6 +94,11 @@ public:
     size_t staged_bytes() const override { return staged_; }
     std::string stats() const override;
     int drawable(uint32_t part) const override;
+    Uniforms *uniforms_of(uint32_t part) override
+    {
+        auto it = parts_.find(part);
+        return it == parts_.end() ? nullptr : &it->second.uniforms;
+    }
     std::string refusal() const override { return refusal_; }
 
 protected:
@@ -97,6 +118,8 @@ private:
         bool upload = false;        /* the scene does not have it yet */
         int64_t geometry_ms = -1;   /* when it last came */
         int handle = 0;
+        bool pivot = false;         /* draws nothing (add_part() with no effect) */
+        uint32_t parent = 0;        /* the part it follows; 0: the view */
     };
 
     bool create(uint32_t number, Part &p);

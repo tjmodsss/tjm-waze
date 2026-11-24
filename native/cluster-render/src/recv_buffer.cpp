@@ -3,6 +3,8 @@
 #include "recv_buffer.h"
 
 #include <cstring>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "cluster_render/protocol.h"
@@ -50,13 +52,41 @@ void RecvBuffer::make_room(size_t want)
     end_ = held;
 }
 
-ssize_t RecvBuffer::fill(int fd)
+ssize_t RecvBuffer::fill(int fd, std::deque<int> *fds)
 {
     if (begin_ == end_)
         begin_ = end_ = 0;
     const size_t want = read_size();
     make_room(want);
-    const ssize_t r = read(fd, data_.get() + end_, want);
+    struct iovec iov = {data_.get() + end_, want};
+    union {
+        char buf[CMSG_SPACE(4 * sizeof(int))];
+        struct cmsghdr align;
+    } ctl;
+    struct msghdr mh;
+    std::memset(&mh, 0, sizeof mh);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = ctl.buf;
+    mh.msg_controllen = sizeof ctl.buf;
+#ifdef MSG_CMSG_CLOEXEC
+    const ssize_t r = recvmsg(fd, &mh, MSG_CMSG_CLOEXEC);
+#else
+    const ssize_t r = recvmsg(fd, &mh, 0);
+#endif
+    for (struct cmsghdr *c = r >= 0 ? CMSG_FIRSTHDR(&mh) : nullptr; c; c = CMSG_NXTHDR(&mh, c)) {
+        if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+            continue;
+        const size_t n = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (size_t i = 0; i < n; i++) {
+            int passed;
+            std::memcpy(&passed, CMSG_DATA(c) + i * sizeof(int), sizeof passed);
+            if (fds)
+                fds->push_back(passed);
+            else
+                close(passed);
+        }
+    }
     if (r > 0)
         end_ += (size_t)r;
     return r;

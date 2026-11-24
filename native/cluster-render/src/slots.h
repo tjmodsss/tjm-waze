@@ -182,6 +182,10 @@
  *   DLT daemon turns RAMSES's console off and on while the service runs
  *   (ramses_console.h): a subscription made while it is off is never read,
  *   and such a showing is not verified (Unobservable) rather than released.
+ *   On iDrive 7 the service keeps the console at INFO whatever DLT's level
+ *   (ramses_dlt.h), so a renderer that stops drawing a shown target (seen at
+ *   route starts, the map's renderer unsubscribing while the slot table
+ *   reports it shown) is caught there.
  * - Holds: a target that follows another (TargetSpec::follows) keeps its
  *   slot from the stock HMI while that target is shown and one of its
  *   take_over_contents is mapped in the slot (follow(), which keeps a
@@ -591,6 +595,10 @@ public:
     std::string renderer_text(int64_t now_ms) const;
     /* Milliseconds until the next timer of any target; -1: none. */
     int64_t wake_in_ms(int64_t now_ms) const;
+    /* Every target idle with nothing of it wanted, loaded, kept or waiting
+     * on the display: what changes that comes from a client or the
+     * display, and no timer of the slot manager is running. */
+    bool at_rest() const;
 
     /* Who has content in slot: us only when the target requested with that
      * scene id is the slot's (0x01000400 is the HUD's and, in 0x203, the

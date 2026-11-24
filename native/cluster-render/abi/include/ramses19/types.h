@@ -39,6 +39,25 @@ namespace ramses
     typedef StronglyTypedValue<uint32_t, resourceCacheFlagTag> resourceCacheFlag_t;
     static const resourceCacheFlag_t ResourceCacheFlag_DoNotCache(0u);
 
+    // One mip level of a cube texture: each face's bytes (all six the same
+    // size), then the faces +X, -X, +Y, -Y, +Z, -Z. Upstream's layout;
+    // make test-ramses makes one, the renderer draws each face.
+    struct CubeMipLevelData
+    {
+        CubeMipLevelData(uint32_t size, const uint8_t* px, const uint8_t* nx, const uint8_t* py, const uint8_t* ny,
+                         const uint8_t* pz, const uint8_t* nz)
+            : m_faceDataSize(size), m_dataPX(px), m_dataNX(nx), m_dataPY(py), m_dataNY(ny), m_dataPZ(pz), m_dataNZ(nz)
+        {
+        }
+        uint32_t m_faceDataSize;
+        const uint8_t* m_dataPX;
+        const uint8_t* m_dataNX;
+        const uint8_t* m_dataPY;
+        const uint8_t* m_dataNY;
+        const uint8_t* m_dataPZ;
+        const uint8_t* m_dataNZ;
+    };
+
     struct MipLevelData
     {
         MipLevelData(uint32_t size, const uint8_t* data) : m_size(size), m_data(data) {}
@@ -100,6 +119,18 @@ namespace ramses
         ETextureFormat_SRGB8 = 20,
         ETextureFormat_SRGB8_ALPHA8 = 21
         // 22..49: ASTC RGBA / SRGBA block formats (see ABI.md).
+    };
+
+    // Element types of a scene's data buffers (Scene::createVertexDataBuffer,
+    // createIndexDataBuffer): checked on the unit's library by make test-ramses.
+    enum EDataType
+    {
+        EDataType_UInt16 = 0,
+        EDataType_UInt32,
+        EDataType_Float,
+        EDataType_Vector2F,
+        EDataType_Vector3F,
+        EDataType_Vector4F
     };
 
     enum ETextureAddressMode
@@ -203,13 +234,19 @@ namespace ramses
         EDepthWrite_Enabled = 1
     };
 
+    // The values Appearance::setDrawMode takes (VERIFIED: its table at
+    // 0x69a560 maps 0-4 to the library's internal Points, Lines, Triangles,
+    // TriangleStrip, LineLoop; a new appearance reads back 2 and draws
+    // triangles; 3 draws a strip). getDrawModeString indexes the internal
+    // names with the public value, so its order (Points, Lines, LineLoop,
+    // Triangles, TriangleStrip) is not this one. The same as RAMSES 27's.
     enum EDrawMode
     {
         EDrawMode_Points = 0,
         EDrawMode_Lines = 1,
-        EDrawMode_LineLoop = 2,
-        EDrawMode_Triangles = 3,
-        EDrawMode_TriangleStrip = 4
+        EDrawMode_Triangles = 2,
+        EDrawMode_TriangleStrip = 3,
+        EDrawMode_LineLoop = 4
     };
 
     enum EStencilFunc

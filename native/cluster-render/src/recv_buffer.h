@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include <deque>
 #include <memory>
 
 namespace crs {
@@ -32,8 +33,10 @@ public:
      * (a 1920x720 4:2:0 atlas) and a read. */
     static const size_t kKeep = (2 << 20) + kChunk;
 
-    /* One read(2) from fd into the tail; its result (errno set when < 0). */
-    ssize_t fill(int fd);
+    /* One read from fd into the tail; its result (errno set when < 0). A
+     * descriptor the peer passed with these bytes (SCM_RIGHTS) goes on fds,
+     * close-on-exec; fds null: none taken. */
+    ssize_t fill(int fd, std::deque<int> *fds = nullptr);
     /* The next whole message, its body inside the buffer until the next
      * fill() or settle(); false when none is whole yet, *bad when the bytes
      * cannot start a message (cr::next_message). */

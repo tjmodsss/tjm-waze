@@ -4,6 +4,7 @@
 
 #include <regex.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iterator>
@@ -69,6 +70,8 @@ bool parse_edit(const std::string &line, SceneEdit *out, std::string *err)
         {"--rotate", SceneEdit::Rotate, true, "--rotate NODE_RE=x,y,z"},
         {"--viewport", SceneEdit::Viewport, true, "--viewport CAMERA_RE=x,y,w,h"},
         {"--set", SceneEdit::Set, true, "--set DATA=v[,v..]"},
+        {"--play", SceneEdit::Play, false, "--play SEQUENCE"},
+        {"--skip", SceneEdit::Skip, false, "--skip SEQUENCE"},
     };
     if (line.size() > SceneEdits::kMaxLine) {
         *err = "longer than " + std::to_string(SceneEdits::kMaxLine) + " characters";
@@ -128,8 +131,9 @@ bool parse_edit(const std::string &line, SceneEdit *out, std::string *err)
         *err = "a pattern or name longer than " + std::to_string(SceneEdits::kMaxPattern) + " characters";
         return false;
     }
-    /* Back-references make matching exponential. */
-    for (size_t i = 0; e.op != SceneEdit::Set && i + 1 < e.pattern.size(); i++)
+    /* Back-references make matching exponential; a name is not matched. */
+    const bool named = e.op == SceneEdit::Set || e.op == SceneEdit::Play || e.op == SceneEdit::Skip;
+    for (size_t i = 0; !named && i + 1 < e.pattern.size(); i++)
         if (e.pattern[i] == '\\' && e.pattern[i + 1] >= '1' && e.pattern[i + 1] <= '9') {
             *err = "back-references are not taken";
             return false;
@@ -193,24 +197,31 @@ bool SceneEdits::due() const
     return false;
 }
 
-bool SceneEdits::stage(FileScene *s)
+bool SceneEdits::stage(FileScene *s, int64_t now_ms)
 {
     bool any = false;
-    for (Kept &k : lines_) {
-        if (!k.due)
-            continue;
-        k.due = false;
-        std::string why;
-        if (apply(s, k.e, &why)) {
-            any = true;
+    for (auto it = lines_.begin(); it != lines_.end();) {
+        Kept &k = *it;
+        if (!k.due) {
+            ++it;
             continue;
         }
-        if (reported_.count(k.e.line))
-            continue;
-        if (reported_.size() >= kMaxKept)
-            reported_.clear();
-        reported_.insert(k.e.line);
-        problems_.push_back(EditProblem{k.e.line, quoted(k.e.line) + " changed nothing: " + why});
+        k.due = false;
+        std::string why;
+        if (apply(s, k.e, now_ms, &why)) {
+            any = true;
+        } else if (!reported_.count(k.e.line)) {
+            if (reported_.size() >= kMaxKept)
+                reported_.clear();
+            reported_.insert(k.e.line);
+            problems_.push_back(EditProblem{k.e.line, quoted(k.e.line) + " changed nothing: " + why});
+        }
+        if (k.e.op == SceneEdit::Play || k.e.op == SceneEdit::Skip) {
+            by_key_.erase(cr::edit_key(k.e.line));
+            it = lines_.erase(it);
+        } else {
+            ++it;
+        }
     }
     return any;
 }
@@ -249,10 +260,12 @@ const SceneEdits::Match &SceneEdits::resolve(FileScene *s, FileScene::Kind k, co
     return m;
 }
 
-bool SceneEdits::apply(FileScene *s, const SceneEdit &e, std::string *why)
+bool SceneEdits::apply(FileScene *s, const SceneEdit &e, int64_t now_ms, std::string *why)
 {
     if (e.op == SceneEdit::Set)
         return s->data(e.pattern, e.v, why);
+    if (e.op == SceneEdit::Play || e.op == SceneEdit::Skip)
+        return s->play(e.pattern, e.op == SceneEdit::Skip, now_ms, why);
     const FileScene::Kind kind = e.op == SceneEdit::Uniform    ? FileScene::Mesh
                                  : e.op == SceneEdit::Viewport ? FileScene::Camera
                                  : e.op == SceneEdit::PassOff || e.op == SceneEdit::PassOn ? FileScene::Pass
@@ -286,6 +299,51 @@ bool SceneEdits::apply(FileScene *s, const SceneEdit &e, std::string *why)
     if (!any && why->empty())
         *why = "the renderer refused it";
     return any;
+}
+
+const uint64_t SequenceClock::kMaxLasts;
+
+uint64_t SequenceClock::play(const void *sys, const void *seq, uint64_t at, uint64_t lasts, bool end, int64_t now_ms,
+                             uint64_t *from)
+{
+    auto it = drives_.find(sys);
+    /* Never below the longest a sequence lasts: a skip can always start one
+     * as long ago as it lasts, without moving the others' time. */
+    const uint64_t t = it == drives_.end() ? std::max(at, kMaxLasts) : now(it->second, now_ms);
+    *from = end ? t - std::min(t, lasts) : t;
+    if (it == drives_.end()) {
+        if (*from + lasts <= t)
+            return t;
+        it = drives_.emplace(sys, Drive{t, now_ms, t, {}}).first;
+    }
+    Drive &d = it->second;
+    d.last = t;
+    d.ends.erase(seq);
+    if (*from + lasts > t)
+        d.ends[seq] = *from + lasts;
+    else if (d.ends.empty())
+        drives_.erase(it);
+    return t;
+}
+
+uint64_t SequenceClock::now(const Drive &d, int64_t now_ms)
+{
+    return std::max(d.last, d.base + (uint64_t)std::max<int64_t>(0, now_ms - d.base_ms));
+}
+
+std::vector<std::pair<const void *, uint64_t>> SequenceClock::tick(int64_t now_ms)
+{
+    std::vector<std::pair<const void *, uint64_t>> out;
+    for (auto it = drives_.begin(); it != drives_.end();) {
+        Drive &d = it->second;
+        uint64_t until = 0;
+        for (const auto &e : d.ends)
+            until = std::max(until, e.second);
+        d.last = std::max(d.last, std::min(until, now(d, now_ms)));
+        out.emplace_back(it->first, d.last);
+        it = d.last >= until ? drives_.erase(it) : std::next(it);
+    }
+    return out;
 }
 
 }  // namespace crs

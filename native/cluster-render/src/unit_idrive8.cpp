@@ -4,8 +4,11 @@
  * a RAMSES 27 participant (communication user ramses_user, 801 VERIFIED on
  * the car) whose built-in DCSM provider offers each target's scene to the
  * cluster (dcsm27_port.h). The provider has no file descriptor: its events
- * are dispatched every pass, and the loop wakes at least every
- * kDispatchMs. A target's scene goes once its offer has stopped
+ * are dispatched every pass, and while a content is offered or the service
+ * is not at rest (Service::at_rest) the loop wakes at least every
+ * kDispatchMs. With nothing offered the cluster has nothing of ours to
+ * send, and a client's request wakes the loop on its socket. A target's
+ * scene goes once its offer has stopped
  * (graph_ramses27.h). Any crash on the unit restarts the head unit
  * (VERIFIED on the car), the teardown of RAMSES 27 included: once the
  * offers are stopped and the framework is disconnected, the process leaves
@@ -279,7 +282,9 @@ int start(const cld::Config &cfg, char **)
         fds.push_back(pollfd{sig_fd, POLLIN, 0});
         const size_t first = service.poll_fds(&fds);
         const int timeout = service.timeout_ms(cld::now_ms());
-        const int n = poll(fds.data(), fds.size(), timeout < 0 ? kDispatchMs : std::min(timeout, kDispatchMs));
+        const bool quiet = port.idle() && service.at_rest();
+        const int n = poll(fds.data(), fds.size(),
+                           timeout < 0 ? kDispatchMs : quiet ? timeout : std::min(timeout, kDispatchMs));
         if (n < 0 && errno != EINTR)
             break;
         if (fds[0].revents & POLLIN)

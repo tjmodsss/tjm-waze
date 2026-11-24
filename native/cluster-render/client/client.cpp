@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -44,6 +46,10 @@ Client::~Client()
 {
     if (fd_ >= 0)
         close(fd_);
+    for (auto &kv : shm_)
+        shm_close(&kv.second);
+    if (cur_fd_ >= 0)
+        close(cur_fd_);
 }
 
 void Client::connect_now(int64_t now_ms)
@@ -73,7 +79,10 @@ bool Client::in_canvas(const Layer &l) { return l.kind == "canvas" || l.canvas; 
 bool Client::held(uint32_t ref) const
 {
     auto it = layers_.find(ref);
-    return it != layers_.end() && in_canvas(it->second) && !(ready_ && canvas_);
+    if (it == layers_.end())
+        return false;
+    const Layer &l = it->second;
+    return (in_canvas(l) && !(ready_ && canvas_)) || (texty(l) && !(ready_ && text_));
 }
 
 void Client::queue_for(uint32_t ref, const std::string &json)
@@ -86,26 +95,32 @@ void Client::replay(bool canvases)
 {
     auto drawn_in = [this](uint32_t ref) {
         auto it = layers_.find(ref);
-        return it != layers_.end() && in_canvas(it->second);
+        return it != layers_.end() && late(it->second);
     };
     /* Assets and canvases first, so binds and the layers drawn in a canvas
      * find them; binds and animations once every layer and part is made. */
     for (int pass = 0; pass < 2; pass++)
         for (auto &kv : layers_) {
             Layer &l = kv.second;
-            if (in_canvas(l) != canvases || (l.kind == "asset" || l.kind == "canvas") != (pass == 0))
+            if (late(l) != canvases || (canvases && held(kv.first)) ||
+                (l.kind == "asset" || l.kind == "canvas" || l.kind == "value" || l.kind == "font") != (pass == 0))
                 continue;
             queue(layer_json(kv.first, l));
             if (!l.edits.empty())
                 queue(edits_json(kv.first, l));
             for (const auto &h : l.hosts)
                 queue(h.second);
-            for (const auto &p : l.parts) {
-                queue(p.second.json);
-                if (!p.second.geometry.empty())
-                    queue_message(p.second.geometry);
-                if (!p.second.transform.empty())
-                    queue(p.second.transform);
+            /* in the order they were made: a parent before what follows it */
+            std::vector<const Part *> parts;
+            for (const auto &p : l.parts)
+                parts.push_back(&p.second);
+            std::sort(parts.begin(), parts.end(), [](const Part *a, const Part *b) { return a->made < b->made; });
+            for (const Part *p : parts) {
+                queue(p->json);
+                if (!p->geometry.empty())
+                    queue_message(p->geometry);
+                if (!p->transform.empty())
+                    queue(p->transform);
             }
             for (const auto &u : l.uniforms)
                 queue(u.second);
@@ -115,12 +130,17 @@ void Client::replay(bool canvases)
                 l.dirty_bytes = 0;
             }
         }
-    for (const auto &kv : layers_)
+    for (const auto &kv : layers_) {
         for (const auto &b : kv.second.binds)
-            if ((in_canvas(kv.second) || drawn_in(b.second.first)) == canvases)
+            if ((late(kv.second) || drawn_in(b.second.first)) == canvases && !held(kv.first) &&
+                !held(b.second.first))
                 queue(b.second.second);
+        for (const auto &b : kv.second.links)
+            if (late(kv.second) == canvases && !held(kv.first))
+                queue(b.second.second);
+    }
     for (const auto &kv : layers_)
-        if (in_canvas(kv.second) == canvases)
+        if (late(kv.second) == canvases && !held(kv.first))
             for (const auto &a : kv.second.animations)
                 queue(a.second);
 }
@@ -141,7 +161,14 @@ void Client::disconnect(int64_t now_ms)
         keep_last(f.first, &f.second.px);
     for (auto &kv : layers_)
         kv.second.sent = false;
-    repeats_ = always_packed_ = preload_ = others_fps_ = render_state_ = samplers_ = host_layers_ = canvas_ = false;
+    repeats_ = always_packed_ = preload_ = others_fps_ = render_state_ = samplers_ = host_layers_ = canvas_ = curves_ = nodes_ = draw_ = instances_ = cube_ = values_ = shm_frames_ = scene_anim_ = over_order_ = text_ = false;
+    for (auto &kv : shm_)
+        shm_close(&kv.second);
+    shm_.clear();
+    shm_due_.clear();
+    if (cur_fd_ >= 0)
+        close(cur_fd_);
+    cur_fd_ = -1;
     if (fps_cap) {
         fps_cap = 0;
         fps_cap_app.clear();
@@ -227,6 +254,20 @@ void Client::read_events()
             samplers_ = j["samplers"] == "1";
             host_layers_ = j["host_layers"] == "1";
             canvas_ = j["canvas"] == "1";
+            curves_ = j["curves"] == "1";
+            nodes_ = j["nodes"] == "1";
+            draw_ = j["draw"] == "1";
+            instances_ = j["instances"] == "1";
+            cube_ = j["cube"] == "1";
+            values_ = j["values"] == "1";
+            shm_frames_ = j["shm_frames"] == "1";
+            if (shm_frames_)
+                for (const auto &kv : layers_)
+                    if (kv.second.kind == "video" && !held(kv.first))
+                        shm_due_.insert(kv.first);
+            scene_anim_ = j["scene_anim"] == "1";
+            text_ = j["text"] == "1";
+            over_order_ = j["over_order"] == "1";
             ready_ = true;
             backoff_ = 0;
             /* after the layers, which went at connect */
@@ -234,11 +275,16 @@ void Client::read_events()
                 for (const auto &kv : layer_hosts_)
                     queue(kv.second.second);
             /* Canvases and the layers drawn in them only to a service that
-             * takes them: an older one would draw such a layer on screen. */
-            if (canvas_)
+             * takes them: an older one would draw such a layer on screen;
+             * fonts and text layers likewise. */
+            if (canvas_ || text_)
                 replay(true);
             if (on_ready)
                 on_ready();
+        } else if (ev == "shm") {
+            auto m = shm_.find((uint32_t)std::strtoul(j["ref"].c_str(), nullptr, 10));
+            if (m != shm_.end())
+                m->second.state = j["ok"] == "1" ? Shm::Ok : Shm::Refused;
         } else if (ev == "layer" && on_layer) {
             on_layer((uint32_t)std::strtoul(j["ref"].c_str(), nullptr, 10), j["state"], j["reason"]);
         } else if (ev == "target") {
@@ -324,14 +370,24 @@ void Client::write_out()
                 ctl_.pop_front();
             } else if (ready_ && next_image(&cur_)) {
                 /* an image layer's changes */
+            } else if (ready_ && next_shm()) {
+                /* a video layer's shared buffer */
             } else if (!frames_.empty()) {
                 /* Round robin over the layers with a frame waiting. */
                 auto it = frames_.upper_bound(last_frame_ref_);
                 if (it == frames_.end())
                     it = frames_.begin();
                 last_frame_ref_ = it->first;
-                cur_.swap(it->second.head);
-                cur_px_.swap(it->second.px);
+                if (shm_frame(it->first, it->second.px)) {
+                    /* copied into a slot: sent as soon as its message is */
+                    auto l = layers_.find(it->first);
+                    if (l != layers_.end())
+                        l->second.sent = true;
+                    keep_last(it->first, &it->second.px);
+                } else {
+                    cur_.swap(it->second.head);
+                    cur_px_.swap(it->second.px);
+                }
                 frames_.erase(it);
             } else {
                 return;
@@ -350,11 +406,37 @@ void Client::write_out()
             iov[mh.msg_iovlen].iov_base = cur_px_.data() + px_off;
             iov[mh.msg_iovlen++].iov_len = cur_px_.size() - px_off;
         }
+        union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } ctl;
+        const bool with_fd = cur_fd_ >= 0 && cur_off_ == 0;
+        if (with_fd) {
+            mh.msg_control = ctl.buf;
+            mh.msg_controllen = sizeof ctl.buf;
+            struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+            c->cmsg_level = SOL_SOCKET;
+            c->cmsg_type = SCM_RIGHTS;
+            c->cmsg_len = CMSG_LEN(sizeof(int));
+            std::memcpy(CMSG_DATA(c), &cur_fd_, sizeof(int));
+        }
         ssize_t w = ::sendmsg(fd_, &mh, kSendFlags);
+        if (w < 0 && with_fd && errno != EAGAIN && errno != EINTR) {
+            /* The descriptor not taken: the message goes without it, the
+             * service refuses it, and frames go whole on this connection. */
+            close(cur_fd_);
+            cur_fd_ = -1;
+            shm_frames_ = false;
+            continue;
+        }
         if (w < 0) {
             if (errno != EAGAIN && errno != EINTR)
                 disconnect(0);
             return;
+        }
+        if (with_fd && w > 0) {
+            close(cur_fd_);   /* the service has its own now; the mapping stays */
+            cur_fd_ = -1;
         }
         cur_off_ += (size_t)w;
     }
@@ -461,12 +543,18 @@ void look_fields(std::vector<std::pair<std::string, std::string>> *kv, const Ren
         kv->push_back({"stencil_ref", std::to_string(r.stencil_ref)});
     if (r.stencil_mask >= 0)
         kv->push_back({"stencil_mask", std::to_string(r.stencil_mask)});
+    if (!r.draw.empty())
+        kv->push_back({"draw", json_quote(r.draw)});
+    if (r.instances)
+        kv->push_back({"instances", std::to_string(r.instances)});
 }
 
 }  // namespace
 
 std::string Client::layer_json(uint32_t ref, const Layer &l) const
 {
+    if (l.kind == "value" || l.kind == "font")
+        return l.value;
     if (l.kind == "scene") {
         std::string res, sha;
         for (const std::string &r : l.so.res)
@@ -484,6 +572,8 @@ std::string Client::layer_json(uint32_t ref, const Layer &l) const
             kv.push_back({"layers", "1"});
         if (l.so.layers && l.so.layers_order_set)
             kv.push_back({"layers_order", num(l.so.layers_order)});
+        if (l.so.layers && l.so.over_order_set)
+            kv.push_back({"over_order", num(l.so.over_order)});
         return json_object(kv);
     }
     if (l.kind == "asset") {
@@ -504,6 +594,8 @@ std::string Client::layer_json(uint32_t ref, const Layer &l) const
             kv.push_back({"wrap_v", json_quote(l.sampler.wrap_v)});
         if (l.sampler.anisotropy)
             kv.push_back({"anisotropy", num(l.sampler.anisotropy)});
+        if (l.cube)
+            kv.push_back({"cube", "1"});
         return json_object(kv);
     }
     if (l.kind == "canvas") {
@@ -551,6 +643,12 @@ std::string Client::layer_json(uint32_t ref, const Layer &l) const
         turn_fields(&kv, l.lo);
     } else if (l.kind == "mesh") {
         mesh_fields(&kv, l.mo);
+    } else if (l.kind == "text") {
+        kv.push_back({"font", num(l.font)});
+        kv.push_back({"max", num(l.to.max)});
+        text_fields(&kv, l.to);
+        kv.push_back({"text", json_quote(l.text)});
+        turn_fields(&kv, l.lo);
     } else {
         kv.push_back({"fs", json_quote(l.eo.fs)});
         if (!l.eo.vs.empty())
@@ -578,6 +676,8 @@ uint32_t Client::add(const Layer &l)
     const uint32_t ref = next_ref_++;
     layers_[ref] = l;
     queue_for(ref, layer_json(ref, l));
+    if (shm_frames_ && l.kind == "video" && !held(ref))
+        shm_due_.insert(ref);
     if (fd_ >= 0)
         write_out();
     return ref;
@@ -629,6 +729,122 @@ uint32_t Client::effect(const LayerOptions &lo, const EffectOptions &eo, bool cl
     l.cluster_time = cluster_time;
     l.look = look;
     return add(l);
+}
+
+uint32_t Client::font(uint32_t asset, const FontOptions &fo)
+{
+    auto a = layers_.find(asset);
+    if (a == layers_.end() || a->second.kind != "asset" || !a->second.ao.r8 || a->second.cube || !fo.line ||
+        fo.glyphs.empty())
+        return 0;
+    Layer l;
+    l.kind = "font";
+    l.lo.target = a->second.ao.target;
+    l.font = asset;
+    std::vector<std::pair<std::string, std::string>> kv = {
+        {"op", json_quote("font")}, {"ref", num(next_ref_)},           {"asset", num(asset)},
+        {"line", num(fo.line)},     {"glyphs", json_quote(fo.glyphs)}};
+    if (fo.sdf)
+        kv.push_back({"sdf", num(fo.sdf)});
+    if (!fo.kerning.empty())
+        kv.push_back({"kerning", json_quote(fo.kerning)});
+    l.value = json_object(kv);
+    return add(l);
+}
+
+uint32_t Client::font(const std::string &target, unsigned w, unsigned h, const uint8_t *px, const FontOptions &fo)
+{
+    if (!fo.line || fo.glyphs.empty() || !w || !h || w > 2048 || h > 2048 || (size_t)w * h + 64 > kMaxMessage)
+        return 0;
+    Layer a;
+    a.kind = "asset";
+    a.ao.target = target;
+    a.ao.r8 = true;
+    a.ao.w = w;
+    a.ao.h = h;
+    a.ao.bilinear = true;
+    a.w = w;
+    a.h = h;
+    a.bpp = 1;
+    a.atlas = true;
+    a.image.assign(px, px + (size_t)w * h);
+    a.whole = a.have = true;
+    const uint32_t atlas = add(a);
+    const uint32_t ref = font(atlas, fo);
+    if (!ref) {
+        drop(atlas);
+        return 0;
+    }
+    layers_[ref].owns = true;
+    return ref;
+}
+
+void Client::text_fields(std::vector<std::pair<std::string, std::string>> *kv, const TextLayerOptions &to)
+{
+    kv->push_back({"align", json_quote(to.align)});
+    kv->push_back({"spacing", num(to.spacing)});
+    kv->push_back({"size", num(to.size)});
+    kv->push_back({"color", json_quote(num(to.color[0]) + " " + num(to.color[1]) + " " + num(to.color[2]) + " " +
+                                       num(to.color[3]))});
+}
+
+namespace {
+
+/* A text layer's string as the service takes it. */
+bool text_ok(const std::string &text) { return text.size() <= kMaxTextBytes && utf8_ok(text); }
+
+bool text_options_ok(const TextLayerOptions &to)
+{
+    bool ok = to.max >= 1 && to.max <= 256 && (to.align == "left" || to.align == "center" || to.align == "right") &&
+              std::isfinite(to.spacing) && to.spacing >= -1024 && to.spacing <= 1024 && std::isfinite(to.size) &&
+              to.size >= 0 && to.size <= 2048;
+    for (float c : to.color)
+        ok = ok && c >= 0 && c <= 1;
+    return ok;
+}
+
+}  // namespace
+
+uint32_t Client::text(const LayerOptions &lo, uint32_t font, const TextLayerOptions &to, const std::string &text)
+{
+    auto f = layers_.find(font);
+    if (f == layers_.end() || f->second.kind != "font" || !text_options_ok(to) || !text_ok(text))
+        return 0;
+    Layer l;
+    l.kind = "text";
+    l.lo = lo;
+    l.font = font;
+    l.to = to;
+    l.text = text;
+    return add(l);
+}
+
+bool Client::set_text(uint32_t ref, const std::string &text)
+{
+    auto it = layers_.find(ref);
+    if (it == layers_.end() || it->second.kind != "text" || !text_ok(text))
+        return false;   /* the last string taken stays */
+    if (it->second.text == text)
+        return true;
+    it->second.text = text;
+    queue_for(ref, json_object({{"op", json_quote("text")}, {"ref", num(ref)}, {"text", json_quote(text)}}));
+    send_now();
+    return true;
+}
+
+bool Client::set_text_style(uint32_t ref, const TextLayerOptions &to)
+{
+    auto it = layers_.find(ref);
+    if (it == layers_.end() || it->second.kind != "text" || !text_options_ok(to))
+        return false;
+    const unsigned max = it->second.to.max;   /* set when it is made */
+    it->second.to = to;
+    it->second.to.max = max;
+    std::vector<std::pair<std::string, std::string>> kv = {{"op", json_quote("text")}, {"ref", num(ref)}};
+    text_fields(&kv, to);
+    queue_for(ref, json_object(kv));
+    send_now();
+    return true;
 }
 
 uint32_t Client::canvas(const CanvasOptions &co)
@@ -696,6 +912,24 @@ uint32_t Client::asset(const AssetOptions &ao, const SamplerOptions &so)
     l.h = ao.h;
     l.bpp = ao.r8 ? 1 : 4;
     if (!l.w || !l.h || l.w > 2048 || l.h > 2048 || (size_t)l.w * l.h * l.bpp + 64 > kMaxMessage)
+        return 0;
+    l.image.assign((size_t)l.w * l.h * l.bpp, 0);
+    return add(l);
+}
+
+uint32_t Client::cube(const AssetOptions &ao, const SamplerOptions &so)
+{
+    Layer l;
+    l.kind = "asset";
+    l.ao = ao;
+    l.ao.h = ao.w;
+    l.sampler = so;
+    l.cube = true;
+    /* the six faces as one image of six rows of faces */
+    l.w = ao.w;
+    l.h = ao.w * 6;
+    l.bpp = ao.r8 ? 1 : 4;
+    if (!l.w || l.w > 2048 || (size_t)l.w * l.h * l.bpp + 64 > kMaxMessage)
         return 0;
     l.image.assign((size_t)l.w * l.h * l.bpp, 0);
     return add(l);
@@ -799,7 +1033,7 @@ void Client::edit(uint32_t ref, const std::string &lines)
         at = nl + 1;
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        if (!line.empty())
+        if (!line.empty() && !edit_once(line))
             it->second.edits[edit_key(line)] = std::make_pair(++edits_, line);
     }
     queue(json_object({{"op", json_quote("edit")}, {"ref", num(ref)}, {"lines", json_quote(lines)}}));
@@ -925,21 +1159,39 @@ bool Client::part(uint32_t ref, uint32_t part, const PartOptions &po)
 
 bool Client::part(uint32_t ref, uint32_t part, const PartOptions &po, const RenderState &look)
 {
-    auto it = layers_.find(ref);
-    if (it == layers_.end() || it->second.kind != "mesh" || !part || it->second.parts.count(part))
-        return false;
-    Part &p = it->second.parts[part];
-    std::vector<std::pair<std::string, std::string>> kv = {{"op", json_quote("part")},
-                                                           {"ref", num(ref)},
-                                                           {"part", num(part)},
-                                                           {"vs", json_quote(po.vs)},
+    return this->part(ref, part, po, look, 0);
+}
+
+bool Client::pivot(uint32_t ref, uint32_t part, uint32_t parent)
+{
+    return add_part(ref, part, parent, {{"node", "1"}});
+}
+
+bool Client::part(uint32_t ref, uint32_t part, const PartOptions &po, const RenderState &look, uint32_t parent)
+{
+    std::vector<std::pair<std::string, std::string>> kv = {{"vs", json_quote(po.vs)},
                                                            {"fs", json_quote(po.fs)},
                                                            {"depth", flag(po.depth)},
                                                            {"cull", json_quote(po.cull)}};
     if (look.blend.empty())
         kv.push_back({"blend", json_quote(po.blend)});
     look_fields(&kv, look);
-    p.json = json_object(kv);
+    return add_part(ref, part, parent, kv);
+}
+
+bool Client::add_part(uint32_t ref, uint32_t part, uint32_t parent,
+                      std::vector<std::pair<std::string, std::string>> fields)
+{
+    auto it = layers_.find(ref);
+    if (it == layers_.end() || it->second.kind != "mesh" || !part || it->second.parts.count(part) ||
+        (parent && !it->second.parts.count(parent)))
+        return false;
+    Part &p = it->second.parts[part];
+    p.made = ++parts_made_;
+    fields.insert(fields.begin(), {{"op", json_quote("part")}, {"ref", num(ref)}, {"part", num(part)}});
+    if (parent)
+        fields.push_back({"parent", num(parent)});
+    p.json = json_object(fields);
     queue_for(ref, p.json);
     send_now();
     return true;
@@ -953,7 +1205,7 @@ bool Client::geometry(uint32_t ref, uint32_t part, const Geometry &g)
     const size_t v = g.positions.size() / 3;
     if (g.positions.size() % 3 || v < 1 || v > kMaxMeshVertices || (!g.normals.empty() && g.normals.size() != v * 3) ||
         (!g.texcoords.empty() && g.texcoords.size() != v * 2) || (!g.colors.empty() && g.colors.size() != v * 4) ||
-        g.indices.size() < 3 || g.indices.size() % 3 || g.indices.size() > kMaxMeshIndices)
+        g.indices.empty() || g.indices.size() > kMaxMeshIndices)
         return false;
     for (uint16_t i : g.indices)
         if (i >= v)
@@ -997,6 +1249,11 @@ uint32_t Client::animate(uint32_t ref, const AnimationOptions &a)
 
 uint32_t Client::animate(uint32_t ref, const AnimationOptions &a, uint32_t again)
 {
+    return animate(ref, a, again, a.step ? "step" : "linear");
+}
+
+uint32_t Client::animate(uint32_t ref, const AnimationOptions &a, uint32_t again, const std::string &interp)
+{
     auto it = layers_.find(ref);
     if (it == layers_.end() || a.property.empty() || a.keys.empty() ||
         (again && !it->second.animations.count(again)))
@@ -1006,7 +1263,7 @@ uint32_t Client::animate(uint32_t ref, const AnimationOptions &a, uint32_t again
         {"op", json_quote("animate")},       {"ref", num(ref)},
         {"anim", num(anim)},                 {"property", json_quote(a.property)},
         {"keys", json_quote(a.keys)},        {"loop", flag(a.loop)},
-        {"interp", json_quote(a.step ? "step" : "linear")}};
+        {"interp", json_quote(interp.empty() ? (a.step ? "step" : "linear") : interp)}};
     if (a.part)
         kv.push_back({"part", num(a.part)});
     if (!a.name.empty())
@@ -1027,6 +1284,75 @@ void Client::stop(uint32_t ref, uint32_t anim)
     send_now();
 }
 
+/* A value's message: its target, type (by width) and v; empty when v is not
+ * width finite numbers, as the service would refuse it. */
+static std::string value_json(uint32_t ref, const std::string &target, size_t width, const std::vector<float> &v)
+{
+    static const char *const names[] = {"float", "vec2", "vec3", "vec4"};
+    if (width < 1 || width > 4 || v.size() != width)
+        return std::string();
+    std::string vs;
+    for (float x : v) {
+        if (!std::isfinite(x))
+            return std::string();
+        vs += (vs.empty() ? "" : " ") + num(x);
+    }
+    return json_object({{"op", json_quote("value")}, {"ref", num(ref)}, {"target", json_quote(target)},
+                        {"type", json_quote(names[width - 1])}, {"v", json_quote(vs)}});
+}
+
+uint32_t Client::value(const std::string &target, UniformType type, const std::vector<float> &v)
+{
+    const std::string m = value_json(next_ref_, target, (size_t)type + 1, v);
+    if (m.empty())
+        return 0;
+    Layer l;
+    l.kind = "value";
+    l.lo.target = target;
+    l.w = (unsigned)v.size();
+    l.value = m;
+    const uint32_t ref = next_ref_++;
+    layers_[ref] = l;
+    queue(l.value);
+    send_now();
+    return ref;
+}
+
+bool Client::set_value(uint32_t value, const std::vector<float> &v)
+{
+    auto it = layers_.find(value);
+    const std::string m = it == layers_.end() || it->second.kind != "value"
+                              ? std::string()
+                              : value_json(value, it->second.lo.target, it->second.w, v);
+    if (m.empty())
+        return false;   /* kept as it was, for a reconnect */
+    it->second.value = m;
+    queue(m);
+    send_now();
+    return true;
+}
+
+bool Client::link(uint32_t ref, const std::string &uniform, uint32_t value, uint32_t part)
+{
+    auto it = layers_.find(ref);
+    auto v = layers_.find(value);
+    if (it == layers_.end() || (it->second.kind != "effect" && it->second.kind != "mesh") || uniform.empty() ||
+        (value && (v == layers_.end() || v->second.kind != "value")))
+        return false;
+    std::vector<std::pair<std::string, std::string>> kv = {{"op", json_quote("link")}, {"ref", num(ref)},
+                                                           {"name", json_quote(uniform)}, {"value", num(value)}};
+    if (part)
+        kv.push_back({"part", num(part)});
+    const std::string m = json_object(kv);
+    if (value)
+        it->second.links[std::make_pair(part, uniform)] = std::make_pair(value, m);
+    else
+        it->second.links.erase(std::make_pair(part, uniform));
+    queue_for(ref, m);
+    send_now();
+    return true;
+}
+
 void Client::request_status()
 {
     queue(json_object({{"op", json_quote("status")}}));
@@ -1041,20 +1367,34 @@ void Client::drop(uint32_t ref)
         return;
     const bool hold = held(ref);   /* never sent: nothing to drop */
     bool sampled = false;
-    for (const auto &kv : layers_) {
+    for (auto &kv : layers_) {
         for (const auto &b : kv.second.binds)
             sampled = sampled || b.second.first == ref;
         sampled = sampled || kv.second.canvas == ref;   /* a canvas with layers in it */
+        /* a font a text layer draws from, an asset a font is over */
+        sampled = sampled || ((kv.second.kind == "text" || kv.second.kind == "font") && kv.second.font == ref);
+        /* a value dropped: the service undoes its links */
+        for (auto b = kv.second.links.begin(); b != kv.second.links.end();)
+            b = b->second.first == ref ? kv.second.links.erase(b) : std::next(b);
     }
     if (it->second.kind == "video")
         spare_.clear();   /* buffers of its size may be needed no more */
+    const uint32_t atlas = it->second.kind == "font" && it->second.owns ? it->second.font : 0;
     if (!sampled)
         layers_.erase(it);
     frames_.erase(ref);
     repeats_due_.erase(ref);
+    shm_due_.erase(ref);
+    auto sm = shm_.find(ref);
+    if (sm != shm_.end()) {
+        shm_close(&sm->second);   /* a "shm" message on its way still goes with its descriptor */
+        shm_.erase(sm);
+    }
     if (!hold)
         queue(json_object({{"op", json_quote("drop")}, {"ref", num(ref)}}));
     send_now();
+    if (atlas && !sampled)
+        drop(atlas);   /* the atlas the font owns goes with it */
 }
 
 size_t Client::frame_bytes(uint32_t ref) const
@@ -1098,6 +1438,64 @@ void Client::keep_last(uint32_t ref, std::vector<uint8_t> *px)
         spare_.push_back(std::move(*px));
     }
     px->clear();
+}
+
+void Client::shm_close(Shm *m)
+{
+    if (m->map)
+        munmap(m->map, m->size);
+    m->map = nullptr;
+}
+
+bool Client::next_shm()
+{
+    while (!shm_due_.empty()) {
+        const uint32_t ref = *shm_due_.begin();
+        shm_due_.erase(shm_due_.begin());
+        const size_t slot = frame_bytes(ref);
+        if (!slot || held(ref) || shm_.count(ref))
+            continue;
+#ifdef __linux__
+        Shm m;
+        m.slots = kShmSlots;
+        m.slot_bytes = slot;
+        m.size = kShmHeader + m.slots * slot;
+        const int fd = memfd_create("cluster-render-frames", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        void *p = MAP_FAILED;
+        if (fd >= 0 && ftruncate(fd, (off_t)m.size) == 0 &&
+            fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) == 0)
+            p = mmap(nullptr, m.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) {
+            if (fd >= 0)
+                close(fd);
+            continue;   /* its frames go whole */
+        }
+        m.map = static_cast<uint8_t *>(p);
+        shm_[ref] = m;
+        cur_ = encode(kJson, json_object({{"op", json_quote("shm")}, {"ref", num(ref)}, {"slots", num(m.slots)}}));
+        cur_fd_ = fd;
+        return true;
+#endif
+    }
+    return false;
+}
+
+bool Client::shm_frame(uint32_t ref, const std::vector<uint8_t> &px)
+{
+    auto it = shm_.find(ref);
+    if (it == shm_.end() || it->second.state != Shm::Ok || px.size() != it->second.slot_bytes)
+        return false;
+    Shm &m = it->second;
+    uint32_t *busy = reinterpret_cast<uint32_t *>(m.map);
+    for (unsigned k = 0; k < m.slots; k++) {
+        if (__atomic_load_n(busy + k, __ATOMIC_ACQUIRE) != 0)
+            continue;   /* the service has not copied its frame out yet */
+        busy[k] = 1;
+        std::memcpy(m.map + kShmHeader + (size_t)k * m.slot_bytes, px.data(), px.size());
+        cur_ = encode(kJson, json_object({{"op", json_quote("slot")}, {"ref", num(ref)}, {"slot", num(k)}}));
+        return true;
+    }
+    return false;
 }
 
 bool Client::frame(uint32_t ref, const uint8_t *atlas, size_t n, uint64_t id)
@@ -1190,6 +1588,9 @@ bool Client::pixels(uint32_t ref, const std::vector<FrameRect> &rects, const uin
         return false;
     Layer &l = it->second;
     const unsigned w = l.w, h = l.h, bpp = l.bpp;
+    /* a cube map is sent whole and once, as the service takes it */
+    if (l.cube && (!rects.empty() || l.have))
+        return false;
     if (rects.empty()) {
         if (n != l.image.size())
             return false;
@@ -1237,7 +1638,7 @@ bool Client::next_image(std::string *msg)
 {
     for (auto &kv : layers_) {
         Layer &l = kv.second;
-        if ((l.kind != "image" && l.kind != "asset") || (!l.whole && l.dirty.empty()))
+        if ((l.kind != "image" && l.kind != "asset") || (!l.whole && l.dirty.empty()) || held(kv.first))
             continue;
         std::vector<FrameRect> rects = l.whole ? std::vector<FrameRect>() : l.dirty;
         size_t n = 0;

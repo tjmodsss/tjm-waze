@@ -29,8 +29,10 @@
  * one sent with its chain, and a factor the service lacks refused; a
  * canvas drawn in with stencil state and sampled on screen; to a service
  * without canvases (a rollback) nothing of a canvas sent, all of it to one
- * that takes them;
- * close() and connect() in one tick making one connection. */
+ * that takes them; a shared value a layer's uniform follows, set and
+ * animated; a pivot, a part following it and an eased animation; a font
+ * and text layers drawn by the service, a line of 64 glyphs one message of
+ * its string; close() and connect() in one tick making one connection. */
 'use strict';
 
 const assert = require('assert');
@@ -40,6 +42,7 @@ const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const { ClusterRender } = require('../cluster_render_client.js');
+const { Font, Text } = require('../cluster_render_text.js');
 
 const bin = process.argv[2];
 const sock = '/tmp/crs-js-test-' + process.pid + '.sock';
@@ -219,10 +222,14 @@ async function main() {
         await until(() => eo.layer[gauge] === 'shown' && eo.layer[label] === 'waiting', 3000));
     ok('its edits kept by key, the latest last',
         Array.from(ovl.layers.get(gauge).edits.values()).join('|') === '--hide ^quad$|--rotate ^needle_pivot$=0,0,45');
-    ovl.edit(gauge, '--spin x\n--show ^nothing$');
+    ovl.edit(gauge, '--spin x\n--show ^nothing$\n--play nowhere');
     ok('a malformed line refused, one that changes nothing reported, both named',
         await until(() => eo.refused.some((r) => r.indexOf('edit: \'--spin x\'') === 0) &&
             eo.refused.some((r) => r.indexOf('edit: \'--show ^nothing$\' changed nothing') === 0), 1000));
+    ok('--play: the hello says the service takes it; an unknown sequence reported; the line not kept',
+        ovl.sceneAnim === true &&
+        await until(() => eo.refused.some((r) => r === 'edit: \'--play nowhere\' changed nothing: no animation sequence nowhere'), 1000) &&
+        !Array.from(ovl.layers.get(gauge).edits.values()).some((l) => l.indexOf('--play') === 0));
     ovl.drop(gauge);
     ok('dropped: the layers there shown again', await until(() => eo.layer[label] === 'shown', 3000));
     const hosted = [];
@@ -424,8 +431,184 @@ async function main() {
     ok('canvas: dropping it with a layer in it refused, kept here',
         await until(() => eo.refused.some((r) => r.indexOf('drop: canvas in use') === 0), 1000) && ovl.layers.has(cv));
     [inCv, onScreen, cv].forEach((r) => ovl.drop(r));
+
+    /* Pivots, parents and eased curves. */
+    ok('motion: the hello says the service takes curves and pivots', ovl.curves === true && ovl.nodes === true);
+    const rig = ovl.mesh({ target: 'panel', x: 500, y: 0, w: 200, h: 200, cz: 5 });
+    const plainVs = 'attribute vec3 a_position;uniform mat4 u_mvp;void main(){gl_Position=u_mvp*vec4(a_position,1.0);}';
+    ok('motion: a pivot and a part following it',
+        ovl.part(rig, 3, { node: true }) && ovl.part(rig, 1, { vs: plainVs, fs: 'void main(){gl_FragColor=vec4(1.0);}', parent: 3 }));
+    ok('motion: a parent not made refused here', !ovl.part(rig, 2, { vs: plainVs, fs: 'void main(){}', parent: 9 }));
+    ovl.geometry(rig, 1, { positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] });
+    ovl.animate(rig, { part: 3, property: 'rotate', keys: '0:0,0,0 1000:0,90,0', interp: 'ease_in_out', loop: true });
+    ok('motion: shown, nothing refused', await until(() => eo.layer[rig] === 'shown', 3000) &&
+        eo.refused.length === refusedBefore + 2);
+    ovl.drop(rig);
+
+    /* Draw modes and instances. */
+    ok('draw: the hello says the service takes draw modes and instances', ovl.draw === true && ovl.instances === true);
+    const many = ovl.mesh({ target: 'panel', x: 300, y: 300, w: 50, h: 50, cz: 5 });
+    ovl.part(many, 1, { vs: 'attribute vec3 a_position;uniform mat4 u_mvp;void main(){gl_Position=u_mvp*vec4(a_position,1.0);}',
+        fs: 'void main(){gl_FragColor=vec4(1.0);}', instances: 4 });
+    ovl.geometry(many, 1, { positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] });
+    ok('draw: a part of 4 instances: shown', await until(() => eo.layer[many] === 'shown', 3000) &&
+        !eo.refused.some((r) => r.indexOf('part: instances are off') === 0));
+    ovl.drop(many);
+    const pts = ovl.mesh({ target: 'panel', x: 0, y: 300, w: 200, h: 200, cz: 5 });
+    ovl.part(pts, 1, { vs: '#version 300 es\nin vec3 a_position;uniform mat4 u_mvp;void main(){gl_PointSize=2.0;' +
+        'gl_Position=u_mvp*vec4(a_position+vec3(float(gl_InstanceID)*0.1,0.0,0.0),1.0);}',
+        fs: '#version 300 es\nprecision mediump float;out vec4 o;void main(){o=vec4(1.0);}', draw: 'points' });
+    ovl.geometry(pts, 1, { positions: [0, 0, 0], indices: [0] });
+    ok('draw: points from a GLSL ES 3.00 shader, one vertex: shown',
+        await until(() => eo.layer[pts] === 'shown', 3000));
+    ovl.drop(pts);
+
+    /* A cube map. */
+    ok('cube: the hello says the service takes cube maps', ovl.cubeMaps === true);
+    const sky = ovl.asset({ target: 'panel', w: 8, h: 8, cube: true, sampling: 'bilinear' });
+    ok('cube: its six faces taken here, not a rect', sky > 0 && ovl.pixels(sky, null, Buffer.alloc(6 * 8 * 8 * 4, 80)) &&
+        !ovl.pixels(sky, [{ x: 0, y: 0, w: 1, h: 1 }], Buffer.alloc(4)));
+    ok('cube: a second whole send refused here, the first kept for a reconnect',
+        !ovl.pixels(sky, null, Buffer.alloc(6 * 8 * 8 * 4, 99)) && ovl.layers.get(sky).image[0] === 80);
+    const env = ovl.effect({ target: 'panel', x: 0, y: 0, w: 32, h: 32,
+        fs: 'precision mediump float;uniform samplerCube u_sky;varying vec2 v_uv;' +
+            'void main(){gl_FragColor=textureCube(u_sky,vec3(v_uv*2.0-1.0,1.0));}' });
+    ovl.bind(env, 'u_sky', sky);
+    status = '';
+    ovl.status();
+    ok('cube: shown, the status names it', await until(() => eo.layer[env] === 'shown', 3000) &&
+        await until(() => status.indexOf('8x8 (cube map)') >= 0, 1000) &&
+        !eo.refused.slice(refusedBefore).some((r) => /^(asset|bind)/.test(r)));
+    ovl.drop(env);
+    ovl.drop(sky);
     [glow, gear, bad, dial, sheet].forEach((r) => ovl.drop(r));
     eo.refused.length = refusedBefore;   /* the bad one's and the drop's refusals, expected */
+
+    /* Shared values (PROTOCOL.md "Shared values"). */
+    ok('values: the hello says the service takes them', ovl.values === true);
+    const lvl = ovl.value({ target: 'panel', v: 0.5 });
+    const fxA = ovl.effect({ target: 'panel', klass: 'overlay', x: 0, y: 0, w: 16, h: 16,
+        fs: 'precision mediump float;uniform float u_level;void main(){gl_FragColor=vec4(u_level);}' });
+    ok('values: a uniform linked, a layer refused as a value, a vec3 refused as a float',
+        lvl > 0 && ovl.link(fxA, 'u_level', lvl) && !ovl.link(fxA, 'u_level', fxA) &&
+        ovl.value({ target: 'panel', type: 'vec3', v: 1 }) === 0);
+    const refusedValues = eo.refused.length;
+    ok('values: set and animated', ovl.setValue(lvl, 0.75) &&
+        ovl.animate(lvl, { property: 'value', keys: '0:0 500:1', loop: true, interp: 'smooth' }) > 0);
+    const valueRefusals = () => eo.refused.slice(refusedValues).filter((r) => /^(value|link|animate)/.test(r));
+    ok('values: the linked layer shown, no value, link or animation refused',
+        await until(() => eo.layer[fxA] === 'shown', 3000) && (await sleep(200), valueRefusals().length === 0));
+    ovl.drop(lvl);
+    ok('values: dropped, the link forgotten here', Object.keys(ovl.layers.get(fxA).links).length === 0);
+    ovl.drop(fxA);
+
+    {   /* The text helper (cluster_render_text.js), in a block: its names its own. */
+    const grid = Buffer.alloc(16 * 16);
+    for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) grid[y * 16 + x] = x < 8 ? 255 : 128;
+    const font = Font.fromGrid({ pixels: grid, w: 16, h: 16, cols: 2, rows: 1, chars: '12' });
+    const fo = font.options();
+    ok('text: a grid font packed, its table as the C++ helper makes it', font.w === 32 && font.h === 18 &&
+        font.lineHeight === 16 && font.pixels[32 + 1] === 255 && font.pixels[32 + 10] === 128 &&
+        fo.glyphs === '49:1,1,8,16,0,0,8 50:10,1,8,16,0,0,8' && fo.kerning === '' && fo.line === 16);
+    let m = font.measure('12', 32);
+    ok('text: a line measured at twice its height', m.width === 32 && m.glyphs === 2);
+    const kerned = Font.fromGlyphs(8, [{ char: 'A', w: 4, h: 2, top: 3, advance: 5, pixels: Buffer.alloc(8, 200) },
+        { char: ' ', w: 0, h: 0, advance: 3, pixels: Buffer.alloc(0) }], new Map([['65,65', -2], ['65,66', 1]]));
+    m = kerned.measure('A A€AA', 8);
+    ok('text: glyph bitmaps, kerning (of glyphs it has), a missing character a space',
+        kerned.options().glyphs === '32:6,1,0,0,0,0,3 65:1,1,4,2,0,3,5' && kerned.options().kerning === '65,65:-2' &&
+        m.width === 24 && m.glyphs === 4);
+    const bm = Font.fromBMFont('common lineHeight=8 base=6\nchar id=65 x=0 y=0 width=4 height=6 xoffset=1 yoffset=2 ' +
+        'xadvance=6\nchar id=66 x=4 y=0 width=4 height=6 xoffset=0 yoffset=2 xadvance=5\nkerning first=65 second=66 ' +
+        'amount=-1\n', { pixels: Buffer.alloc(8 * 6 * 4, 90), w: 8, h: 6, bpp: 4 }, 4);
+    ok('text: a BMFont, its distance range', bm.lineHeight === 8 && bm.measure('AB', 8).width === 10 &&
+        bm.options().glyphs === '65:1,1,4,6,1,2,6 66:6,1,4,6,0,2,5' && bm.options().kerning === '65,66:-1' &&
+        bm.options().sdf === 4);
+    ok('text: spacing between characters only, none after the last', font.measure('12', 16, 2).width === 18);
+    const page = { pixels: Buffer.alloc(8 * 6), w: 8, h: 6 };
+    const glyph = 'char id=65 x=0 y=0 width=4 height=6 xoffset=0 yoffset=0 xadvance=5';
+    const throws = (fnt) => { try { Font.fromBMFont(fnt, page); return false; } catch (e) { return true; } };
+    ok('text: a BMFont of one page, its glyphs in every channel, taken',
+        !throws('common lineHeight=8 pages=1 packed=0\n' + glyph + ' page=0 chnl=15\n'));
+    ok('text: a BMFont of several pages, packed, a glyph on another page, in one channel or outside the page refused',
+        throws('common lineHeight=8 pages=2\n' + glyph + '\n') && throws('common lineHeight=8 packed=1\n' + glyph + '\n') &&
+        throws('common lineHeight=8\n' + glyph + ' page=1\n') && throws('common lineHeight=8\n' + glyph + ' chnl=4\n') &&
+        throws('common lineHeight=8\nchar id=65 x=6 y=0 width=4 height=6 xadvance=5\n'));
+    ok('text: a BMFont of a negative xadvance refused; a glyph bitmap\'s negative advance its width, as in C++',
+        throws('common lineHeight=8\nchar id=65 x=0 y=0 width=4 height=6 xadvance=-3\n') &&
+        Font.fromGlyphs(8, [{ char: 'x', w: 4, h: 8, advance: -5, pixels: Buffer.alloc(32, 9) }]).measure('xx', 8).width === 8);
+    ok('text: the hello says the service takes text', ovl.texts === true);
+    const fontRef = font.asset(ovl, 'panel');
+    const label = new Text(ovl, font, fontRef, { target: 'panel', klass: 'overlay', x: 600, y: 40, w: 200, h: 32,
+        align: 'center', maxGlyphs: 4 });
+    const textRefused = eo.refused.length;
+    ok('text: set, centred, and more glyphs than it holds: false',
+        fontRef > 0 && label.ref > 0 && label.set('12') && !label.set('12121') && label.set('21'));
+    ok('text: shown, nothing refused', await until(() => eo.layer[label.ref] === 'shown', 3000) &&
+        (await sleep(200), eo.refused.slice(textRefused).filter((r) => /^(text|font|layer|asset)/.test(r)).length === 0));
+    const layersBefore = ovl.layers.size;
+    ok('text: a rect with no width or height, or more than 256 glyphs, refused: nothing sent',
+        new Text(ovl, font, fontRef, { target: 'panel', x: 0, y: 0, h: 32 }).ref === 0 &&
+        new Text(ovl, font, fontRef, { target: 'panel', x: 0, y: 0, w: 200 }).ref === 0 &&
+        new Text(ovl, font, fontRef, { target: 'panel', x: 0, y: 0, w: 200, h: 32, maxGlyphs: 257 }).ref === 0 &&
+        ovl.layers.size === layersBefore);
+    const full = new Text(ovl, font, fontRef, { target: 'panel', klass: 'overlay', x: 0, y: 100, w: 1600, h: 32 });
+    const line = '12'.repeat(32);
+    const fits = full.set(line);
+    const bytes = (o) => Buffer.byteLength(JSON.stringify(o)) + 5;
+    ok('text: 64 glyphs by default, a full line of them one message of its string, under 120 bytes',
+        fits && ovl.layers.get(full.ref).opts.max === 64 &&
+        bytes({ op: 'text', ref: full.ref, text: line }) < 120);
+    ok('text: its colour changed, a colour past 1 refused here',
+        ovl.textStyle(full.ref, { color: [1, 0, 0, 1] }) && !ovl.textStyle(full.ref, { color: [2, 0, 0, 1] }) &&
+        !ovl.setText(fontRef, 'x'));
+    ok('text: drawn, nothing refused', await until(() => eo.layer[full.ref] === 'shown', 3000) &&
+        (await sleep(200), eo.refused.slice(textRefused).filter((r) => /^(text|font|layer|asset)/.test(r)).length === 0));
+    const atlasRef = ovl.layers.get(fontRef).opts.font;
+    ok('text: a string past 1024 bytes or with a lone surrogate refused here, the last one kept for a reconnect',
+        !full.set('1'.repeat(1100)) && !ovl.setText(full.ref, '1\uD800') && !ovl.setText(full.ref, '\uDC001') &&
+        full.set('12\u00b0') && !full.set('\uD83D') &&
+        ovl._layerMsg(full.ref, ovl.layers.get(full.ref)).text === '12\u00b0' &&
+        ovl.text({ target: 'panel', font: fontRef, text: 'x'.repeat(1025) }) === 0);
+    const sizeBefore = ovl.layers.size;
+    ok('text: a font of no line or glyphs, or none at all, refused here, no atlas made for it',
+        ovl.font(null) === 0 && ovl.font(atlasRef, null) === 0 &&
+        ovl.font({ target: 'panel', w: 4, h: 4, pixels: Buffer.alloc(16) }) === 0 &&
+        ovl.font({ target: 'panel', w: 4, h: 4, pixels: Buffer.alloc(16), line: 4 }) === 0 &&
+        ovl.layers.size === sizeBefore);
+    ovl.drop(fontRef);
+    ok('text: the font a layer draws from kept here, its atlas with it',
+        ovl.layers.has(fontRef) && ovl.layers.has(atlasRef) && ovl.layers.get(atlasRef).kind === 'asset');
+    full.drop();
+    label.drop();
+    ovl.drop(fontRef);
+    ok('text: dropped once no layer draws from it, its atlas with it',
+        !ovl.layers.has(fontRef) && !ovl.layers.has(atlasRef));
+    }
+
+    {   /* The showcase's label page: each line's texts within its line on the
+         * panel, set() taking them whole. */
+    const { dotFont, LABEL_LINES, LABEL_TEXTS } = require('../showcase.js');
+    const dots = dotFont(Font, 8);
+    const over = [];
+    Object.keys(LABEL_TEXTS).forEach((k) => {
+        const at = LABEL_LINES[k], w = Math.round(1920 * at[3]), h = Math.round(720 * at[2]);
+        LABEL_TEXTS[k].forEach((t) => {
+            const m = dots.measure(t, h);
+            if (m.width > w || m.glyphs > 64) over.push(k + ' "' + t + '"');
+        });
+    });
+    ok('showcase: each label line wide enough for its texts on the panel', over.length === 0, over.join(', '));
+    }
+
+    {   /* The showcase's header names every file it needs on the unit. */
+    const show = fs.readFileSync(path.join(__dirname, '..', 'showcase.js'), 'utf8');
+    const needs = [];
+    show.replace(/require\('\.\/([^']+)'\)/g, (m, f) => { needs.push(f); return m; });
+    const copy = /On the unit \(Node 8\): copy ([^]*?) into one/.exec(show);
+    ok('showcase: its header names each file it requires', needs.length >= 2 && copy !== null &&
+        needs.every((f) => copy[1].indexOf(f) >= 0));
+    }
 
     /* Rolled back to a service without canvases: none of a canvas sent to
      * it (it would draw a layer drawn in one on screen), made before its
@@ -461,6 +644,13 @@ async function main() {
     const rin = rc.effect({ target: 'panel', canvas: rcv, w: 32, h: 32, fs: 'void main(){}' });
     const rout = rc.effect({ target: 'panel', w: 32, h: 32, fs: 'void main(){}' });
     rc.bind(rout, 'u_cv', rcv);
+    const rgrid = Buffer.alloc(16 * 16, 255);
+    const rfont = Font.fromGrid({ pixels: rgrid, w: 16, h: 16, cols: 2, rows: 1, chars: '12' });
+    const rfontRef = rfont.asset(rc, 'panel');
+    const ratlas = rc.layers.get(rfontRef).opts.font;
+    const rtext = new Text(rc, rfont, rfontRef, { target: 'panel', w: 64, h: 16 });
+    rtext.set('21');
+    rtext.set('2'.repeat(2000));   /* refused here: the replay keeps '21' */
     await until(() => peer !== null, 2000);
     await sleep(100);
     hello({});
@@ -475,19 +665,60 @@ async function main() {
         rc.canvases === false && got.some((m) => m.op === 'layer' && m.ref === rout) &&
         got.every((m) => !m.binary && m.op !== 'canvas' && m.canvas === undefined && m.op !== 'bind' &&
             m.ref !== rin && m.ref !== rmesh));
+    ok('older service: no font, no text layer and no atlas sent, its pixels neither',
+        rc.texts === false && got.every((m) => m.op !== 'font' && m.op !== 'text' && m.ref !== ratlas &&
+            m.ref !== rfontRef && m.ref !== rtext.ref));
     got.length = 0;
     peer.destroy();
     peer = null;
     await until(() => peer !== null, 3000);
     await sleep(100);
-    hello({ canvas: 1 });
+    hello({ canvas: 1, text: 1 });
     ok('a service that takes canvases: the canvas, the layers in it, a part, its geometry and the bind sent ' +
         'after its hello', await until(() => got.some((m) => m.op === 'bind' && m.ref === rout), 2000) &&
         got.some((m) => m.op === 'canvas' && m.ref === rcv) && got.some((m) => m.op === 'layer' && m.ref === rin &&
         m.canvas === rcv && m.x === 4) && got.some((m) => m.op === 'part' && m.ref === rmesh) &&
         got.some((m) => m.binary) && got.some((m) => m.op === 'uniform' && m.ref === rin));
+    const at = (pred) => got.findIndex(pred);
+    ok('a service that takes text: the atlas, then the font, then the text layer with its last string taken',
+        at((m) => m.op === 'asset' && m.ref === ratlas) >= 0 &&
+        at((m) => m.op === 'asset' && m.ref === ratlas) < at((m) => m.op === 'font' && m.ref === rfontRef) &&
+        at((m) => m.op === 'font' && m.ref === rfontRef) < at((m) => m.op === 'layer' && m.ref === rtext.ref) &&
+        got.some((m) => m.op === 'layer' && m.ref === rtext.ref && m.text === '21'));
     rc.close();
     old.close();
+
+    {   /* The showcase's geometry page asks for instances once the hello
+         * says the service draws them. */
+        const seen = [];
+        const showSock = sock + '.show';
+        const show = net.createServer((s) => {
+            let buf = Buffer.alloc(0);
+            s.on('data', (d) => {
+                buf = Buffer.concat([buf, d]);
+                while (buf.length >= 5 && buf.length >= 4 + buf.readUInt32LE(0)) {
+                    const len = buf.readUInt32LE(0);
+                    if (buf[4] === 0x4a) seen.push(JSON.parse(buf.slice(5, 4 + len).toString('utf8')));
+                    buf = buf.slice(4 + len);
+                }
+            });
+            s.on('error', () => {});
+            const body = Buffer.from(JSON.stringify({ ev: 'hello', proto: 1, backend: 'id7', draw: 1, instances: 1,
+                targets: 'map:1088x480,panel:1920x720' }));
+            const head = Buffer.alloc(5);
+            head.writeUInt32LE(body.length + 1, 0);
+            head[4] = 0x4a;
+            s.write(Buffer.concat([head, body]));
+        });
+        await new Promise((r) => show.listen(showSock, r));
+        const child = spawn(process.execPath, [path.join(__dirname, '..', 'showcase.js'), 'geometry', '--socket', showSock],
+            { stdio: 'ignore' });
+        const asked = await until(() => seen.some((m) => m.op === 'part' && m.instances !== undefined), 5000);
+        child.kill('SIGTERM');
+        show.close();
+        ok('showcase: the geometry page draws 16 instances where the hello says the service draws them',
+            asked && seen.some((m) => m.op === 'part' && m.instances === 16));
+    }
 
     clearInterval(feed);
     ok('frames stopping: the video is stalled after its stall time',

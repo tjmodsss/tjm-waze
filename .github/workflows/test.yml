@@ -121,7 +121,12 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22.12.0
+      # Mesa's software GLES through EGL, for test/text_gl_check, which then
+      # fails instead of skipping where it cannot draw (CR_REQUIRE_GL)
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libegl1 libgles2 libegl-mesa0 libgl1-mesa-dri
       - run: make -C native/cluster-render test
+        env:
+          CR_REQUIRE_GL: 1
 
   # the unit's toolchain (gcc 7.5) in Docker, preinstalled on the runner
   cluster-render-x86:

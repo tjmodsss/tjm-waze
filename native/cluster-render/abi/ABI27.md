@@ -101,6 +101,10 @@ them, and root is denied.
   `Scene::createArrayResource(EDataType, n, data)`; there are no client
   resources. An effect is compiled in a scratch scene (to check it and read
   its attributes) and in each scene that draws it.
+- **Mutable geometry:** `Scene::createArrayBuffer(EDataType, maxElements)`
+  and `ArrayBuffer::updateData(first, count, data)` in place of 19's
+  vertex and index data buffers (text layers' glyph runs;
+  `include/ramses27/ramses-client-api/ArrayBuffer.h`, upstream's).
 - **Texture buffers:** `createTexture2DBuffer(ETextureFormat, w, h, mips)`
   (format first; `ETextureFormat` is an enum class) and
   `Texture2DBuffer::updateData(mip, x, y, w, h, data)`.

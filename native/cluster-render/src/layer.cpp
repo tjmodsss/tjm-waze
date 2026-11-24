@@ -3,6 +3,7 @@
 #include "layer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -68,12 +69,22 @@ void Uniforms::dirty(const std::string &name)
         it->second.dirty = true;
 }
 
+void Uniforms::link(const std::string &name, bool on)
+{
+    if (on) {
+        linked_.insert(name);
+        return;
+    }
+    linked_.erase(name);
+    dirty(name);
+}
+
 bool Uniforms::stage(Graph *g, int drawable)
 {
     bool any = false;
     for (auto &kv : values_) {
         Value &u = kv.second;
-        if (!u.dirty)
+        if (!u.dirty || linked_.count(kv.first))
             continue;
         const bool went = u.n ? g->uniform(drawable, kv.first.c_str(), u.v.data(), u.n)
                               : g->uniform_array(drawable, kv.first.c_str(), u.type, u.v.data(), u.elements);
@@ -123,6 +134,35 @@ bool Layer::play(uint32_t anim, uint32_t part, const Animation &a, std::string *
         *err = e;
         return false;
     }
+    /* One playing: replaced where it is, from where it is (a needle sent to
+     * a new value), without its static pose in between. */
+    auto now = played_.find(anim);
+    if (g_ && !defer_starts_ && now != played_.end() && now->second.handle && !now->second.pending) {
+        const int node = animated(part);
+        /* What gives the target of the one sent before its own value back,
+         * should the replacement play elsewhere: the graph keeps the one
+         * for the target that plays (Graph::replace), and runs it once the
+         * replacement is made, the old animation driving it until then. Its
+         * target alone, not its keys. */
+        const uint32_t was_part = now->second.part;
+        Animation was;
+        was.property = now->second.a.property;
+        was.uniform = now->second.a.uniform;
+        was.width = now->second.a.width;
+        std::function<void()> back = [this, was_part, was]() { restore(was_part, was); };
+        const int handle = node ? g_->replace(now->second.handle, node, a, back) : 0;
+        if (!handle) {
+            if (node)
+                restore(was_part, was);
+            played_.erase(now);
+            *err = "the renderer refused the animation";
+            return false;
+        }
+        now->second.part = part;
+        now->second.a = a;
+        now->second.handle = handle;
+        return true;
+    }
     stop(anim);
     Played p;
     p.part = part;
@@ -152,6 +192,31 @@ bool Layer::stop(uint32_t anim)
     }
     played_.erase(it);
     return true;
+}
+
+bool Layer::animating(uint32_t part, const std::string &name) const
+{
+    for (const auto &kv : played_)
+        if (kv.second.part == part && kv.second.a.property == Animated::Uniform && kv.second.a.uniform == name)
+            return true;
+    return false;
+}
+
+float Layer::animated_scale(uint32_t part) const
+{
+    float s = 1;
+    bool any = false;
+    for (const auto &kv : played_) {
+        const Animation &a = kv.second.a;
+        if (kv.second.part != part || a.property != Animated::Scale || a.width < 2)
+            continue;
+        if (!any)
+            s = 0;
+        any = true;
+        for (size_t k = 0; k + 1 < a.v.size(); k += a.width)
+            s = std::max(s, std::max(std::fabs(a.v[k]), std::fabs(a.v[k + 1])));
+    }
+    return s;
 }
 
 bool Layer::animations_started() const
@@ -614,10 +679,14 @@ void EffectLayer::place()
 
 void EffectLayer::restore(uint32_t, const Animation &a)
 {
-    if (a.property == Animated::Uniform)
-        uniforms_.dirty(a.uniform);
-    else
+    if (a.property != Animated::Uniform) {
         place();
+        return;
+    }
+    /* written now: a replacement made at a flush restores in that flush */
+    uniforms_.dirty(a.uniform);
+    if (g_ && quad_)
+        uniforms_.stage(g_, quad_);
 }
 
 Stage EffectLayer::stage(int64_t now_ms)

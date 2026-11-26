@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## 0.14.17
+
+While the map is not seen (the cluster showing other content in its
+slot or the slot locked, the HUD giving way to BMW's lists, or the app
+hosting it hiding it, also a cluster theme on a page without the map),
+the head unit makes one map picture a second instead of one for every
+frame and sends none, and the HUD map is not scaled. The phone's stream is
+still decoded, so the map is back with its newest picture the moment it
+is seen again; with the cluster-render released with it, that picture is
+the first one the cluster draws.
+
+## 0.14.16
+
+A map setting the app saves for one driver profile goes into that
+profile's settings only; one made for another driver than the one in use
+is not saved. While any driver has own settings, a map setting from an
+earlier Maps on cluster is not saved either: update the app. Settings
+saved by earlier versions stay as they are.
+
+## 0.14.15
+
+The map service runs in the head unit's slice for standard services, level
+with the HMI.
+
 ## 0.14.14
 
 Android Auto: Patch, Remove patch, Zoom and the turn card take effect at

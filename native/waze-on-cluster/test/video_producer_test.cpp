@@ -11,7 +11,9 @@
  * again gets it whole, not as the same picture again. Over the FIFO (its
  * reader thread): a skipped frame's late picture comes at its slot, well
  * before the decode thread's 500 ms wait for a packet. picture_fps 0: every
- * frame gets a picture.
+ * frame gets a picture. Unseen (kUnseenFps): a frame decoded within the
+ * second after a picture has none, and gets it at once when the rate goes
+ * back to every frame.
  *
  * Linux only: the producer's pipes are pipe2's. */
 #include <arpa/inet.h>
@@ -284,11 +286,37 @@ static void parts()
                                                   again.content == 32);
 }
 
+/* Unseen (picture_pace.h kUnseenFps): every frame decoded, a picture a
+ * second; a frame decoded in between has none, and once the map is seen
+ * again (the rate back to every frame) its picture comes at once, not at
+ * the next frame. */
+static void unseen()
+{
+    VideoConfig c = config(0);
+    c.udp_port = free_udp_port();
+    VideoProducer p(c);
+    Rtp rtp(c.udp_port);
+    rtp.send("1088x480", true, 30);
+    ok("unseen: the first frame's picture", next_picture(p, 2000).content == 30);
+    p.set_picture_fps(woc::kUnseenFps);
+    rtp.send(nullptr, false, 31);
+    const Picture first = next_picture(p, 2000);
+    ok("unseen: the first frame after it its picture (the rate starts again)", first.got && first.content == 31);
+    rtp.send(nullptr, false, 32);
+    ok("unseen: the next frame, within the second, none", !next_picture(p, 300).got && decoded(p) == 3);
+    const int64_t seen = now_ms();
+    p.set_picture_fps(0);
+    const Picture now = next_picture(p, 2000);
+    ok("seen again: that frame's picture at once", now.got && now.content == 32 && now.at - seen < 200);
+    ok("seen again: every frame counted once", decoded(p) == 3);
+}
+
 int main()
 {
     off();
     parts();
     over_udp();
     over_fifo();
+    unseen();
     return failures ? 1 : 0;
 }

@@ -1474,7 +1474,7 @@ void Compositor::host_eligibility(LayerHost &lh) const
     const TargetState st = slots_->status(lh.into).state;
     lh.eligible = lh.over = false;
     lh.wait.clear();
-    if (!lh.host.shown) {
+    if (!lh.host.shown && !lh.host.hide) {
         lh.wait = "it shows the target nowhere (shown 0)";
         return;
     }
@@ -1484,6 +1484,25 @@ void Compositor::host_eligibility(LayerHost &lh) const
     }
     if (!t.graph || !(st == TargetState::Shown || st == TargetState::Lingering || slots_->kept(lh.into))) {
         lh.wait = into + " is not on screen (" + target_state_name(st) + ")";
+        return;
+    }
+    /* Hidden (hide): no picture to stack, so no layer over the rect is
+     * needed, but one of the client's drawn and seen on into, as an app in
+     * the foreground has: a background app's hidden host counts for
+     * nothing. Its topmost such layer orders it among hidden hosts; a shown
+     * host on any into wins over it (host_winners). */
+    if (!lh.host.shown) {
+        const Arrangement &a = t.arr;
+        for (size_t p = 0; p < a.order.size(); p++) {
+            const Entry &e = layers_.at(a.order[p]);
+            if (e.owner == lh.owner && listed(a.drawn, a.order[p]) && seen(*e.layer)) {
+                lh.eligible = true;
+                lh.top_pos = p;
+            }
+        }
+        lh.anchor = 0;
+        if (!lh.eligible)
+            lh.wait = "no layer of the client is drawn on " + into;
         return;
     }
     /* The client's layers drawn and seen over the rect, from its topmost
@@ -1518,21 +1537,30 @@ std::map<int, const Compositor::LayerHost *> Compositor::host_winners(const std:
      * several intos, the one holding the target (held_into_: the last live
      * host's, also after it ended) keeps it while it has an eligible host;
      * else the one whose host was sent first (sent again after unhost, a
-     * host is sent later). */
+     * host is sent later). A shown host anywhere wins over a hidden one
+     * (hide): a hidden host is live only while no shown host is eligible. */
     std::map<std::pair<int, int>, const LayerHost *> best;   /* by (target, into) */
     for (const auto &kv : layer_hosts_) {
         const LayerHost &lh = kv.second;
         if (!lh.eligible || by_scene[kv.first.first])
             continue;
         const LayerHost *&b = best[std::make_pair(kv.first.first, lh.into)];
-        if (!b || lh.top_pos > b->top_pos)
+        /* a shown host over a hidden one (hide), else the one drawn higher */
+        if (!b || (lh.host.shown && !b->host.shown) || (lh.host.shown == b->host.shown && lh.top_pos > b->top_pos))
             b = &lh;
     }
+    std::map<int, bool> shown;   /* by target: a shown host is eligible on some into */
+    for (const auto &kv : best)
+        shown[kv.first.first] = shown[kv.first.first] || kv.second->host.shown;
     std::map<int, const LayerHost *> win;
     for (const auto &kv : best) {
         const int target = kv.first.first;
+        if (!kv.second->host.shown && shown[target])
+            continue;
         auto h = held_into_.find(target);
         auto keep = h == held_into_.end() ? best.end() : best.find(std::make_pair(target, h->second));
+        if (keep != best.end() && !keep->second->host.shown && shown[target])
+            keep = best.end();
         if (keep != best.end()) {
             win[target] = keep->second;
             continue;
@@ -1554,9 +1582,11 @@ void Compositor::host_decided(int target, LayerHost &lh, const LayerHost *winner
         why = "target " + name + " is hosted by a scene";
     } else if (lh.eligible && !live) {
         by = winner->owner;
-        why = winner->into == lh.into ? "target " + name + " is hosted by another client's layers, drawn higher over it"
-                                      : "target " + name + " is hosted by another client's layers on " +
-                                            slots_->targets()[winner->into].name + ", there first";
+        const std::string &on = slots_->targets()[winner->into].name;
+        why = !lh.host.shown && winner->host.shown ? "target " + name + " is shown by another client's layers on " + on
+              : winner->into == lh.into ? "target " + name + " is hosted by another client's layers, drawn higher over it"
+                                        : "target " + name + " is hosted by another client's layers on " + on +
+                                              ", there first";
     }
     if (live != lh.live || why != lh.why || by != lh.by) {
         host_serial_++;
@@ -1634,7 +1664,8 @@ void Compositor::arrange_layer_hosts()
         host_decided(kv.first.first, kv.second, w == win.end() ? nullptr : w->second, by_scene[kv.first.first]);
     }
     for (const auto &kv : win)
-        host_restack(kv.first, *kv.second);
+        if (kv.second->host.shown)
+            host_restack(kv.first, *kv.second);
 }
 
 const Compositor::LayerHost *Compositor::layer_host_of(int ti, const Entry &e) const
@@ -2162,10 +2193,16 @@ void Compositor::render(int64_t now_ms)
          * drawn once is drawn again, as the display may have dropped its
          * buffers while the scene was not mapped. */
         const bool flushing = slots_->flushing((int)ti);
-        if (flushing && !t.flushing)
+        if (flushing && !t.flushing) {
             for (auto &ck : canvases_)
                 if (ck.second.canvas->target() == (int)ti)
                     ck.second.canvas->touch();
+            /* and a video's frame from before may wait for a newer one (fresh_ms) */
+            for (auto &kv : layers_)
+                if (kv.second.layer->target() == (int)ti && !kv.second.composited &&
+                    !std::strcmp(kv.second.layer->kind(), "video"))
+                    static_cast<VideoLayer *>(kv.second.layer.get())->on_screen_again(now_ms);
+        }
         t.flushing = flushing;
         if ((!t.graph && !t.file) || !flushing)
             continue;

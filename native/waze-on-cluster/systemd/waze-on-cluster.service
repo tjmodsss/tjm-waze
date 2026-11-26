@@ -43,6 +43,9 @@ ExecStartPre=-+/bin/sh -c 'mkdir -p /var/opt/waze-on-cluster/log /var/opt/waze-o
 # overrides the conf's. Read at each start.
 EnvironmentFile=-/var/opt/waze-on-cluster/aa-crop.env
 ExecStart=/var/opt/waze-on-cluster/current/waze-on-cluster -c /var/opt/waze-on-cluster/current/waze-on-cluster.conf $WOC_SRC_CROP
+# The head unit's slice for its standard services, where carplay and the
+# AVB stream handler run: level with the HMI, not ahead of it.
+Slice=standard.slice
 Restart=on-failure
 # At boot RAMSES or DCSM may not be up yet; 5 s keeps the retries clear of
 # systemd's start limit (5 starts in 10 s), which would also stop the socket.

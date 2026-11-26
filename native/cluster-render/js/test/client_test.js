@@ -14,7 +14,8 @@
  * over it, hosting the map, shown and hidden, the other client told, and the
  * host ended when it is dropped; a host from a theme's layers (no scene),
  * kept before the connection and sent after the hello, live while a layer
- * of it is visible (the hosting event saying so, and why not), refused, a
+ * of it is visible (the hosting event saying so, and why not), hidden with
+ * hide (hosted, shown 0) and without it (not hosted), refused, a
  * refused move ending it on both sides, a host sent after a refused move
  * kept on both, unhosted, kept but not sent to an older service, ended when
  * the theme closes; a layer's hosted mark; a hidden preload layer keeping its target
@@ -303,6 +304,14 @@ async function main() {
     ok('layer host: refused: the client forgets it, the service ends it', await until(() =>
         !thm.layerHosts.has('map') && hosted[hosted.length - 1] === 'map:-' &&
         et.refused.some((r) => r.indexOf('host: x, y, w, h must lie inside panel') === 0), 2000));
+    thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400, shown: false, hide: true });
+    ok('layer host: shown false with hide: sent with hide, the map hosted in the panel and hidden, the theme live',
+        thm.hostHide === true && thm.layerHosts.get('map').msg.hide === 1 &&
+        await until(() => hosted[hosted.length - 1] === 'map:panel:0:560', 2000) &&
+        await until(() => hostingThm[hostingThm.length - 1] === 'map:live', 2000));
+    thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400, shown: false });
+    ok('layer host: shown false without hide: not hosted, the map on its own target',
+        !('hide' in thm.layerHosts.get('map').msg) && await until(() => hosted[hosted.length - 1] === 'map:-', 2000));
     thm.host('panel', { target: 'map', x: 700, y: 160, w: 560, h: 400, edge_top: 30 });
     ok('layer host: hosted again, with an edge',
         await until(() => hosted[hosted.length - 1] === 'map:panel:1:560', 2000) &&

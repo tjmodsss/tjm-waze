@@ -146,8 +146,17 @@ void VideoLayer::offer(const uint8_t *atlas, int64_t now_ms)
     front_.resize(atlas_bytes_);
     crk::round_levels(front_.data(), atlas, atlas_bytes_, p_.level_bits);
     front_pending_ = true;
-    front_ms_ = last_frame_ms_ = now_ms;
+    front_ms_ = last_frame_ms_ = picture_ms_ = now_ms;
     have_ = true;
+}
+
+void VideoLayer::on_screen_again(int64_t now_ms)
+{
+    if (p_.fresh_ms > 0 && front_pending_ && !repeated_ && !source_ && (shown_ms_ >= 0 || wrote_) &&
+        picture_ms_ < now_ms) {
+        hold_from_ms_ = picture_ms_;
+        hold_until_ms_ = now_ms + p_.fresh_ms;
+    }
 }
 
 void VideoLayer::repeat(int64_t now_ms)
@@ -210,7 +219,7 @@ void VideoLayer::canvas_changed(int64_t now_ms)
         superseded_++;
     repeated_ = front_stale_ = false;
     front_pending_ = true;
-    front_ms_ = last_frame_ms_ = now_ms;
+    front_ms_ = last_frame_ms_ = picture_ms_ = now_ms;
     have_ = true;
 }
 
@@ -317,6 +326,7 @@ bool VideoLayer::attach(Graph *g, int64_t now_ms, std::string *err)
     repeated_ = front_stale_ = false;
     front_pending_ = front_.size() == atlas_bytes_ && front_ms_ >= 0;
     shown_.assign(atlas_bytes_, 0);
+    wrote_ = wrote_ || shown_ms_ >= 0;
     shown_ms_ = -1;
     planner_.reset();
     held_.assign(planner_.tiles(), 0);
@@ -539,6 +549,15 @@ Stage VideoLayer::stage(int64_t now_ms)
     staged_ = Staged();
     if (!g_ || !drawn_)
         return Stage::Idle;
+    /* On screen again: the frame from before waits for a newer one, unless
+     * the target waits on this layer (tiles a change uncovers, a buffer left
+     * half written): then it goes, so only this frame is ever held. */
+    if (hold_until_ms_ >= 0) {
+        if (front_pending_ && picture_ms_ == hold_from_ms_ && now_ms < hold_until_ms_ && !uncovering() &&
+            !holds_flush())
+            return Stage::Idle;
+        hold_until_ms_ = -1;
+    }
     /* Quiet tiles due to settle are written from front_, still the newest
      * frame, when no newer one waits; the packed quad gives way to the exact
      * atlas when no newer frame needed it for kRefineMs. */

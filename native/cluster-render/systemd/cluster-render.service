@@ -25,6 +25,9 @@ RuntimeDirectoryMode=0755
 # ("+"); a failure ("-") only leaves the service without them.
 ExecStartPre=-+/bin/sh -c 'mkdir -p /var/opt/cluster-render/log /var/opt/cluster-render/state && chown hmi_5000:hmi_5000 /var/opt/cluster-render/log /var/opt/cluster-render/state'
 ExecStart=/var/opt/cluster-render/current/cluster-render -c /var/opt/cluster-render/current/cluster-render.conf
+# The head unit's slice for its standard services, where carplay and the
+# AVB stream handler run: level with the HMI, not ahead of it.
+Slice=standard.slice
 Restart=on-failure
 # At boot RAMSES or DCSM may not be up yet; 5 s keeps the retries clear of
 # systemd's start limit (5 starts in 10 s), which would also stop the socket.

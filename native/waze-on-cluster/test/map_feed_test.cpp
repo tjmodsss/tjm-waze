@@ -62,21 +62,34 @@
  *   gone, back on its own target; no part asked of the decoder (by default);
  *   a host whose place cannot be drawn (its part misses the map, its rect
  *   too small): on its own target instead;
+ * - unseen (unseen_map): parked behind the stock map no frame reaches the
+ *   renderer, a repeat a second keeps the layer (every quarter of stall_ms
+ *   at the smallest), never stalling it; seen again, the newest picture is
+ *   the first written, never one sent as the slot was taken or held, then
+ *   every frame; under an
+ *   exclusive alert, still written, seen; hidden by a scene host, unseen;
+ *   MapFeeds unseen only while every feed is (the HUD giving way to BMW's
+ *   lists, also once resized), each unseen feed sending and scaling once a second beside a
+ *   seen one;
  * - hosted by a theme's layers, no scene (layers_hosting): in the panel at
  *   the host's rect, its layer marked as the hosted map and so under the
  *   theme's layers; back on its own target while
- *   they are hidden and once the theme is gone;
+ *   they are hidden, with shown 0 and once the theme is gone; with shown 0
+ *   and hide, hidden: no layer, unseen;
  * - the cluster's map hosted (hosted_wake): a frame with the scaling worker
  *   wakes the service's loop to take it, and its part is drawn;
  * - hosted with hosted_vpp_scale (vpp_hosting): the host's part asked of the
  *   decoder at the size it is shown at, a whole frame meanwhile scaled by
  *   the worker, a VPP-made one sent as it is, one of another part dropped,
- *   the host's move asking for its new part, the host gone, none;
+ *   the host's move asking for its new part, the panel taken (unseen:
+ *   parts held, the loop not woken for them) and back (the newest part),
+ *   the host gone, none;
  * - always_packed (always_packed_map): 0, the layer without always_packed and a still
  *   map exact; 1, every update packed, a still map's too, never exact; with
  *   hosted_vpp_scale the VPP-made part packed; a host's part not a multiple
  *   of 4 high as with 0, shown; cluster-render upgraded or downgraded under
- *   the feed, the layer made again for it (renderer_changed). */
+ *   the feed, the layer made again for it (renderer_changed), and for fresh_ms
+ *   (renderer_fresh_changed). */
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -547,9 +560,11 @@ static void hosting()
     ok("hidden by the host: no layer, nothing sent, idle with the reason",
        r.svc->compositor().layers().empty() && r.st().state == "idle" && r.st().reason == MapFeed::kHostHidden &&
            r.svc->slots().status(map_i).state == crs::TargetState::Idle);
+    ok("hidden by the host: unseen (map_feed.h)", r.feed->unseen());
     h.shown = true;
     design.host(sc, h);
     r.pump(1500);
+    ok("shown again by the host: seen", !r.feed->unseen());
     ok("shown again: the newest picture's part first", r.st().state == "showing" &&
                                                          r.drawing("panel", crop_of(f2, 264, 40, 560, 400), &with) && with);
 
@@ -659,6 +674,35 @@ static void layers_hosting()
     theme->set(frame_ref, frame);
     r.pump(2500, &f);
     ok("layer host: shown again: hosted again", r.st().target == "panel" && r.st().hosted);
+
+    /* The theme on a page without the map: shown 0. Without hide, the map
+     * on its own target, under the panel; with hide, hidden: no layer at
+     * all, unseen. */
+    const auto videos = [&r]() {
+        int n = 0;
+        for (const crs::Layer *l : r.svc->compositor().layers())
+            n += std::string(l->kind()) == "video";
+        return n;
+    };
+    cr::Host nowhere = h;
+    nowhere.shown = false;
+    theme->host(nowhere);
+    r.pump(2500, &f);
+    ok("layer host: shown 0 without hide: the map on its own target, seen",
+       r.st().state == "showing" && r.st().target == "map" && !r.st().hosted && !r.feed->unseen());
+    nowhere.hide = true;
+    theme->host(nowhere);
+    r.pump(2500, &f);
+    ok("layer host: shown 0 with hide: hidden, no layer anywhere, the map's slot released, unseen",
+       r.st().state == "idle" && r.st().reason == MapFeed::kHostHidden && r.feed->unseen() && videos() == 0 &&
+           r.svc->slots().status(map_i).state == crs::TargetState::Idle);
+    const std::vector<uint8_t> f2 = atlas(6);
+    r.pump(500, &f2);
+    theme->host(h);
+    r.pump(2500);
+    ok("layer host: shown 1 again: hosted, the newest picture's part, seen",
+       r.st().state == "showing" && r.st().target == "panel" && !r.feed->unseen() &&
+           r.drawing("panel", crop_of(f2, 264, 40, 560, 400), &with) && with);
 
     r.other = nullptr;
     theme.reset();
@@ -817,6 +861,38 @@ static void vpp_hosting()
     ok("vpp: the host moved, its new part asked for", r.feed->part() == other);
     r.pump(1000, &p3);
     ok("vpp: the new part's frames shown", r.drawing("panel", p3, &with) && with && r.feed->scaled_frames() == scaled);
+
+    /* The stock HMI takes the panel: unseen; the part's frames held, none
+     * sent, the loop not woken for them; the panel back, the newest part. */
+    const std::vector<uint8_t> p4 = crop_of(f2, 200, 40, 560, 400);
+    r.port.steal(r.sc.targets[1], 0x01000201);
+    r.pump(1000, &p3);
+    int spins = 0;
+    for (int step = 0; step < 200; step++) {
+        r.pump(5, &p4, 5);
+        spins += r.feed->wake_in_ms(r.now) <= 5;
+    }
+    ok("vpp: the panel taken: unseen, the part's frames held, the loop not woken for them",
+       r.feed->unseen() && r.drawing("panel", p3, &with) && with && spins <= 3);
+    /* back with the producer's newest picture on its way: the part at hand
+     * waits for it and is never written */
+    r.feed->set_picture_coming(true);
+    r.port.stock_unmap(0x203, 0x01000201);
+    for (int step = 0; step < 600 && r.st().state != "showing"; step++)
+        r.pump(5);
+    r.feed->set_picture_coming(false);
+    r.pump(50);
+    const bool waited = r.drawing("panel", p3, &with) && with;
+    const std::vector<uint8_t> p5 = crop_of(f, 200, 40, 560, 400);
+    bool older = false;
+    r.pump(5, &p5, 5);
+    for (int step = 0; step < 40; step++) {
+        r.pump(5);
+        r.drawing("panel", p4, &with);
+        older = older || with;
+    }
+    ok("vpp: the panel back, the producer's picture on its way: the part at hand waits, the newest written first",
+       !r.feed->unseen() && waited && !older && r.drawing("panel", p5, &with) && with);
 
     design.drop(sc);
     r.part = OutputPart();
@@ -982,7 +1058,7 @@ struct OldRenderer {
     int lfd = -1, cfd = -1;
     std::string in;
     std::vector<std::string> ops;
-    bool packed = false;
+    bool packed = false, fresh = false;
 
     OldRenderer()
     {
@@ -1030,6 +1106,8 @@ struct OldRenderer {
                     {"targets", cr::json_quote("map:1088x480,panel:1920x720")}, {"repeat", "1"}};
                 if (packed)
                     kv.push_back({"always_packed", "1"});
+                if (fresh)
+                    kv.push_back({"fresh_ms", "1"});
                 const std::string h = cr::encode(cr::kJson, cr::json_object(kv));
                 if (write(cfd, h.data(), h.size()) != (ssize_t)h.size())
                     std::printf("old renderer: hello not written\n");
@@ -1130,6 +1208,273 @@ static void renderer_changed()
     }
 }
 
+/* cluster-render upgraded or downgraded under the feed (fresh_ms): after
+ * the reconnect the layer made again with fresh_ms, or without it. */
+static void renderer_fresh_changed()
+{
+    for (int up = 0; up < 2; up++) {
+        OldRenderer r;
+        r.fresh = !up;
+        FeedConfig fc;
+        fc.socket = r.path;
+        MapFeed feed(fc);
+        feed.set_stream(true, false, Picture::Shown);
+        int64_t now = 100000;
+        auto run = [&] {
+            for (int i = 0; i < 400; i++) {
+                now += 5;
+                r.poll();
+                feed.poll(now);
+                r.poll();
+            }
+        };
+        run();
+        const bool before = r.layer_op().find("\"fresh_ms\"") != std::string::npos;
+        r.fresh = up;
+        r.hang_up();
+        run();
+        const std::string op = r.layer_op();
+        const bool after = op.find("\"fresh_ms\"") != std::string::npos;
+        if (up)
+            ok("fresh_ms: an older cluster-render upgraded under the feed: the layer with fresh_ms after the reconnect",
+               !before && after);
+        else
+            ok("fresh_ms: cluster-render downgraded under the feed: the layer without fresh_ms after the reconnect",
+               before && !op.empty() && !after);
+    }
+}
+
+/* An exclusive alert of another app over a target: every layer under it
+ * suspended, still written by the renderer. */
+static uint32_t alert_over(cr::Client *c, const char *target)
+{
+    cr::LayerOptions lo;
+    lo.target = target;
+    lo.klass = "alert";
+    lo.exclusive = true;
+    lo.w = lo.h = 64;
+    cr::ImageOptions io;
+    io.w = io.h = 64;
+    const uint32_t a = c->image(lo, io);
+    const std::vector<uint8_t> px(64 * 64 * 4, 255);
+    c->pixels(a, {}, px.data(), px.size());
+    return a;
+}
+
+/* Unseen (map_feed.h): the stock map taking the slot, the map parked behind
+ * it (no take-over), is not seen; its frames reach the renderer at most once
+ * a second, enough that it never stalls, the app told the stock map holds
+ * the slot; the stock map gone, the map seen again draws the newest picture
+ * first, at once, and takes every frame again. Under another app's
+ * exclusive alert, which the renderer keeps writing it under, it is seen.
+ * Hidden by a scene host: unseen too (hosting above). MapFeeds: unseen only
+ * while every feed that takes frames is: the cluster's parked with the
+ * HUD's shown is seen; the HUD giving way to BMW's lists as well, unseen;
+ * the cluster's alone, unseen; each feed, unseen, scales and sends at most
+ * once a second while the other takes its frames at its rate. */
+static void unseen_map()
+{
+    const uint64_t kStock = 0x01000101;
+    const std::vector<uint8_t> f1 = atlas(21), f2 = atlas(22);
+    Rig r(false, 6000);
+    r.sc.targets[0].take_over_stock = false;
+    r.start();
+    r.pump(1500, &f1);
+    ok("unseen: shown, seen", r.st().state == "showing" && !r.feed->unseen());
+    cr::Client app("alerting", r.path);
+    r.other = &app;
+    const uint32_t a = alert_over(&app, "map");
+    r.pump(1000, &f1);
+    const unsigned long long under = r.received();
+    r.pump(2000, &f1);
+    ok("under another app's exclusive alert, still written: seen, every frame reaches the renderer",
+       r.st().reason == "under an alert on the cluster" && !r.feed->unseen() && r.received() - under >= 28);
+    app.drop(a);
+    r.pump(1000, &f1);
+    r.other = nullptr;
+
+    r.port.steal(r.sc.targets[0], kStock);
+    r.pump(1000, &f1);
+    ok("unseen: parked behind the stock map, not seen, the app told why",
+       r.feed->unseen() && r.st().state == "starting" && r.st().reason == "the stock map holds the slot");
+    const unsigned long long before = r.received();
+    r.pump(8000, &f1);   /* 123 frames, at a frame each 65 ms */
+    const unsigned long long sent = r.received() - before;
+    ok("unseen: no frame, a repeat a second reaches the renderer", sent >= 4 && sent <= 9);
+    ok("unseen: past stall_ms, still fed: parked, not stalled",
+       r.feed->unseen() && r.st().reason == "the stock map holds the slot");
+    r.port.stock_unmap(0x100, kStock);
+    for (int step = 0; step < 400 && r.st().state != "showing"; step++)
+        r.pump(5);
+    r.pump(500, &f1);
+
+    /* The first write when it is seen again: a frame sent as the slot is
+     * taken (before the feed knows) is never written, nor the pictures held
+     * meanwhile; the newest is, at once. */
+    const std::vector<uint8_t> f_pend = atlas(23), f_mid = atlas(24), f_new = atlas(25);
+    r.port.steal(r.sc.targets[0], kStock);
+    r.spare.assign(f_pend.begin(), f_pend.end());
+    r.feed->offer(&r.spare, (uint64_t)r.now, r.now);
+    r.pump(1000, &f_mid);
+    r.spare.assign(f_new.begin(), f_new.end());
+    r.feed->offer(&r.spare, (uint64_t)r.now, r.now);
+    bool stale = false;
+    const auto drawn = [&r](const std::vector<uint8_t> &f) {
+        bool w = false;
+        r.drawing("map", f, &w);
+        return w;
+    };
+    ok("unseen: the frames sent and held while parked never written",
+       r.feed->unseen() && !drawn(f_pend) && !drawn(f_mid));
+    r.port.stock_unmap(0x100, kStock);
+    int steps = 0;
+    for (; steps < 400 && r.st().state != "showing"; steps++) {
+        r.pump(5);
+        stale = stale || drawn(f_pend) || drawn(f_mid);
+    }
+    bool fresh = false;
+    for (int step = 0; step < 20 && !fresh; step++) {
+        r.pump(5);
+        stale = stale || drawn(f_pend) || drawn(f_mid);
+        fresh = drawn(f_new);
+    }
+    ok("seen again: the first picture written is the newest, within 100 ms, never an older one",
+       steps < 400 && fresh && !stale && !r.feed->unseen());
+    /* Seen again with the producer's picture on its way that never comes:
+     * the picture at hand after kAwaitMs. */
+    const std::vector<uint8_t> f_hand = atlas(26);
+    r.port.steal(r.sc.targets[0], kStock);
+    r.pump(1000, &f1);
+    r.spare.assign(f_hand.begin(), f_hand.end());
+    r.feed->offer(&r.spare, (uint64_t)r.now, r.now);
+    r.feed->set_picture_coming(true);
+    r.port.stock_unmap(0x100, kStock);
+    for (int step = 0; step < 400 && r.st().state != "showing"; step++)
+        r.pump(5);
+    r.pump(100);
+    const bool held_back = !drawn(f_hand);
+    r.pump(200);
+    r.feed->set_picture_coming(false);
+    ok("seen again, the producer's picture on its way never comes: the picture at hand after kAwaitMs",
+       held_back && drawn(f_hand));
+    const unsigned long long again = r.received();
+    r.pump(2000, &f1);
+    ok("seen again: every frame reaches the renderer", r.received() - again >= 28 && r.st().state == "showing");
+
+    /* The smallest stall_ms (idle_ms 1000): parked for 5 s (asking for the
+     * slot again now and then), kept by repeats, never stalled. */
+    {
+        Rig q(false, 1000);
+        q.sc.targets[0].take_over_stock = false;
+        q.start();
+        q.pump(1500, &f1);
+        q.port.steal(q.sc.targets[0], kStock);
+        q.pump(500, &f1);
+        bool kept = true;
+        int unseen_steps = 0, repeated = 0;
+        for (int step = 0; step < 50; step++) {
+            const bool was = q.feed->unseen();
+            const unsigned long long n = q.received();
+            q.pump(100, &f1);
+            kept = kept && q.st().state == "starting";
+            if (was && q.feed->unseen()) {
+                unseen_steps++;
+                repeated += q.received() != n;
+            }
+        }
+        ok("unseen, stall_ms 1000: parked 5 s, never stalled, unseen most of it, a repeat every quarter of stall_ms",
+           kept && unseen_steps >= 30 && repeated * 100 >= unseen_steps * 30);
+    }
+
+    /* MapFeeds, the cluster's and the HUD's */
+    Rig b(false, 6000, false, true, true);
+    b.feed.reset();
+    b.sc.targets[0].take_over_stock = false;
+    b.start();
+    FeedConfig fc;
+    fc.socket = b.path;
+    fc.video.level_bits = 0;
+    MapFeeds feeds(fc, true, true, 10);
+    feeds.set_stream(true, false, Picture::Shown);
+    std::vector<uint8_t> spare;
+    unsigned seq = 0;
+    const auto pump = [&](int64_t ms) {
+        for (int64_t t = 0; t < ms; t += 5) {
+            b.now += 5;
+            if (t % 65 == 0) {
+                spare.assign(f1.begin(), f1.end());
+                spare[(seq++) % 1088] ^= 0x80;   /* a moving map: each frame another picture */
+                feeds.offer(&spare, (uint64_t)b.now, b.now);
+            }
+            for (int round = 0; round < 400; round++) {
+                std::vector<pollfd> fds;
+                const size_t first = b.svc->poll_fds(&fds);
+                const int n = ::poll(fds.data(), fds.size(), 0);
+                b.port.tick(b.now);
+                b.svc->after_poll(fds, first, b.now);
+                const bool pending = (feeds.cluster() && feeds.cluster()->wants_write()) ||
+                                     (feeds.hud_feed() && feeds.hud_feed()->wants_write());
+                const bool busy = scaling(feeds, b.now);
+                if (busy)
+                    usleep(1000);
+                feeds.poll(b.now);
+                if (round > 0 && n <= 0 && !pending && !busy)
+                    break;
+            }
+        }
+    };
+    const auto frames_on = [&](const char *target) {
+        unsigned long long sum = 0;
+        for (const crs::Layer *l : b.svc->compositor().layers()) {
+            if (b.svc->slots().targets()[l->target()].name != target || std::string(l->kind()) != "video")
+                continue;
+            unsigned long long n[4] = {};
+            std::sscanf(l->stats().c_str(), "%llu sent, %llu unchanged, %llu within threshold, %llu superseded",
+                        &n[0], &n[1], &n[2], &n[3]);
+            sum += n[0] + n[1] + n[2] + n[3];
+        }
+        return sum;
+    };
+    pump(2000);
+    ok("MapFeeds: both shown, seen", !feeds.unseen() && feeds.status("d").state == "showing" &&
+                                         feeds.status("d").hud_state == "showing");
+    b.port.steal(b.sc.targets[0], kStock);
+    pump(1000);
+    unsigned long long m0 = frames_on("map"), h0 = frames_on("hud");
+    pump(4000);
+    const unsigned long long map_sent = frames_on("map") - m0, hud_sent = frames_on("hud") - h0;
+    ok("MapFeeds: the cluster's parked, the HUD's shown: seen",
+       !feeds.unseen() && feeds.cluster()->unseen() && !feeds.hud_feed()->unseen());
+    ok("MapFeeds: the unseen cluster's a repeat a second, the HUD's frames at hud_fps",
+       map_sent >= 2 && map_sent <= 6 && hud_sent >= 30);
+    b.port.stock_map(0x322, 0x01000322);   /* BMW's list on the HUD: it gives way */
+    pump(1000);
+    m0 = frames_on("map");
+    h0 = frames_on("hud");
+    pump(4000);
+    ok("MapFeeds: the HUD giving way to BMW's list too: unseen", feeds.unseen() && feeds.hud_feed()->unseen());
+    const unsigned long long hud_unseen = frames_on("hud") - h0;
+    ok("MapFeeds: the unseen HUD scales nothing, a repeat a second", hud_unseen >= 2 && hud_unseen <= 6);
+    feeds.set_hud_width(60);   /* a new layer at the new size, its target's state unchanged */
+    pump(1000);
+    h0 = frames_on("hud");
+    pump(3000);
+    ok("MapFeeds: the HUD resized while giving way: its new layer unseen, once a second",
+       feeds.hud_feed()->unseen() && frames_on("hud") - h0 >= 2 && frames_on("hud") - h0 <= 5);
+    b.port.stock_unmap(0x322, 0x01000322);
+    pump(3000);
+    ok("MapFeeds: the list gone, the HUD back: seen", !feeds.unseen() && !feeds.hud_feed()->unseen() &&
+                                                       feeds.status("d").hud_state == "showing");
+    feeds.set_hud(false);
+    pump(500);
+    ok("MapFeeds: the cluster's alone, parked: unseen", feeds.unseen());
+    b.port.stock_unmap(0x100, kStock);
+    pump(1000);
+    ok("MapFeeds: the stock map gone: seen, showing", !feeds.unseen() && feeds.status("d").state == "showing");
+    feeds.set_cluster(false);
+    ok("MapFeeds: neither: not unseen (no pictures at all)", !feeds.unseen() && !feeds.wants_frames());
+}
+
 int main()
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1141,6 +1486,8 @@ int main()
     always_packed_map();
     old_renderer();
     renderer_changed();
+    renderer_fresh_changed();
+    unseen_map();
     Rig r;
     r.pump(100);
     const crs::Layer *l = r.map_layer();

@@ -94,6 +94,7 @@
     "2.4 GHz": "2,4 GHz",
     "Audio may cut out. On your iPhone, turn Wi-Fi off and on.": "Zvuk sa môže prerušovať. Na iPhone vypnite a zapnite Wi-Fi.",
     "Own settings for this driver": "Vlastné nastavenia pre tohto vodiča",
+    "Driver profile can't be read": "Profil vodiča sa nedá načítať",
     "Keep HUD map over BMW's pop-ups": "Ponechať mapu na HUD nad kontextovými oknami BMW"
   }
 }

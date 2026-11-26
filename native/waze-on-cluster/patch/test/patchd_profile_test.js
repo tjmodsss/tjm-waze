@@ -190,7 +190,7 @@ var A = 'a1b2c3d4-0000-4000-8000-000000000001', B = 'a1b2c3d4-0000-4000-8000-000
     ok('ticked: map.state.conf as it was', fs.readFileSync(STATE, 'utf8') === first);
 
     /* A change while the profile has its own: its copy and map.state.conf. */
-    r = await ask({ cmd: 'hud-size', hud_width_pct: 50 });
+    r = await ask({ cmd: 'hud-size', hud_width_pct: 50, profile: A, own: 1 });
     ok('a change with own settings: in the profile\'s copy and in map.state.conf', r.ok && await when(function () {
         return state().hud_width_pct === 50 && profiles().own[A].hud_width_pct === 50 && profiles().shared.hud_width_pct === 70;
     }));
@@ -210,8 +210,8 @@ var A = 'a1b2c3d4-0000-4000-8000-000000000001', B = 'a1b2c3d4-0000-4000-8000-000
     ok('the local conf untouched', fs.readFileSync(CONF, 'utf8') === LOCAL);
 
     /* B changes the shared settings; A's stay A's. */
-    await ask({ cmd: 'hud-pos', hud_x: 40, hud_y: -20 });
-    await ask({ cmd: 'cluster', on: 0 });
+    await ask({ cmd: 'hud-pos', hud_x: 40, hud_y: -20, profile: B, own: 0 });
+    await ask({ cmd: 'cluster', on: 0, profile: B, own: 0 });
     await when(function () { return state().cluster === 0 && profiles().shared.cluster === 0; });
     r = await ask({ cmd: 'profile', id: A });
     ok('back to A: its own settings, changed', r.ok && r.own === true && r.changed === true && same(r.settings, settings(1, 1, 50, 0, 0)));
@@ -238,7 +238,7 @@ var A = 'a1b2c3d4-0000-4000-8000-000000000001', B = 'a1b2c3d4-0000-4000-8000-000
 
     /* A burst of switches, sent at once: one write, after the last. */
     await ask({ cmd: 'profile-own', id: A, on: 1 });
-    await ask({ cmd: 'hud-size', hud_width_pct: 40 });
+    await ask({ cmd: 'hud-size', hud_width_pct: 40, profile: A, own: 1 });
     await when(function () { return state().hud_width_pct === 40 && profiles().own[A].hud_width_pct === 40; });
     await saved();
     var pIno = ino(PROFILES);
@@ -310,10 +310,10 @@ var A = 'a1b2c3d4-0000-4000-8000-000000000001', B = 'a1b2c3d4-0000-4000-8000-000
     await start();
     await ask({ cmd: 'profile', id: A });
     await ask({ cmd: 'profile-own', id: A, on: 1 });
-    await ask({ cmd: 'hud-size', hud_width_pct: 60 });
+    await ask({ cmd: 'hud-size', hud_width_pct: 60, profile: A, own: 1 });
     await ask({ cmd: 'profile', id: B });
     await ask({ cmd: 'profile-own', id: B, on: 1 });
-    await ask({ cmd: 'hud-size', hud_width_pct: 40 });
+    await ask({ cmd: 'hud-size', hud_width_pct: 40, profile: B, own: 1 });
     var both = function () { var f = profiles(); return f.own[A].hud_width_pct === 60 && f.own[B].hud_width_pct === 40; };
     ok('A and B with their own settings', await when(function () { return both() && state().hud_width_pct === 40; }));
     /* map.state.conf's write fails: profiles.json already right, map.state.conf written when tried again */
@@ -364,7 +364,7 @@ var A = 'a1b2c3d4-0000-4000-8000-000000000001', B = 'a1b2c3d4-0000-4000-8000-000
         await start();
         await ask({ cmd: 'profile', id: A });
         await ask({ cmd: 'profile-own', id: A, on: 1 });
-        await ask({ cmd: 'hud-size', hud_width_pct: 60 });
+        await ask({ cmd: 'hud-size', hud_width_pct: 60, profile: A, own: 1 });
         await when(function () { return state().hud_width_pct === 60 && profiles().own[A].hud_width_pct === 60; });
     }
     await aOwn();
@@ -424,7 +424,7 @@ var A = 'a1b2c3d4-0000-4000-8000-000000000001', B = 'a1b2c3d4-0000-4000-8000-000
     await start();
     await ask({ cmd: 'profile', id: A });
     await ask({ cmd: 'profile-own', id: A, on: 1 });
-    r = await ask({ cmd: 'cluster', on: 0 });
+    r = await ask({ cmd: 'cluster', on: 0, profile: A, own: 1 });
     ok('Off as A\'s own: map.state.conf on neither, A\'s copy too, the shared settings on the cluster', r.ok && await when(function () {
         pf = profiles();
         return sameKeys(state(), OFF) && same(pf.own[A], OFF) && same(pf.shared, ON) && pf.active === A;
@@ -441,7 +441,7 @@ var A = 'a1b2c3d4-0000-4000-8000-000000000001', B = 'a1b2c3d4-0000-4000-8000-000
     ok('started again: A\'s Off kept in map.state.conf and profiles.json, nothing to move', r.ok && r.own && !r.changed && same(r.settings, OFF) &&
         sameKeys(state(), OFF) && same(profiles().own[A], OFF), JSON.stringify(r));
     r = await ask({ cmd: 'profile', id: B });
-    await ask({ cmd: 'cluster', on: 0 });
+    await ask({ cmd: 'cluster', on: 0, profile: B, own: 0 });
     ok('Off as the shared settings: B on neither, A\'s own still Off', r.ok && !r.own && await when(function () {
         pf = profiles();
         return sameKeys(state(), OFF) && same(pf.shared, OFF) && same(pf.own[A], OFF) && pf.active === null;
@@ -487,7 +487,7 @@ var A = 'a1b2c3d4-0000-4000-8000-000000000001', B = 'a1b2c3d4-0000-4000-8000-000
     r = await ask({ cmd: 'profile', id: A });
     ok('a profiles.json from before hud_keep_shown: A keeps its own settings, giving way', r.ok && r.own &&
         same(r.settings, settings(1, 1, 50, 0, 0, 0)) && !/WARNING: driver profiles/.test(out.slice(mark)), JSON.stringify(r));
-    r = await ask({ cmd: 'hud-keep-shown', on: 1 });
+    r = await ask({ cmd: 'hud-keep-shown', on: 1, profile: A, own: 1 });
     ok('kept shown as A\'s own: in A\'s copy and map.state.conf', r.ok && r.hud_keep_shown === 1 && await when(function () {
         return state().hud_keep_shown === 1 && profiles().own[A].hud_keep_shown === 1;
     }), JSON.stringify(profiles()));

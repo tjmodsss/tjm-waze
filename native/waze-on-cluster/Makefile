@@ -92,7 +92,7 @@ test-bin: $(CPP_TESTS)
 # The patchers, patchd and boot recovery under the umask an installer may
 # set (077): every file they replace keeps the mode its service needs.
 NODE_TESTS = locate permissions file_mode mutation undo rollback_conf patch patchd_patch patchd_activate \
-	patchd_hud patchd_profile patchd_dlt patchd_reboot patchd_wifi wifi_band dlt_capture capture_host recovery \
+	patchd_hud patchd_profile patchd_profile_write patchd_dlt patchd_reboot patchd_wifi wifi_band dlt_capture capture_host recovery \
 	recovery_lock inmem journal_keep logs collect_logs logs_fw units x86_flow aapd_locate aapd head_unit
 NODE_RUNS = $(addprefix node-,$(NODE_TESTS)) $(addprefix node-rollback.,$(ROLLBACK_PART_IDS))
 

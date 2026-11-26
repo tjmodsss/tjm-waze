@@ -240,6 +240,7 @@ class OnlineApp extends EventEmitter {
 const hmiContexts = [];
 let displayLanguage = null;
 let sessionUser = '';
+const GUEST = 'de.bmw.infotainment.personalization.UserAccountManager.guest';
 const someipBuilders = {
     buildTypedProxy: (iface, instance) => Promise.resolve(iface === 'de.bmw.infotainment.personalization.SessionManager' ? {
         init: () => Promise.resolve(),
@@ -284,7 +285,7 @@ async function main() {
     const main = xmlIds('1').map(([id]) => [id, components[id].type, components[id].name, shipped(components[id])]);
     assert.deepStrictEqual(main.map(([id, type, name, text]) => (type === 'title' ? name : `${name} ${text}`)), [
         'wocTitle',
-        'wocHeadGeneral General', 'wocShowOn Show on: Cluster', 'wocProfile Own settings for this driver', 'wocMap Cluster map: Off', "wocGuide Hide BMW's turn box", 'wocLogs Logs',
+        'wocHeadGeneral General', 'wocShowOn Show on: Cluster', 'wocProfile Own settings for this driver', 'wocProfileStatus ', 'wocMap Cluster map: Off', "wocGuide Hide BMW's turn box", 'wocLogs Logs',
         'wocHeadHud HUD', 'wocHud HUD map: \u2014', "wocHudKeep Keep HUD map over BMW's pop-ups", 'wocHudSize Size: \u2014', 'wocHudPos Position: \u2014', 'wocHudLeft Move left',
         'wocHudRight Move right', 'wocHudUp Move up', 'wocHudDown Move down', 'wocHudCentre Centre',
         'wocHeadCarPlay CarPlay', 'wocStatus Status: Connecting…', 'wocEnable Patch', 'wocDisable Remove patch', 'wocWifi ', 'wocWifiHint ',
@@ -314,16 +315,16 @@ async function main() {
     assert.deepStrictEqual(['MinValue', 'MaxValue', 'NumberOfSteps'].map((k) => components['52'].rows[0][k].value), [0, HUD_SIZE_STEPS, HUD_SIZE_STEPS],
         'the slider: one step for each 5 %');
     /* every info row reads "Name: Value" */
-    assert(main.filter(([, type, name]) => type === 'label' && !/^wocHead|^(wocRestartStatus|wocWifi|wocWifiHint)$/.test(name))
+    assert(main.filter(([, type, name]) => type === 'label' && !/^wocHead|^(wocProfileStatus|wocRestartStatus|wocWifi|wocWifiHint)$/.test(name))
         .every(([, , , text]) => /^[A-Z][A-Za-z ]+: [A-Z\u2014]/.test(text)), 'info rows as Name: Value');
     const hidden = Object.values(components).filter((d) => d.properties.Visible.value !== 1).map((d) => d.name);
-    assert.deepStrictEqual(hidden, ['wocWifi', 'wocWifiHint', 'wocRestart', 'wocRestartStatus'],
-        'every row ships shown but CarPlay Wi-Fi, its line and the restart\'s two');
+    assert.deepStrictEqual(hidden, ['wocWifi', 'wocWifiHint', 'wocRestart', 'wocRestartStatus', 'wocProfileStatus'],
+        'every row ships shown but CarPlay Wi-Fi, its line, the restart\'s two and the driver profile\'s line');
     assert(/<component id="34" type="button" widget="LT_Button_1Row">\s*<property id="2" value="0"\/>/.test(XML), 'application.xml: the restart, hidden');
-    ['29', '30'].forEach((id) => assert(new RegExp(`<component id="${id}" type="label" widget="LT_Label_1Row">\\s*<property id="2" value="0"\\/>\\s*` +
+    ['29', '30', '64'].forEach((id) => assert(new RegExp(`<component id="${id}" type="label" widget="LT_Label_1Row">\\s*<property id="2" value="0"\\/>\\s*` +
         '<property id="3" value="0"\\/>').test(XML), `application.xml: ${components[id].name}, hidden and unfocusable`));
     console.log('ok   the main page: General, HUD, CarPlay and Android Auto under unfocusable header rows, Show on the first stop; no log rows; ' +
-        'CarPlay Wi-Fi and its line CarPlay\'s last, the restart\'s rows the page\'s last, all four hidden');
+        'the driver profile\'s line under Own, CarPlay Wi-Fi and its line CarPlay\'s last, the restart\'s rows the page\'s last, all five hidden');
     const logsPage = UI.containers['2'];
     assert.strictEqual(logsPage.name, 'ST_OnlineApps_WazeClusterLogs');
     assert.deepStrictEqual(logsPage.properties.ParentState, { value: 1, type: 'UInt' }, 'the Logs page is a child of the main page');
@@ -446,6 +447,54 @@ async function main() {
         const showOn = byName.wocShowOn;
         const size = byName.wocHudSize;
         const hudRows = () => ['wocHudKeep', 'wocHudSize', 'wocHudLeft', 'wocHudRight', 'wocHudUp', 'wocHudDown'].map((n) => byName[n].enabled);
+        const own = byName.wocProfile;
+        const sync = OnlineApp.instance._profiles;
+        const mapWrites = () => patch.received.filter((m) => ['cluster', 'hud', 'hud-size', 'hud-pos', 'hud-keep-shown'].includes(m.cmd));
+
+        const profileLine = byName.wocProfileStatus;
+        /* no driver with own settings: the shared settings are the only
+         * ones; with no driver profile read (an empty value), Show on acts,
+         * its writes name no profile, and no line says the profile is unreadable */
+        await until('reads with nothing to go by', () => sync.unreadable());
+        assert(showOn.enabled === true && own.enabled === false && profileLine.visible === false,
+            'no own settings: Show on acts without a driver profile, no line about it');
+        await sleep(450);
+        showOn.pick(3);
+        await until('Off, saved without a profile', () => render.cluster === 0 && patch.map.cluster === 0 &&
+            JSON.stringify(mapWrites().slice(-1)) === JSON.stringify([{ cmd: 'cluster', on: 0 }]));
+        await sleep(450);
+        showOn.pick(0);
+        await until('the cluster again', () => render.cluster === 1 && patch.map.cluster === 1 && showOn.shown() === 'Show on: Cluster');
+        console.log('ok   no driver with own settings: Show on acts with no driver profile read, its writes name none');
+
+        /* another driver with own settings (patchd says so): until a driver
+         * profile is read, Show on, the HUD's rows and Own greyed, the line
+         * says the profile cannot be read; a pick or press saves nothing */
+        patch.own['a1b2c3d4-0000-4000-8000-000000000009'] = Object.assign({}, patch.map);
+        patch._broadcast(patch._status());
+        await until('greyed, the line shown', () => showOn.enabled === false && profileLine.visible === true &&
+            profileLine.text === "Driver profile can't be read");
+        assert(hudRows().every((e) => e === false) && own.enabled === false && own.selected === false &&
+            own.text === 'Own settings for this driver', 'greyed until a driver profile is settled');
+        assert.strictEqual(patch.count('profile'), 0, 'an empty value tells patchd nothing');
+        const writesBefore = mapWrites().length;
+        render.received.length = 0;
+        await sleep(450);
+        showOn.pick(1);
+        await until('a greyed drop-down picked: back where it was', () => showOn.shown() === 'Show on: Cluster');
+        own.press();
+        await until('a greyed checkbox pressed: unticked again', () => own.selected === false);
+        await sleep(100);
+        assert.deepStrictEqual(render.received, [], 'a pick before the profile is settled: nothing to the render');
+        assert.strictEqual(mapWrites().length, writesBefore, 'a pick before the profile is settled: nothing saved');
+        assert.strictEqual(patch.count('profile-own'), 0, 'a greyed checkbox pressed asks nothing');
+        /* the guest profile, on the shared settings */
+        sessionUser = GUEST;
+        await until('the guest profile settled', () => sync.profile === GUEST && showOn.enabled === true && profileLine.visible === false);
+        await sleep(450);
+        console.log('ok   another driver with own settings: until a driver profile is settled, Show on, the HUD\'s rows and Own greyed, ' +
+            'the line says the profile cannot be read; a pick sends and saves nothing');
+
         await until('the cluster, the HUD off', () => showOn.shown() === 'Show on: Cluster' && showOn.enabled === true &&
             byName.wocHud.text === 'HUD map: Off' && size.text === 'Size: Standard' && size.cells['0:Value'] === 5 &&
             byName.wocHudPos.text === 'Position: Centre');
@@ -457,9 +506,11 @@ async function main() {
         showOn.pick(1);
         await until('the HUD alone', () => render.hud === 1 && render.cluster === 0 && showOn.shown() === 'Show on: HUD (experimental)' &&
             byName.wocHud.text === 'HUD map: Showing' && byName.wocMap.text === 'Cluster map: Off' && byName.wocGuide.enabled === false);
+        assert.deepStrictEqual(mapWrites().slice(-2), [{ cmd: 'hud', on: 1, profile: GUEST, own: 0 }, { cmd: 'cluster', on: 0, profile: GUEST, own: 0 }],
+            'each write names the driver profile and the settings the page showed');
         await until('the size and position enabled', () => hudRows().every((e) => e === true));
         assert.deepStrictEqual(render.received, [{ cmd: 'hud', on: '1' }, { cmd: 'cluster', on: '0' }], 'the HUD on, then the cluster off');
-        await until('saved', () => patch.count('hud') === 1 && patch.count('cluster') === 1);
+        await until('saved', () => patch.map.hud === 1 && patch.map.cluster === 0);
         size.turn(1);
         await until('larger', () => size.text === 'Size: 60 %' && render.hudWidth === 60 && size.cells['0:Value'] === 6);
         await until('saved', () => patch.received.some((m) => m.cmd === 'hud-size' && m.hud_width_pct === 60));
@@ -522,7 +573,7 @@ async function main() {
         await until('off from the cluster', () => render.cluster === 0 && render.hud === 0 && offShown());
         assert.deepStrictEqual(render.received, [{ cmd: 'cluster', on: '0' }], 'only the cluster off');
         await until('off saved', () => saves() === saved + 1);
-        assert.deepStrictEqual(patch.received.slice(-1), [{ cmd: 'cluster', on: 0 }]);
+        assert.deepStrictEqual(patch.received.slice(-1), [{ cmd: 'cluster', on: 0, profile: GUEST, own: 0 }]);
         render.received.length = 0;
         size.turn(1);
         byName.wocHudLeft.emit('action');
@@ -559,17 +610,8 @@ async function main() {
             'Disabled after errors greys them');
 
         /* ---- own settings per driver profile ---- */
-        const own = byName.wocProfile;
-        /* no profile read yet (an empty value): greyed, nothing told, a press asks nothing */
-        await sleep(100);
-        assert(own.enabled === false && own.selected === false && own.text === 'Own settings for this driver', 'greyed, unticked');
-        assert.strictEqual(patch.count('profile'), 0, 'an empty value tells patchd nothing');
-        own.press();
-        await until('a greyed checkbox pressed: unticked again', () => own.selected === false);
-        await sleep(100);
-        assert.strictEqual(patch.count('profile-own'), 0, 'a greyed checkbox pressed asks nothing');
         sessionUser = 'a1b2c3d4-0000-4000-8000-000000000001';
-        await until('driver A: enabled, unticked', () => own.enabled === true && own.selected === false);
+        await until('driver A: enabled, unticked', () => sync.profile === sessionUser && own.enabled === true && own.selected === false);
         await sleep(450);
         own.ticks.length = 0;
         own.press();
@@ -587,18 +629,40 @@ async function main() {
         sessionUser = 'a1b2c3d4-0000-4000-8000-000000000001';
         await until('A again: its HUD, ticked', () => render.hud === 1 && render.cluster === 0 && showOn.shown() === 'Show on: HUD (experimental)' &&
             own.selected === true);
+        /* patchd put B's settings in effect before A's page write reached it
+         * (the profile sync racing the page): refused, nothing saved, the
+         * render back to the stored settings, the profile told again */
+        const aOwn = JSON.stringify(patch.own[sessionUser]), shared = JSON.stringify(patch.shared);
+        patch.current = 'a1b2c3d4-0000-4000-8000-000000000002';
+        patch.active = null;
+        patch.map = patch.shared;
+        const toldBefore = patch.count('profile');
+        await sleep(450);
+        showOn.pick(3);
+        await until('refused: the render back to the stored settings, A told again and its own on the render', () =>
+            patch.count('profile') > toldBefore && patch.current === sessionUser && render.hud === 1 && render.cluster === 0 &&
+            showOn.shown() === 'Show on: HUD (experimental)');
+        assert(mapWrites().slice(-1)[0].profile === sessionUser && mapWrites().slice(-1)[0].own === 1, 'the write named A\'s own settings');
+        assert(render.received.some((m) => m.cmd === 'hud' && m.on === '0'), 'the render had taken the pick');
+        assert.strictEqual(JSON.stringify(patch.own[sessionUser]), aOwn, 'A\'s own settings unchanged');
+        assert.strictEqual(JSON.stringify(patch.shared), shared, 'the shared settings unchanged');
+        console.log('ok   a page write patchd refuses (another driver profile in effect): nothing saved, the render back to the ' +
+            'stored settings, the profile told again');
         await sleep(450);
         own.press();
         await until('unticked: the shared settings back', () => own.selected === false && own.enabled === true && render.cluster === 1 &&
             render.hud === 0 && showOn.shown() === 'Show on: Cluster');
         const told = patch.count('profile');
         sessionUser = '';
-        await sleep(150);
-        assert(own.enabled === true && patch.count('profile') === told && showOn.shown() === 'Show on: Cluster', 'an empty read changes nothing');
+        await until('empty reads: greyed, the line shown', () => own.enabled === false && showOn.enabled === false &&
+            byName.wocProfileStatus.visible === true);
+        assert(patch.count('profile') === told && showOn.shown() === 'Show on: Cluster', 'empty reads tell patchd nothing and keep what is shown');
         sessionUser = 'a1b2c3d4-0000-4000-8000-000000000001';
+        await until('read again: enabled, the line hidden', () => own.enabled === true && showOn.enabled === true &&
+            byName.wocProfileStatus.visible === false);
         render.received.length = 0;
         console.log('ok   Own settings for this driver: greyed until a profile is read; ticked, the profile keeps its own map settings; ' +
-            'a switch moves the render to the other profile\'s or the shared settings; unticked, the shared ones back; an empty read changes nothing');
+            'a switch moves the render to the other profile\'s or the shared settings; unticked, the shared ones back; empty reads grey the page under the line until the profile reads again');
 
         byName.ST_OnlineApps_WazeCluster.emit('visible', { visible: false });
         await until('sockets closed', () => render._clients.size === 0 && patch._clients.size === 0);
@@ -606,8 +670,39 @@ async function main() {
 
         render.stream(false);
         patch.announce('patched', 'high', null);
+        /* the render shows other settings than the ones stored for the driver
+         * in effect (the shared ones, on the cluster): the page opened, it is
+         * moved to them */
+        render.cluster = 0;
+        render.hud = 1;
+        render.received.length = 0;
         byName.ST_OnlineApps_WazeCluster.emit('visible', { visible: true });
         await until('page reads the current state', () => status.text === 'Status: Patched' && byName.wocMap.text === 'Cluster map: Waiting for the phone');
+        await until('the stored settings on the render and the page', () => render.cluster === 1 && render.hud === 0 &&
+            showOn.shown() === 'Show on: Cluster');
+        console.log('ok   the page opened: the render moved to the settings stored for the driver profile in effect');
+
+        /* a driver switch while the app is in the background, its poll not
+         * yet come: back in focus, the page loads the new driver's stored
+         * settings at once */
+        const B = 'a1b2c3d4-0000-4000-8000-000000000002';
+        patch.own[B] = { cluster: 0, hud: 1, hud_width_pct: 0, hud_offset_x: 0, hud_offset_y: 0, hud_keep_shown: 0 };
+        byName.ST_OnlineApps_WazeCluster.emit('visible', { visible: false });
+        await until('hidden', () => render._clients.size === 0 && patch._clients.size === 0);
+        sync._pollMs = 600000;
+        await until('no read on its way', () => !sync._polling);
+        clearTimeout(sync._timer);
+        sessionUser = B;
+        const t0 = Date.now();
+        byName.ST_OnlineApps_WazeCluster.emit('visible', { visible: true });
+        await until('B\'s own settings: the HUD alone', () => sync.profile === B && render.hud === 1 && render.cluster === 0 &&
+            showOn.shown() === 'Show on: HUD (experimental)' && showOn.enabled === true);
+        assert(Date.now() - t0 < 1500, `at once, not at a poll: ${Date.now() - t0} ms`);
+        console.log('ok   back in focus after a driver switch in the background: the new driver\'s stored settings at once');
+        sessionUser = 'a1b2c3d4-0000-4000-8000-000000000001';
+        sync._pollMs = 20;
+        sync.load();
+        await until('A again', () => sync.profile === sessionUser && render.cluster === 1);
         console.log('ok   a page opened again reads the render\'s current state');
 
         /* The patch the install wrote, from the daemon: its line, Patch
@@ -673,12 +768,12 @@ async function main() {
         await until('unknown', () => wifi.visible === false && hint.visible === false);
         console.log('ok   CarPlay Wi-Fi: 5 GHz alone, 2.4 GHz with the line under it; neither while the band is unknown');
 
-        /* Through every state above, no row came or went but CarPlay Wi-Fi,
-         * its line and the restart's, and each button was greyed and enabled
-         * in place. */
-        assert.deepStrictEqual([...shownOrHidden].sort(), ['wocRestart', 'wocRestartStatus', 'wocWifi', 'wocWifiHint'],
-            'only CarPlay Wi-Fi, its line and the restart\'s rows are shown and hidden');
-        Object.values(components).filter((d) => !/^(wocRestart|wocWifi)/.test(d.name) && d.type !== 'title')
+        /* Through every state above, no row came or went but the driver
+         * profile's line, CarPlay Wi-Fi, its line and the restart's, and each
+         * button was greyed and enabled in place. */
+        assert.deepStrictEqual([...shownOrHidden].sort(), ['wocProfileStatus', 'wocRestart', 'wocRestartStatus', 'wocWifi', 'wocWifiHint'],
+            'only the driver profile\'s line, CarPlay Wi-Fi, its line and the restart\'s rows are shown and hidden');
+        Object.values(components).filter((d) => !/^(wocRestart|wocWifi|wocProfileStatus)/.test(d.name) && d.type !== 'title')
             .forEach((d) => assert.strictEqual(byName[d.name].visible, true, `${d.name} stays on the page`));
         ['wocEnable', 'wocDisable', 'wocAaEnable', 'wocAaDisable', 'wocAaZoomOut', 'wocAaZoomIn', 'wocAaCard', 'wocGuide', 'wocShowOn', 'wocProfile', 'wocHudSize',
             'wocHudLeft', 'wocHudCentre', 'wocHudKeep']

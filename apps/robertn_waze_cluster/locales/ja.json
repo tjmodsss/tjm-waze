@@ -94,6 +94,7 @@
     "2.4 GHz": "2.4 GHz",
     "Audio may cut out. On your iPhone, turn Wi-Fi off and on.": "音声が途切れることがあります。iPhoneでWi-Fiをオフにしてからオンにしてください。",
     "Own settings for this driver": "このドライバー専用の設定",
+    "Driver profile can't be read": "ドライバープロファイルを読み取れません",
     "Keep HUD map over BMW's pop-ups": "HUDの地図をBMWのポップアップより優先"
   }
 }

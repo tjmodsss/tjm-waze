@@ -8,7 +8,9 @@
  * guide hold is asked for. The HUD's is made while the HUD is on, beside
  * the cluster's. Off, nothing
  * of it exists: no connection, no layer, no thread, no copy. With neither,
- * wants_frames() is false: the capture decodes without pictures.
+ * wants_frames() is false: the capture decodes without pictures. With
+ * feeds none of which is seen (MapFeed "Unseen"), unseen() is true: the
+ * capture makes kUnseenFps pictures a second (picture_pace.h).
  *
  * Each feed is its own connection to the cluster renderer and its own
  * layer, so each slot is asked for, held and released on its own. A new
@@ -55,6 +57,10 @@ public:
     /* A feed takes frames: the cluster's, or the HUD's with its layer made
      * and not disabled. */
     bool wants_frames() const;
+    /* Of those, none is seen (MapFeed::unseen): the pictures go down to
+     * kUnseenFps a second (picture_pace.h) until one is. */
+    bool unseen() const;
+    void set_picture_coming(bool coming);
     /* The HUD map's size and place as asked, kept for a HUD feed made
      * later; the status has the place as far as the HUD's feed puts it. */
     void set_hud_width(unsigned pct);

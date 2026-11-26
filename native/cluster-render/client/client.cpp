@@ -161,7 +161,7 @@ void Client::disconnect(int64_t now_ms)
         keep_last(f.first, &f.second.px);
     for (auto &kv : layers_)
         kv.second.sent = false;
-    repeats_ = always_packed_ = preload_ = others_fps_ = render_state_ = samplers_ = host_layers_ = canvas_ = curves_ = nodes_ = draw_ = instances_ = cube_ = values_ = shm_frames_ = scene_anim_ = over_order_ = text_ = false;
+    repeats_ = always_packed_ = preload_ = others_fps_ = render_state_ = samplers_ = host_layers_ = host_hide_ = fresh_ms_ = canvas_ = curves_ = nodes_ = draw_ = instances_ = cube_ = values_ = shm_frames_ = scene_anim_ = over_order_ = text_ = false;
     for (auto &kv : shm_)
         shm_close(&kv.second);
     shm_.clear();
@@ -253,6 +253,8 @@ void Client::read_events()
             render_state_ = j["render_state"] == "1";
             samplers_ = j["samplers"] == "1";
             host_layers_ = j["host_layers"] == "1";
+            host_hide_ = j["host_hide"] == "1";
+            fresh_ms_ = j["fresh_ms"] == "1";
             canvas_ = j["canvas"] == "1";
             curves_ = j["curves"] == "1";
             nodes_ = j["nodes"] == "1";
@@ -635,6 +637,8 @@ std::string Client::layer_json(uint32_t ref, const Layer &l) const
         kv.push_back({"stall_ms", num(l.vo.stall_ms)});
         if (l.vo.always_packed)   /* only when set: a layer without it is written exact */
             kv.push_back({"always_packed", "1"});
+        if (l.vo.fresh_ms)
+            kv.push_back({"fresh_ms", num(l.vo.fresh_ms)});
     } else if (l.kind == "image") {
         kv.push_back({"iw", num(l.io.w)});
         kv.push_back({"ih", num(l.io.h)});
@@ -965,6 +969,8 @@ std::string Client::host_json(const std::pair<std::string, std::string> &by, con
     std::vector<std::pair<std::string, std::string>> kv = {
         {"op", json_quote("host")}, by,             {"target", json_quote(h.target)}, {"x", num(h.x)},
         {"y", num(h.y)},            {"w", num(h.w)}, {"h", num(h.h)},                  {"shown", flag(h.shown)}};
+    if (h.hide)
+        kv.push_back({"hide", "1"});
     if (h.src_w && h.src_h)
         kv.insert(kv.end(), {{"src_x", num(h.src_x)}, {"src_y", num(h.src_y)}, {"src_w", num(h.src_w)},
                              {"src_h", num(h.src_h)}});

@@ -216,6 +216,12 @@ within one budget (`src/governor.h`, `kit/upload_pacer.h`):
   ends as soon as the layer is hidden, waits, goes or its client goes, and
   nothing of it is kept. The held clients get an `fps_cap` event; the
   status lists who asks.
+- **Fresh frames.** A video layer sent with `fresh_ms` (PROTOCOL.md; only
+  to a service whose hello has `fresh_ms` 1): when its target is written
+  again after being off screen, a frame of the layer from before waits up
+  to that long for a newer one, and only that frame waits; the target's
+  other layers are written as usual. waze-on-cluster uses it so a map seen
+  again is drawn with its newest picture first.
 - **The HUD's share.** While `hud` has a layer, its layers and assets write
   from up to half of the budget, only as much as they spend; what the HUD
   leaves goes to the cluster. With the cluster idle the HUD gets the whole
@@ -320,7 +326,10 @@ Beside the layers:
   (over it when that one is exclusive), so its frame and readouts sit over
   it. The picture goes back to its own target while none of the app's
   layers over the rect is drawn, the panel is not on screen, or a scene
-  hosts it, and when the app ends the host or exits. Of several apps
+  hosts it, and when the app ends the host or exits. A host sent with
+  `hide` and `shown` 0 hides the picture while that target is on screen
+  with a layer of the app drawn there, instead of putting it back on its
+  own slot under the app's layers; any app's shown host wins over it. Of several apps
   hosting the same target into one target the one drawn highest over the
   picture wins, so a background app's early host loses to the visible
   theme; across targets the one holding it keeps it while it can, so a

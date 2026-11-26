@@ -87,6 +87,10 @@ struct VideoOptions {
      * sent only when set, to a service whose hello takes it
      * (Client::takes_always_packed). */
     bool always_packed = false;
+    /* The target on screen again: a frame from before waits up to this long
+     * for a newer one (PROTOCOL.md "fresh_ms"); sent only when set, to a
+     * service whose hello takes it (Client::takes_fresh_ms). */
+    unsigned fresh_ms = 0;
 };
 
 /* RGBA, straight alpha, w x h (0: the layer's w and h, which must then be
@@ -259,6 +263,10 @@ struct Host {
     int src_x = 0, src_y = 0;
     unsigned src_w = 0, src_h = 0;   /* 0: the whole target */
     bool shown = true;
+    /* a host with into: with shown 0, hidden while into is on screen, not
+     * shown on its own target (sent when set; the event never carries it).
+     * Only to a service whose hello has host_hide (takes_host_hide()). */
+    bool hide = false;
     /* the edge drawn on the hosted picture (sent, all five, with edge_top or
      * edge_bottom; the event never carries it) */
     unsigned edge_top = 0, edge_bottom = 0, edge_fade = 0, edge_dim = 0, edge_blur = 0;
@@ -266,6 +274,7 @@ struct Host {
     {
         return target == o.target && into == o.into && x == o.x && y == o.y && w == o.w && h == o.h &&
                src_x == o.src_x && src_y == o.src_y && src_w == o.src_w && src_h == o.src_h && shown == o.shown &&
+               hide == o.hide &&
                edge_top == o.edge_top && edge_bottom == o.edge_bottom && edge_fade == o.edge_fade &&
                edge_dim == o.edge_dim && edge_blur == o.edge_blur;
     }
@@ -499,6 +508,10 @@ public:
     bool takes_samplers() const { return samplers_; }
     /* The service's hello takes a host from layers (host(const Host &)). */
     bool takes_host_layers() const { return host_layers_; }
+    /* The service's hello takes a host's hide (Host::hide). */
+    bool takes_host_hide() const { return host_hide_; }
+    /* The service's hello takes a video layer's fresh_ms. */
+    bool takes_fresh_ms() const { return fresh_ms_; }
     /* The service's hello takes canvases (CanvasOptions). */
     bool takes_canvas() const { return canvas_; }
     /* The service's hello takes eased curves (animate()'s interp). */
@@ -646,6 +659,8 @@ private:
     bool render_state_ = false;     /* and render state */
     bool samplers_ = false;         /* and samplers */
     bool host_layers_ = false;      /* and hosts from layers */
+    bool host_hide_ = false;        /* and a host's hide */
+    bool fresh_ms_ = false;         /* and a video layer's fresh_ms */
     /* Hosts from this client's layers: by hosted target, (into, message). */
     std::map<std::string, std::pair<std::string, std::string>> layer_hosts_;
     bool canvas_ = false;           /* and canvases */

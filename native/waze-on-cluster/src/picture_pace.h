@@ -28,7 +28,16 @@
  * While another app's layer on the cluster asks for the other videos'
  * upload bandwidth (cluster-render's others_fps), the renderer writes the
  * map at most at its fps_cap, so the pictures follow it (picture_rate),
- * and go back to picture_fps when it is released. */
+ * and go back to picture_fps when it is released.
+ *
+ * While nothing of the map is seen (map_feed.h "Unseen": its slot not on
+ * the cluster, the HUD giving way, hidden by its host), kUnseenFps pictures
+ * a second at most, fewer than the freeze watch takes as shipped
+ * (freeze_min_fps 3), so a stream that freezes then is taken down by its
+ * blank pictures (blank_ms) instead.
+ * Every frame is still decoded, so the stream stays in step without a new
+ * keyframe; seen again, the newest frame's picture comes at once (a late
+ * picture at the new rate) and the rest at the rate above. */
 #ifndef WOC_PICTURE_PACE_H
 #define WOC_PICTURE_PACE_H
 
@@ -37,6 +46,9 @@
 #include "frame_clock.h"
 
 namespace woc {
+
+/* Pictures a second while nothing of the map is seen. */
+const unsigned kUnseenFps = 1;
 
 class PicturePace {
 public:

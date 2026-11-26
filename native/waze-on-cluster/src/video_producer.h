@@ -154,6 +154,9 @@ public:
         paced_seen_ = t;
         return d;
     }
+    /* The newest decoded frame has no picture yet and gets one late
+     * (picture_pace.h): at once when the rate goes up. */
+    bool picture_pending() const { return paced_.load(); }
     /* When the last frame of the decode size was decoded; -1 for none. */
     int64_t last_frame_ms() const { return last_frame_ms_.load(); }
     /* The last minute's pictures of the decode size, how many of them

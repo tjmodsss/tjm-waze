@@ -57,11 +57,30 @@
  * part the layer no longer shows (the host moved or went) is dropped. Only
  * a whole frame (before VPP has the part, or when it cannot make it) goes
  * through the worker. A layer made for another part, or for none, starts
- * from the next frame, not a part of the old one. */
+ * from the next frame, not a part of the old one.
+ *
+ * Unseen: while the renderer reports the visible layer waiting with its
+ * target parked, waiting or unavailable (the cluster shows other content
+ * in the slot, the slot is locked, the HUD gives way to BMW's lists, the
+ * display service is down), states in which it writes nothing of the
+ * target, and while its host hides it, nothing of the map is seen. No frame
+ * goes then and nothing is scaled; a repeat of the last frame keeps the
+ * layer from stalling (at least every quarter of stall_ms, at most every
+ * kUnseenMs), and the newest picture is held. The moment it is seen again
+ * (the renderer reports it shown, or the host shows it), the newest picture
+ * goes first, as a frame, scaled where the layer scales: the producer's
+ * when one is on its way (set_picture_coming; the one at hand waits up to
+ * kAwaitMs for it), else the one at hand. The layer's fresh_ms keeps a
+ * frame of its own from before (one sent as the slot was taken) from being
+ * written ahead of it, unless the target waits on the layer meanwhile
+ * (cluster-render PROTOCOL.md "fresh_ms"); with a renderer that does not
+ * take fresh_ms, a layer is never unseen. A layer the stream hides is not
+ * unseen: its frames go nowhere, as above. */
 #ifndef WOC_MAP_FEED_H
 #define WOC_MAP_FEED_H
 
 #include <stdint.h>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -162,6 +181,13 @@ public:
     static const char *const kHostHidden;
     /* How often poll() looks for the worker's frame while it scales. */
     static const int64_t kScaleWaitMs = 5;
+    /* Unseen (the header's "Unseen"): a repeat at least this often. */
+    static const int64_t kUnseenMs = 1000;
+    /* The layer's fresh_ms (cluster-render PROTOCOL.md). */
+    static const unsigned kFreshMs = 250;
+    /* Seen again: how long the picture at hand waits for the producer's
+     * newest, within kFreshMs. */
+    static const int64_t kAwaitMs = 200;
 
     explicit MapFeed(const FeedConfig &cfg);
 
@@ -221,6 +247,11 @@ public:
     bool latest(std::vector<uint8_t> *out) const;
     /* cluster-render reports the target disabled. */
     bool disabled() const;
+    /* Nothing of the map is seen (the header's "Unseen"). */
+    bool unseen() const;
+    /* The producer has the newest frame's picture on its way (VideoProducer::
+     * picture_pending), for the moment the map is seen again. */
+    void set_picture_coming(bool coming) { picture_coming_ = coming; }
     /* Frames scaled for this feed. */
     uint64_t scaled_frames() const { return worker_.frames(); }
 
@@ -269,6 +300,16 @@ private:
     void send_newest();
     /* Makes the layer visible once the newest frame has gone. */
     void show_when_sent();
+    void follow_seen(int64_t now_ms);
+    /* The newest picture at hand to the layer, as a frame. */
+    void send_at_hand();
+    /* Seen again with the producer's picture on its way: the one at hand
+     * held for it (follow_await sends it when it does not come). */
+    bool awaiting(int64_t now_ms) const;
+    void follow_await(int64_t now_ms);
+    /* Unseen: a repeat when one is due, so the layer never stalls. */
+    void keep_layer(int64_t now_ms);
+    int64_t keep_every_ms() const;
 
     FeedConfig cfg_;
     cr::Client client_;
@@ -317,6 +358,15 @@ private:
      * held_new_ (else the layer's last), never a whole picture. */
     OutputPart held_part_;
     const char *unpacked_why_ = nullptr;   /* why always_packed did not apply, as last logged */
+    /* every target's state as the renderer last reported it on this
+     * connection: it reports a target's again only when it changes */
+    std::map<std::string, std::string> target_states_;
+    bool unseen_ = false;                  /* unseen() at the last poll */
+    int64_t kept_ms_ = 0;                  /* unseen: when it went unseen or the last repeat went */
+    bool picture_coming_ = false;
+    bool layer_fresh_ = false;             /* the layer was made with fresh_ms (made again when that changes) */
+    uint64_t await_id_ = 0;                /* awaiting: the picture at hand's id */
+    int64_t await_until_ms_ = -1;
 };
 
 }  // namespace woc

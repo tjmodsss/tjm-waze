@@ -11,7 +11,8 @@
  * FakeRender speaks the render control protocol: on connect a status and the
  * log backlog. Like the render, it maps on its own: stream(true) -> starting,
  * then showing the "map" page at 30 updates/s; stream(false) -> idle. The map
- * stays when the connection closes. guide -> the status with the new
+ * stays when the connection closes. With `statusDelayMs` set, its status
+ * after a cluster or hud command comes that much later. guide -> the status with the new
  * hide_bmw_guidance (none with `hide` null, as a tool before the switch).
  *
  * FakePatch speaks the patch daemon protocol: on connect the log backlog and
@@ -27,9 +28,18 @@
  * `rebootFails` set, failed with that code. The map settings per driver
  * profile as patchd keeps them: `map` the settings in effect, `shared` and
  * `own` (by id) the rest, `current` the profile last told; profile and
- * profile-own answer as patchd does (profile-own refused for another id), or
- * not at all with `profileMute` set (a patchd before profiles); cluster,
- * hud, hud-size and hud-pos change `map`.
+ * profile-own answer as patchd does (profile-own refused for another id),
+ * `profileDelayMs` late, refused with `profileRefuse` set, by closing the
+ * connection with `profileDrop` set
+ * (a patchd restarting), or not at all with `profileMute` set (a patchd
+ * before profiles); its status says whether any profile has own settings,
+ * sent again `statusDelayMs` after a tick changes that;
+ * cluster,
+ * hud, hud-size, hud-pos and hud-keep-shown change `map`, and one that names
+ * a profile and set ("profile", "own") other than the ones in effect is
+ * refused as patchd refuses it (one naming none while a profile has own
+ * settings too), with the settings in effect; one saved is answered
+ * `saveMs` later with the settings in effect.
  *
  * FakeLogs speaks the logs socket: on connect its state; save -> saving,
  * then the new archive first in the list (or `failWith` as the error).
@@ -195,7 +205,13 @@ class FakeRender extends LineServer {
         }
         if (msg.cmd === 'cluster' && msg.on !== undefined) {
             this.cluster = Number(msg.on);
-            this._broadcast(this._status());
+            if (!this.statusDelayMs) this._broadcast(this._status());
+        }
+        if (msg.cmd === 'hud' || msg.cmd === 'cluster') {
+            if (this.statusDelayMs) {
+                clearTimeout(this._statusTimer);
+                this._statusTimer = setTimeout(() => this._broadcast(this._status()), this.statusDelayMs);
+            }
         }
         if (msg.cmd === 'hud') {
             if (msg.on !== undefined) this.hud = Number(msg.on);
@@ -205,7 +221,7 @@ class FakeRender extends LineServer {
             if (msg.hud_x !== undefined) this.hudX = lim(Number(msg.hud_x));
             if (msg.hud_y !== undefined) this.hudY = Number(msg.hud_y);
             if (msg.hud_keep_shown !== undefined && this.hudKeep !== null) this.hudKeep = Number(msg.hud_keep_shown);
-            this._broadcast(this._status());
+            if (!this.statusDelayMs) this._broadcast(this._status());
         }
     }
 }
@@ -289,7 +305,11 @@ class FakePatch extends LineServer {
             pending: this.pending, conflict: this.conflict, recovered: this.recovered, aa: this.aa,
             removable: this.removable !== null ? this.removable : this.pending === 'apply' || (!this.pending && ['patched', 'unknown', 'error'].includes(this.state)),
             busy: this.busy ? 'carplay' : this.aa.state === 'busy' ? 'aa' : this._rebooting ? 'restart' : null,
-            restart: this.restart, wifi: this.wifi };
+            restart: this.restart, wifi: this.wifi, own_settings: this._ownSettings() };
+    }
+
+    _ownSettings() {
+        return Object.keys(this.own).length > 0;
     }
 
     /* patchd's profileCmd: the settings in effect saved into the entry they
@@ -308,10 +328,14 @@ class FakePatch extends LineServer {
         }
         const target = id && this.own[id] ? id : null;
         const want = target ? this.own[target] : this.shared;
+        const ownBefore = msg.cmd === 'profile-own' ? !msg.on || this._ownSettings() : null;
         const changed = JSON.stringify(want) !== JSON.stringify(this.map);
         this.active = target;
         this.map = want;
-        this._send(socket, { ev: `${msg.cmd}-reply`, ok: true, id, own: !!target, changed, settings: want });
+        const r = { ev: `${msg.cmd}-reply`, ok: true, id, own: !!target, changed, settings: want, own_settings: this._ownSettings() };
+        if (this.profileDelayMs) setTimeout(() => this._send(socket, r), this.profileDelayMs);
+        else this._send(socket, r);
+        if (ownBefore !== null && ownBefore !== this._ownSettings()) setTimeout(() => this._broadcast(this._status()), this.statusDelayMs || 0);
     }
 
     /* CarPlay's Wi-Fi band changes, as patchd sends it: a status. */
@@ -340,15 +364,25 @@ class FakePatch extends LineServer {
             return;
         }
         if (msg.cmd === 'profile' || msg.cmd === 'profile-own') {
-            if (!this.profileMute) this._profile(msg, socket);
+            if (this.profileDrop) socket.destroy();
+            else if (this.profileRefuse) this._send(socket, { ev: 'refused', cmd: msg.cmd, reason: 'not now' });
+            else if (!this.profileMute) this._profile(msg, socket);
             return;
         }
         const MAP = { cluster: ['cluster'], hud: ['hud'], 'hud-size': ['hud_width_pct'], 'hud-pos': ['hud_offset_x', 'hud_offset_y'],
             'hud-keep-shown': ['hud_keep_shown'] };
         if (MAP[msg.cmd]) {
+            if (!('profile' in msg) ? this._ownSettings() : this.current === undefined || msg.profile !== this.current ||
+                    (msg.own === 1) !== !!(msg.profile && this.own[msg.profile])) {
+                this._send(socket, { ev: `${msg.cmd}-reply`, ok: false, refused: 'profile', reason: 'not the driver profile in effect',
+                    settings: this.map, own_settings: this._ownSettings() });
+                return;
+            }
             const v = msg.cmd === 'hud-pos' ? [msg.hud_x, msg.hud_y] : [msg.cmd === 'hud-size' ? msg.hud_width_pct : msg.on];
             this.map = Object.assign({}, this.map);
             MAP[msg.cmd].forEach((k, i) => { this.map[k] = v[i]; });
+            /* answered once saved, with the settings in effect */
+            setTimeout(() => this._send(socket, { ev: `${msg.cmd}-reply`, ok: true, settings: this.map }), this.saveMs || 0);
             return;
         }
         if (msg.cmd === 'reboot') {

@@ -121,6 +121,28 @@
             }
           ]
         },
+        "64": {
+          "type": "label",
+          "name": "wocProfileStatus",
+          "properties": {
+            "Visible": {
+              "value": 0,
+              "type": "UInt"
+            },
+            "Focusable": {
+              "value": 0,
+              "type": "UInt"
+            }
+          },
+          "rows": [
+            {
+              "Text": {
+                "value": "",
+                "type": "Text"
+              }
+            }
+          ]
+        },
         "21": {
           "type": "label",
           "name": "wocMap",

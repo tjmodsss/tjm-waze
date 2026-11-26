@@ -74,6 +74,9 @@ struct VideoParams {
     /* Every write packed, the first and a still picture's too, never the
      * exact atlas; needs pan_blocks (without, off). */
     bool always_packed = false;
+    /* Its target on screen again (on_screen_again): a frame that came before
+     * waits up to this long for a newer one before it is written (0: none). */
+    int fresh_ms = 0;
 };
 
 /* A host's edge (PROTOCOL.md "host"): the picture's rows kEdgeInset in
@@ -119,6 +122,10 @@ public:
      * counted and kept live as that frame would be, with nothing to copy and
      * no plan to make unless tiles are due to settle. */
     void repeat(int64_t now_ms);
+    /* The target flushes again after it did not: a frame waiting since
+     * before, once this layer has written one, waits up to fresh_ms for a
+     * newer one (PROTOCOL.md "fresh_ms"). Not for a composite's source. */
+    void on_screen_again(int64_t now_ms);
 
     bool ready(int64_t now_ms) const override;
     bool attach(Graph *g, int64_t now_ms, std::string *err) override;
@@ -275,6 +282,10 @@ private:
      * front_stale_: a whole write swapped the newest frame into shown_. */
     bool repeated_ = false, front_stale_ = false;
     int64_t front_ms_ = -1, shown_ms_ = -1, last_frame_ms_ = -1;
+    int64_t picture_ms_ = -1;   /* when front_'s picture came (offer, canvas_changed; not repeat) */
+    bool wrote_ = false;        /* written in a scene before the one it is attached to */
+    /* on_screen_again: the picture of picture_ms_ hold_from_ms_ waits until hold_until_ms_ (-1: none) */
+    int64_t hold_from_ms_ = -1, hold_until_ms_ = -1;
     bool have_ = false;
 
     int atlas_quad_ = 0, block_quad_ = 0;

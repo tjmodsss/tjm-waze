@@ -392,7 +392,7 @@ test('where the map shows: the cluster by default; the HUD and both through the 
     await until('the cluster from off', () => render.cluster === 1 && render.hud === 0 && c.shownOn() === 'cluster' &&
         /^Cluster map: Showing/.test(c.mapText()));
     /* a render on neither from its own configuration reads as Off, a choice still to make */
-    render.cluster = 0;
+    render.cluster = 0; patch.map.cluster = 0;
     render.announce(render.state, render.reason);
     await until('neither', () => c.shownOn() === 'off' && c.canChooseShownOn());
     c.close();
@@ -401,7 +401,7 @@ test('where the map shows: the cluster by default; the HUD and both through the 
 });
 
 test('the HUD disabled by the cluster renderer: Disabled after errors, the size and place greyed, the choice kept', async (render, patch) => {
-    render.hud = 1;
+    render.hud = 1; patch.map.hud = 1;
     render.hudState = 'disabled';
     const c = control();
     c.open();
@@ -420,7 +420,7 @@ test('the HUD disabled by the cluster renderer: Disabled after errors, the size 
 });
 
 test('the HUD map size as a slider: 5 % steps from 30 to 85 %, Standard at the step below its ~57 %', async (render, patch) => {
-    render.hud = 1;
+    render.hud = 1; patch.map.hud = 1;
     const c = control();
     c.open();
     await until('connected', () => c.connectedRender() && c.connectedPatch());
@@ -451,7 +451,7 @@ test('the HUD map over BMW\'s pop-ups: gives way by default; a flip goes to the 
     await until('the HUD off', () => c.renderStatus && c.hudOn() === false);
     assert.deepStrictEqual([c.hudKeepShown(), c.canKeepHud()], [false, false], 'giving way, greyed while the HUD is off');
     c.toggleHudKeep();
-    render.hud = 1;
+    render.hud = 1; patch.map.hud = 1;
     render.announce(render.state, render.reason);
     await until('on', () => c.canKeepHud());
     assert.strictEqual(render.received.filter((m) => m.hud_keep_shown !== undefined).length, 0, 'nothing sent while greyed');
@@ -470,8 +470,8 @@ test('the HUD map over BMW\'s pop-ups: gives way by default; a flip goes to the 
 
 test('an asked HUD size the render does not show: the render\'s own after a moment, at once on a render reconnect; ' +
     'the same step taken again', async (render, patch) => {
-    render.hud = 1;
-    render.hudWidth = 50;
+    render.hud = 1; patch.map.hud = 1;
+    render.hudWidth = 50; patch.map.hud_width_pct = 50;
     const c = control();
     c.open();
     await until('on', () => c.renderStatus && c.canChangeHudSize() && c.hudSizeText() === 'Size: 50 %');
@@ -497,7 +497,7 @@ test('an asked HUD size the render does not show: the render\'s own after a mome
 });
 
 test('the HUD map position: 10 px a press each way, Centre back; the render moves it and patchd saves it', async (render, patch) => {
-    render.hud = 1;
+    render.hud = 1; patch.map.hud = 1;
     const c = control();
     c.open();
     await until('connected', () => c.connectedRender() && c.connectedPatch());

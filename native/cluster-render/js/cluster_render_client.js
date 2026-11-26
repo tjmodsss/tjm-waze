@@ -32,6 +32,7 @@
  *       res: ['/var/opt/my-tool/gauge.ramres'], sha256: [sceneSha, resSha] });
  *   cr.edit(gauge, '--rotate ^needle$=0,0,-30\n--uniform ^bar$:u_level=0.5');
  *   cr.host('panel', { target: 'map', x: 600, y: 120, w: 720, h: 480 });   // the map under this app's panel layers
+ *   cr.host('panel', { target: 'map', x: 600, y: 120, w: 720, h: 480, shown: false, hide: true });   // hidden, not on its own slot
  *   cr.on('host', (target, ev) => { ... });   // ev.into: where target is drawn now ('' : its own slot)
  *   cr.on('hosting', (target, ev) => { ... });   // this app's host: ev.state 'live' or 'waiting', ev.reason
  *   cr.close();
@@ -198,6 +199,7 @@ class ClusterRender extends EventEmitter {
         this.fpsCap = 0;        /* another app's others_fps holding this one's videos (fps_cap); 0: none */
         this.fpsCapApp = '';
         this.hostLayers = false;
+        this.hostHide = false;
         this.layerHosts = new Map();   /* hosts from this app's layers: hosted target -> { into, msg } */
     }
 
@@ -322,6 +324,7 @@ class ClusterRender extends EventEmitter {
             this.renderState = ev.render_state === 1;   /* takes blend factors, depth_func, color_mask */
             this.samplers = ev.samplers === 1;   /* takes mipmapped sampling, mirror, wrap_u/v, anisotropy */
             this.hostLayers = ev.host_layers === 1;   /* takes a host from layers (host('panel', ...)) */
+            this.hostHide = ev.host_hide === 1;   /* takes a host's hide */
             this.canvases = ev.canvas === 1;   /* takes canvases and layers drawn in them */
             this.curves = ev.curves === 1;   /* takes interp ease_in, ease_out, ease_in_out, smooth */
             this.nodes = ev.nodes === 1;   /* takes pivot parts and parents */
@@ -732,6 +735,8 @@ class ClusterRender extends EventEmitter {
         m.w = opts.w;
         m.h = opts.h;
         m.shown = flag(opts.shown !== false);
+        /* with shown false, hidden while into is on screen, not shown on the target's own slot */
+        if (opts.hide) m.hide = 1;
         /* the part: all four with src_w and src_h, else none (all of it), as the C++ client */
         if (opts.src_w && opts.src_h) {
             m.src_x = opts.src_x || 0;

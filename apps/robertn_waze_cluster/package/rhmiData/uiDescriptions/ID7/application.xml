@@ -22,6 +22,10 @@
                 <property id="2" value="1"/>
                 <property id="3" value="3"/>
             </component>
+            <component id="64" type="label" widget="LT_Label_1Row">
+                <property id="2" value="0"/>
+                <property id="3" value="0"/>
+            </component>
             <component id="21" type="label" widget="LT_Label_1Row">
                 <property id="2" value="1"/>
                 <property id="3" value="0"/>

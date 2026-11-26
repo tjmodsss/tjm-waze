@@ -353,6 +353,7 @@ int serve(Config cfg)
         producer.set_live(live, now);
         producer.set_pictures(feed.wants_frames());
         feed.set_stream(live, producer.frozen(now), producer.picture(now));
+        feed.set_picture_coming(producer.picture_pending());
         feed.poll(now);
         if (feed.fps_cap() != fps_cap) {
             fps_cap = feed.fps_cap();
@@ -366,8 +367,9 @@ int serve(Config cfg)
                          feed.fps_cap_app().c_str(), target_fps ? std::min(fps_cap, target_fps) : fps_cap, pictures);
             else
                 log_info("render: the map back at %u updates a second, pictures as configured", target_fps);
-            producer.set_picture_fps(rate);
         }
+        producer.set_picture_fps(feed.unseen() ? kUnseenFps
+                                               : picture_rate(vc.picture_fps, fps_cap, target_fps, picture_floor));
         if (fc.vpp_scale)
             producer.set_part(feed.part());
         producer.retry_sources(now);

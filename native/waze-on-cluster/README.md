@@ -45,7 +45,8 @@ The Store installs it with the app `robertn_waze_cluster`; it requires
 `cluster-render` and `mgu-deploy` (`component.json`, `"requires"`).
 
 **Install.** The deploy tool runs `patchd.js activate` as root. On a car
-coded `KI_KOMBI_VARIANT` 7 with any carplay build whose edit sites the
+coded `KI_KOMBI_VARIANT` 7, or whose coding cannot be read (planned as 7),
+with any carplay build whose edit sites the
 patcher finds and verifies, it plans the patch in memory and arms
 CarPlay's next start, on trial until it has run healthy on that car (see
 Boot recovery), and never stops, kills or
@@ -57,12 +58,19 @@ CarPlay next starts, which then applies the patch in memory, so no restart
 is needed for it. It then does the same for Android Auto on any aapd build
 it can plan: an earlier release's patch of `/usr/bin/aapd` and `/etc/aapd.conf`
 goes back as they ship, and the patch is armed in aapd's memory. Where the
-sites are not found or not recognised, the coding is another, or another
-tool's change is found beside our own edits, it leaves everything as it is,
-and the app's Status says why; bytes away from the sites do not count. A
-patch you turned off with Remove patch stays off across updates, car
-software updates and restarts, until you press Patch (PATCH.md
-"Install-time activation", "In memory").
+sites are not found or not recognised, or another tool's change is found
+beside our own edits, it leaves everything as it is, and the app's Status
+says why; bytes away from the sites do not count. On a car coded
+otherwise it plans nothing, drops a patch planned for another coding and
+puts an earlier release's patch back as it ships. On a cluster coded 9 or
+10 CarPlay and Android Auto show the map themselves, and the app says
+`Built in`; on 0 (no cluster display) or any other coding the map's
+geometry is not known to fit, and it says `Not supported — no cluster
+display` or `Not supported — this cluster`. A car software update that
+replaces CarPlay or aapd leaves them running as they ship until the next
+install or Patch. A patch you turned off with Remove patch stays off across
+updates, car software updates and restarts, until you press Patch
+(PATCH.md "Install-time activation", "In memory").
 
 **Remove.** In the Store, remove the app, then the tool (refused while the
 app is installed). `patchd.js deactivate` turns both patches in memory
@@ -90,9 +98,12 @@ before CarPlay (or aapd) starts: after one failed start for a patch not yet
 proven on that car, after two for a proven one. CarPlay comes back without
 the map, its Status reads `Removed — head
 unit kept restarting`, and its Patch button applies the patch again
-(PATCH.md "Boot recovery"). Android Auto's patch is removed at the first
-crash of the patched aapd, and aapd is started again after every end, so
-Android Auto comes back without the cluster map; the patch stays off until
+(PATCH.md "Boot recovery"). A start that ended with no shutdown record,
+after which the head unit was off 3 minutes or more, counts as one that
+ended in order; a crash in it, or a quick restart after it, still counts.
+Android Auto's patch is removed at the first crash of the patched aapd,
+and aapd is started again after every end, so Android Auto comes back
+without the cluster map; the patch stays off until
 its Patch button applies it, an update brings a newer patch, or a car
 software update replaces aapd or aapd.conf (then it is tried again, on
 trial).

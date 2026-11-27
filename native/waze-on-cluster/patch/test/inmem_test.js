@@ -273,14 +273,20 @@ test('woc-patch.sh off: the next start runs carplay as it ships, the record turn
 }, true);
 
 test('the patcher\'s refusals of a file are conflicts; a failure a later try may not meet is not', () => {
-    ['refusing: head unit: unknown variant is not supported', 'refusing: KI_KOMBI_VARIANT 9 is not the supported cluster coding (7); pass --unproven to patch it anyway',
+    ['refusing: head unit: unknown variant is not supported', 'refusing: not supported on this cluster (KI_KOMBI_VARIANT 9; the map is made for KI_KOMBI_VARIANT 7)',
         'refusing: variant: not found', 'in memory needs the pristine build on disk: variant edited',
         'refusing: the edited image does not verify (sink)', 'refusing: the plan does not reproduce the edited image (bytes differ)'].forEach((w) => assert.strictEqual(inmem.refusal(w), true, w));
-    ['cannot read /usr/bin/carplay: EIO: i/o error',
-        'refusing: the cluster coding cannot be read (/dev/shm/rawcodingdata unreadable); pass --unproven to patch it anyway'].forEach((w) => assert.strictEqual(inmem.refusal(w), false, w));
+    ['cannot read /usr/bin/carplay: EIO: i/o error'].forEach((w) => assert.strictEqual(inmem.refusal(w), false, w));
     assert.strictEqual(inmem.refusalConflict('refusing: the edited image does not verify (sink)'), 'not patchable: the edited image does not verify (sink)');
     assert.strictEqual(inmem.refusalConflict('refusing: the plan does not reproduce the edited image (bytes differ)'), 'not patchable: the plan does not reproduce the edited image (bytes differ)');
-    assert.strictEqual(inmem.refusalConflict('refusing: variant: not found'), 'refusing: variant: not found');
+    /* each refusal as the conflict patchd reports, in the words the app maps */
+    [['refusing: variant: not found', 'not patchable: variant: not found'],
+     ['refusing: head unit: unknown variant is not supported', 'not supported on this car (head unit: unknown variant is not supported)'],
+     ['refusing: not supported on this car (KI_KOMBI_VARIANT 0: no cluster display is coded)', 'not supported on this car (KI_KOMBI_VARIANT 0: no cluster display is coded)'],
+     ['refusing: not supported on this cluster (KI_KOMBI_VARIANT 4; the map is made for KI_KOMBI_VARIANT 7)', 'not supported on this cluster (KI_KOMBI_VARIANT 4; the map is made for KI_KOMBI_VARIANT 7)'],
+     ['refusing: built in on this cluster (KI_KOMBI_VARIANT 9: CarPlay and Android Auto stream the cluster map themselves)', 'built in on this cluster (KI_KOMBI_VARIANT 9: CarPlay and Android Auto stream the cluster map themselves)'],
+     ['refusing: /etc/aapd.conf: no number SCREENS/KOMBI_DISPLAY/DIMENSIONS/12.3/SA_WIDTHPIXELS', 'aapd.conf not usable: no number SCREENS/KOMBI_DISPLAY/DIMENSIONS/12.3/SA_WIDTHPIXELS'],
+     ['in memory needs the pristine build on disk: variant edited', 'in memory needs the pristine build on disk: variant edited']].forEach((c) => assert.strictEqual(inmem.refusalConflict(c[0]), c[1], c[0]));
 });
 
 test('a plan armed by another version\'s library path is armed again (the env file only, the run\'s result kept); an arm that fails says why', async () => {

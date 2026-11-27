@@ -302,7 +302,7 @@ class FakePatch extends LineServer {
     _status() {
         return { ev: 'status', state: this.busy ? 'busy' : this.state, panel: this.panel,
             res: this.res, safe: this.safe, mapurl: this.mapurl, carplay: this.carplay, reason: this.reason,
-            pending: this.pending, conflict: this.conflict, recovered: this.recovered, aa: this.aa,
+            pending: this.pending, conflict: this.conflict, recovered: this.recovered, removed: this.removed, aa: this.aa,
             removable: this.removable !== null ? this.removable : this.pending === 'apply' || (!this.pending && ['patched', 'unknown', 'error'].includes(this.state)),
             busy: this.busy ? 'carplay' : this.aa.state === 'busy' ? 'aa' : this._rebooting ? 'restart' : null,
             restart: this.restart, wifi: this.wifi, own_settings: this._ownSettings() };

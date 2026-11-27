@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.6.18
+
+The Status rows say Not supported only where the patch cannot be applied,
+and why: `Not supported on this head unit`, `Not supported — no cluster
+display`, `Not supported — this cluster`, or `Not supported — this
+CarPlay version` (`this Android Auto version`). A patch turned off with
+Remove patch reads `Removed`, a cluster that shows the map by itself
+`Built in`, and a failure `Failed — press Patch to try again` where Patch
+can retry it. Neither section offers Patch where it is not supported or
+built in.
+
 ## 0.6.17
 
 With Own settings for this driver in use, the page loads the current

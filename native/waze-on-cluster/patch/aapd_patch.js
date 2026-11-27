@@ -14,7 +14,7 @@
  *              (featureFlag && KombiVariant <= 1): the immediate 1 -> 2.
  *              aapd maps raw KI_KOMBI_VARIANT 9 -> 0, 10 -> 1, 1..8 and
  *              11 -> 2, 0 -> 3, so this admits every raw value of class 2;
- *              the plan refuses unless the coding is 7.
+ *              the plan refuses every readable value but 7 (codingRefusal).
  *   selfstart  onNewNavigationStatus()'s call of setNaviStreamStatus
  *              retargeted to requestStream() (same `this`), and
  *              requestStream()'s opening test, `not streaming && focus mode
@@ -36,9 +36,11 @@
  *              geometry, which boot recovery writes there for a start it
  *              arms (inmem.js).
  *
- * The sites are found in each build by aapd_locate.js; a build where any of
- * them is not found is refused, and any build where all are found and
- * verify is planned: no list of builds decides it. `plan` reads aapd on
+ * The sites are found in each build by aapd_locate.js; a build where any
+ * of them is not found is refused, and any build where all are found and
+ * verify is planned: no list of builds decides it. The one exception is a
+ * build without the ready start's site (the locator's `absent`): it is
+ * planned without it, at patch revision 2. `plan` reads aapd on
  * disk, which must be the pristine build (every site stock), and
  * aapd.conf, which must have the entries the geometry needs and hold none
  * of our geometries (aapd_conf.js check); it writes the plan libwocpatch.so
@@ -100,6 +102,8 @@ var SHIPPED = {
  * ready start, which only the patch in memory writes. */
 var EDITS = [['gate', 'gate'], ['call', 'selfstart call'], ['guard', 'selfstart guard'], ['screen', 'screen']];
 var SITES = EDITS.concat([['confpath', 'confpath'], ['readystart', 'readystart']]);
+/* A site's name on the status lines and in the plan. */
+function siteName(e) { return e[1].replace(' ', '-'); }
 /* The most bytes aapd may differ in from its backup and still be its build:
  * the edits' bytes (gate 7, call 5, guard 16, screen at most 16), twice
  * over. */
@@ -110,7 +114,8 @@ var SAME_BUILD_MAX_DIFF = 2 * (7 + 5 + 16 + 16);
  * only when this revision is newer than the turned-off one (patchd.js). 2:
  * requestStream goes ahead only while the phone's cluster display is set
  * up. 3: the stream is also asked for when the phone sets the display up
- * (readystart). */
+ * (readystart). A plan for a build without the ready start's site is
+ * revision 2. */
 var PATCH_REV = 3;
 
 /* /dev/shm/rawcodingdata, the coding image CodingShmApp publishes: a 0x2c
@@ -139,11 +144,19 @@ function readCoding(p) {
     return { variant: (b[CODING.at] & CODING.mask) >> CODING.shift };
 }
 
-/* Why a coding readCoding read ({variant} or {err}) is not the one the
- * patch is made for (KI_KOMBI_VARIANT 7), or null. */
+/* Why the patch is not for a coding readCoding read ({variant} or {err}),
+ * or null. The map's slot, safe area and crop are those of the
+ * KI_KOMBI_VARIANT 7 cluster (high_4_1). 9 and 10 (ic_box_high, ic_box_mid)
+ * are clusters CarPlay and Android Auto stream the map to themselves; 0
+ * codes no cluster display, and every other value another cluster. A
+ * coding that cannot be read is planned as 7, on trial; boot recovery
+ * plans it again once it reads otherwise (recovery.js codingMoved). */
+var BUILT_IN = [9, 10];
 function codingRefusal(cd) {
-    return cd.err ? 'the cluster coding cannot be read (' + cd.err + ')'
-        : cd.variant !== CODING.want ? 'KI_KOMBI_VARIANT ' + cd.variant + ' is not the supported cluster coding (' + CODING.want + ')' : null;
+    if (cd.err || cd.variant === CODING.want) return null;
+    return cd.variant === 0 ? 'not supported on this car (KI_KOMBI_VARIANT 0: no cluster display is coded)'
+        : BUILT_IN.indexOf(cd.variant) >= 0 ? 'built in on this cluster (KI_KOMBI_VARIANT ' + cd.variant + ': CarPlay and Android Auto stream the cluster map themselves)'
+        : 'not supported on this cluster (KI_KOMBI_VARIANT ' + cd.variant + '; the map is made for KI_KOMBI_VARIANT ' + CODING.want + ')';
 }
 
 /* The located binary: { loc, size, sha256, bad: [why an edit is not
@@ -160,13 +173,16 @@ function classify(buf) {
         }
         if (!loc.elf) bad.push(loc.reason);
         else EDITS.forEach(function (e) { if (!loc[e[0]].ok && bad.indexOf(loc[e[0]].reason) < 0) bad.push(loc[e[0]].reason); });
-        /* inMem: why the patch in memory cannot be planned for it, the
-         * config path and the ready start included */
+        /* inMem: why the patch in memory cannot be planned for it: the
+         * config path, and the ready start unless its site is absent from
+         * the build (readyStart). */
         var inMem = bad.slice();
-        if (loc.elf) ['confpath', 'readystart'].forEach(function (k) {
-            var why = !loc[k] ? k + ': not located' : !loc[k].ok ? loc[k].reason : null;
-            if (why && inMem.indexOf(why) < 0) inMem.push(why);
-        });
+        if (loc.elf) {
+            var cw = !loc.confpath ? 'confpath: not located' : !loc.confpath.ok ? loc.confpath.reason : null;
+            if (cw && inMem.indexOf(cw) < 0) inMem.push(cw);
+            var rs = loc.readystart;
+            if (rs && !rs.ok && !rs.absent && inMem.indexOf(rs.reason) < 0) inMem.push(rs.reason);
+        }
         classified[h] = { loc: loc, size: buf.length, sha256: h, bad: bad, inMem: inMem };
     }
     return classified[h];
@@ -208,9 +224,10 @@ function trusted(file) {
 }
 
 function binOther(cur, orig) {
-    if (cur.length !== orig.length) return 'its size differs';
     var a = buildId(cur), b = buildId(orig);
-    if (a && b) return a === b ? null : 'its build-id differs';
+    if (a && b && a !== b) return cpLocate.BUILD_ID_DIFFERS;
+    if (cur.length !== orig.length) return 'its size differs';
+    if (a && b) return null;
     for (var i = 0, n = 0; i < cur.length; i++) if (cur[i] !== orig[i] && ++n > SAME_BUILD_MAX_DIFF) return 'more than ' + SAME_BUILD_MAX_DIFF + ' bytes differ';
     return null;
 }
@@ -341,12 +358,15 @@ function cmdStatus(t) {
     line('coding', cd.err ? 'unreadable (' + cd.err + ')' : 'KI_KOMBI_VARIANT ' + cd.variant);
     var why = notRestorable(us);
     line('restorable', why ? 'no (' + why + ')' : 'yes');
+    /* aapd another build than its backup by its build-id (a car software
+     * update replaced it), and nothing else in the way of a revert */
+    line('replaced', why && us[0].p && us[0].p.other === cpLocate.BUILD_ID_DIFFERS && !(us[1].p && (us[1].p.err || us[1].p.other)) ? 'yes' : 'no');
     line('undo', undoLine(us));
     var modified = !c.bad.length && notPristine(c);
     line('known', c.bad.length ? 'NO — ' + c.bad[0] : modified ? 'yes, modified build (' + modified + ')' : 'yes, pristine ' + label(c));
     SITES.forEach(function (e) {
         var s = c.loc[e[0]];
-        line(e[1].replace(' ', '-'), s && s.ok ? s.state.toUpperCase() : 'UNKNOWN (' + (s ? s.reason : 'not located') + ')');
+        line(siteName(e), s && s.ok ? s.state.toUpperCase() : 'UNKNOWN (' + (s ? s.reason : 'not located') + ')');
     });
     line('geometry', geometryText(us[1].cur, us[1].b));
     var fo = foreignIn(t);
@@ -375,7 +395,7 @@ function cmdProbe(t, file) {
     line('patch-rev', String(PATCH_REV));
     line('patchable', c.inMem.length ? 'no (' + c.inMem.join('; ') + ')' : 'yes');
     SITES.forEach(function (e) {
-        var s = c.loc[e[0]], k = e[1].replace(' ', '-');
+        var s = c.loc[e[0]], k = siteName(e);
         if (!s || !s.ok) { line(k, 'not found (' + (s ? s.reason : 'not located') + ')'); return; }
         line(k, s.state + ' at 0x' + s.offset.toString(16) + ', ' + s.len + ' bytes: ' + buf.toString('hex', s.offset, s.offset + s.len) +
             ' (stock ' + (s.stock || '?') + ', patched ' + s.patched + ')' + (s.readyFlag !== undefined ? ', ready flag +0x' + s.readyFlag.toString(16) : ''));
@@ -399,6 +419,10 @@ function cmdRevert(t, yes, force, dropBackup) {
     plans.forEach(function (x) {
         if (x.p && x.p.err) { left.push(x.p.err + '; ' + x.file + ' left as it is'); return; }
         if (!x.p || (x.cur && x.p.out.equals(x.cur) && !x.modeBad)) return;
+        /* Another build by its build-id (a car software update replaced
+         * it): with --drop-backup its backup, of a build no longer there,
+         * goes and the file stays. */
+        if (x.p.other && !force && dropBackup && x.p.other === cpLocate.BUILD_ID_DIFFERS) { process.stdout.write(x.file + ' is another build than its backup (' + x.p.other + '); left as it is\n'); return; }
         if (x.p.other && !force) { left.push(x.file + ' is another build than its backup (' + x.p.other + '); left as it is (--force overwrites it)'); return; }
         if (!yes) die('pass --yes to proceed');
         /* At its original already: only the mode and owner. */
@@ -433,10 +457,14 @@ function cmdRevert(t, yes, force, dropBackup) {
  * patches. */
 function plans() { return require('./carplay_patch.js'); }
 
-/* The plan's regions of the classified image `c` ([[offset, length]]) and
- * their names. */
-function planRegions(c) { return SITES.map(function (e) { return [c.loc[e[0]].offset, c.loc[e[0]].len]; }); }
-var PLAN_NAMES = ['gate', 'selfstart-call', 'selfstart-guard', 'screen', 'confpath', 'readystart'];
+/* The sites the plan of the classified image `c` edits: every site, the
+ * ready start where the build has it (readyStart; classify refuses one
+ * found but changed). */
+function readyStart(c) { return !!c.loc.readystart && c.loc.readystart.ok; }
+function planSites(c) { return SITES.filter(function (e) { return e[0] !== 'readystart' || readyStart(c); }); }
+/* The plan's regions of `c` ([[offset, length]]) and their names. */
+function planRegions(c) { return planSites(c).map(function (e) { return [c.loc[e[0]].offset, c.loc[e[0]].len]; }); }
+function planNames(c) { return planSites(c).map(siteName); }
 
 function writeFileWhole(file, data) {
     var tmp = file + '.tmp';
@@ -462,25 +490,26 @@ function cmdPlan(t, dpi, card, outFile, confOut) {
     if (!outFile || !confOut) die('plan needs --out <file> and --conf-out <file>');
     if (conf.DENSITIES.indexOf(dpi) < 0) die('--dpi must be ' + conf.DENSITY_MIN + '-' + conf.DENSITY_MAX + ' in steps of ' + conf.DENSITY_STEP);
     if (conf.CARDS.indexOf(card) < 0) die('--card must be ' + conf.CARDS.join(' or '));
-    var codingWhy = codingRefusal(readCoding(t.coding));
+    var cd = readCoding(t.coding), codingWhy = codingRefusal(cd);
     if (codingWhy) die('refusing: ' + codingWhy);
     var buf = readOr(t.target);
     if (!buf) die('cannot read ' + t.target);
     var c = classify(buf);
     if (c.inMem.length) die('refusing: ' + c.inMem.join('; '));
-    var why = notPristine(c) || ['confpath', 'readystart'].filter(function (k) { return c.loc[k].state !== 'original'; }).map(function (k) { return k + ' edited'; })[0] || null;
+    var why = notPristine(c) || ['confpath', 'readystart'].filter(function (k) { return (k !== 'readystart' || readyStart(c)) && c.loc[k].state !== 'original'; })
+        .map(function (k) { return k + ' edited'; })[0] || null;
     if (why) die('in memory needs the pristine build on disk: ' + why);
     var text = readOr(t.conf);
     if (!text) die('cannot read ' + t.conf);
     var confWhy = confNotOriginal(text.toString('utf8'));
     if (confWhy) die('refusing: ' + t.conf + ': ' + confWhy);
-    var out = Buffer.from(buf);
-    SITES.forEach(function (e) { Buffer.from(c.loc[e[0]].patched, 'hex').copy(out, c.loc[e[0]].offset); });
+    var out = Buffer.from(buf), sites = planSites(c);
+    sites.forEach(function (e) { Buffer.from(c.loc[e[0]].patched, 'hex').copy(out, c.loc[e[0]].offset); });
     var oc = classify(out);
-    if (!sameBuild(c, oc) || ['confpath', 'readystart'].some(function (k) { return oc.loc[k].offset !== c.loc[k].offset; }) ||
-        SITES.some(function (e) { return !oc.loc[e[0]].ok || oc.loc[e[0]].state !== 'patched'; }))
+    if (!sameBuild(c, oc) || sites.some(function (e) { return e[0] === 'confpath' || e[0] === 'readystart' ? oc.loc[e[0]].offset !== c.loc[e[0]].offset : false; }) ||
+        sites.some(function (e) { return !oc.loc[e[0]].ok || oc.loc[e[0]].state !== 'patched'; }))
         die('refusing: the edited image does not verify');
-    var p = plans().planOf(buf, out, planRegions(c), PLAN_NAMES, c.loc.buildId);
+    var p = plans().planOf(buf, out, planRegions(c), planNames(c), c.loc.buildId);
     if (p.err) die('refusing: ' + p.err);
     var o = plans().overlay(buf, p.text);
     if (o.err || !o.buf.equals(out)) die('refusing: the plan does not reproduce the edited image (' + (o.err || 'bytes differ') + ')');
@@ -489,8 +518,8 @@ function cmdPlan(t, dpi, card, outFile, confOut) {
     writeFileWhole(confOut, copy);
     writeFileWhole(outFile, p.text);
     process.stdout.write(JSON.stringify({ build: c.loc.buildId, version: c.loc.version ? 'aapd ' + c.loc.version : label(c), sha256: c.sha256, size: buf.length, edits: p.edits,
-        coding: 'ok', writes: { dpi: dpi, card: card, crop: conf.srcCrop(card, dpi) },
-        planSha256: sha256(Buffer.from(p.text)), rev: PATCH_REV, copies: { conf: sha256(copy) }, inputs: { conf: sha256(text) } }) + '\n');
+        coding: cd.err ? 'unreadable' : 'ok', variant: cd.err ? null : cd.variant, writes: { dpi: dpi, card: card, crop: conf.srcCrop(card, dpi) },
+        planSha256: sha256(Buffer.from(p.text)), rev: readyStart(c) ? PATCH_REV : 2, record: readyStart(c) ? 1 : 2, copies: { conf: sha256(copy) }, inputs: { conf: sha256(text) } }) + '\n');
 }
 
 /* `overlay`: the edit lines of `status` for aapd with the plan laid over it
@@ -503,10 +532,12 @@ function cmdOverlay(t, planFile, confCopy) {
     try { text = fs.readFileSync(planFile, 'utf8'); } catch (e) { line('overlay', 'NO — ' + e.message); return; }
     var o = plans().overlay(buf, text);
     if (o.err) { line('overlay', 'NO — ' + o.err); return; }
-    var c = classify(o.buf), bad = [];
+    var c = classify(o.buf), bad = [], planned = o.edits.indexOf('readystart') >= 0;
     SITES.forEach(function (e) {
         var x = c.loc[e[0]];
-        line(e[1].replace(' ', '-'), x && x.ok ? x.state.toUpperCase() : 'UNKNOWN (' + (x ? x.reason : 'not located') + ')');
+        /* a plan without the ready start, for a build where it is not found */
+        if (e[0] === 'readystart' && !planned && !(x && x.ok)) { line('readystart', 'NOT APPLIED (' + (x ? x.reason : 'not located') + ')'); return; }
+        line(siteName(e), x && x.ok ? x.state.toUpperCase() : 'UNKNOWN (' + (x ? x.reason : 'not located') + ')');
         if (!x || !x.ok || x.state !== 'patched') bad.push(e[1] + ' not patched');
     });
     var orig = readOr(t.conf), copy = confCopy ? readOr(confCopy) : null, g = orig && copy ? conf.edited(orig.toString('utf8'), copy.toString('utf8')) : null;

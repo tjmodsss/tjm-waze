@@ -33,19 +33,23 @@
  * boot's shutdown mark and, without one, the restart records of recmgr and
  * crashhandler. It reads a binary only to restore it.
  *
- * A service's state ({fails, unknown, arm, prev, starts, ended}): fails,
+ * A service's state ({fails, unknown, arm, prev, starts, ended, log}): fails,
  * the failed patched boots and crashes since the last healthy boot;
  * unknown, the patched boots in a row since then that ended with no
  * record; arm, this boot's record ({boot, at, patch, crashes, ran,
- * confirmed, clean}), written before a patched binary starts; prev, the
- * last boot counted; starts ({boot, n}), the starts made this boot; ended
- * ({boot, run}), the last run whose end was handled. At the next boot the
- * armed boot counts only on evidence (tally): a crash of the service, or a
- * restart recmgr or crashhandler recorded. A healthy boot clears the count,
- * an orderly one (a switch-off, a restart asked for) or one the service
- * never ran in keeps it, and two boots in a row with no record at all
- * count one. A proven patch is restored at 2 failed boots or crashes with
- * no healthy boot between, an unproven one at 1 (THRESHOLD).
+ * confirmed, seen, lastAt, crashKey, clean}), written before a patched
+ * binary starts; prev,
+ * the last boot counted; starts ({boot, n}), the starts made this boot;
+ * ended ({boot, run}), the last run whose end was handled; log, the newest
+ * LOG_MAX lines of how each boot was counted, crashes and restores, for
+ * Save logs. At the next boot the armed boot counts only on evidence
+ * (tally): a crash of the service, or a restart recmgr or crashhandler
+ * recorded. A healthy boot clears the count, an orderly one (a switch-off,
+ * a restart asked for) or one the service never ran in keeps it, and two
+ * boots in a row with no record at all count one, unless the head unit
+ * was off OFF_MS after it (offOf). A proven patch is restored at 2 failed boots
+ * or crashes with no healthy boot between, an unproven one at 1
+ * (THRESHOLD).
  *
  * shutdown_mark.sh (a var-opt-ro.service drop-in) records at each NSM
  * shutdown, before /var/opt goes read-only, whether each service was
@@ -133,7 +137,7 @@ function targets(o) {
             foreignIn: function () { return require('./carplay_patch.js').foreignIn(o.carplay); },
             /* the plan's arguments for a patch in the file put back (drec, its record) */
             planArgs: function (drec) {
-                return ['--panel', 'high', '--coding', CODING].concat(drec && drec.patched === true && drec.proven !== true && drec.trial !== true ? ['--unproven'] : []);
+                return ['--panel', 'high', '--coding', CODING];
             },
             check: function (i, cur) {
                 if (!exists(o.carplay + '.woc-orig')) return null;
@@ -268,7 +272,7 @@ function keepRestartRecords(t, dir, id, opts) {
 
 /* Failed boots or crashes before a restore: a patch the record does not
  * call proven (a patch on trial, which every build is until it ran healthy
- * on this car, or a car coded otherwise) is restored at its first, a proven
+ * on this car) is restored at its first, a proven
  * one at its second; a binary of the backup's build the record does not
  * describe counts as proven. */
 var THRESHOLD = { proven: 2, unknown: 2, unproven: 1 };
@@ -277,6 +281,33 @@ var THRESHOLD = { proven: 2, unknown: 2, unproven: 1 };
  * phone's CarPlay or Android Auto session, which an attached phone opens
  * within it. */
 var HEALTHY_MS = parseInt(process.env.WOC_RECOVERY_HEALTHY_MS, 10) || 60000;
+/* While the patched service runs healthy, the watcher records when it
+ * last saw it so (arm.seen, the wall clock), this often. */
+var SEEN_MS = parseInt(process.env.WOC_RECOVERY_SEEN_MS, 10) || 60000;
+/* A start that ended with no record, its patched service last seen healthy
+ * at least this long before the next start began, ended as a parked car's
+ * does. A loop's reset comes at most SEEN_MS after the last seen time, and
+ * its next start seconds after the reset (offOf). */
+var OFF_MS = parseInt(process.env.WOC_RECOVERY_OFF_MS, 10) || 3 * 60000;
+/* The time the head unit keeps from its last shutdown, which it can start
+ * on before it gets the real time, is no later than this after the last
+ * time a start before was seen or armed: a heartbeat, the shutdown after
+ * it and the next boot's start-up (offOf). */
+var KEPT_MS = SEEN_MS + 60000;
+/* No wall clock before this is a set one: the head unit starts at its
+ * software's build time until the time is set. */
+var CLOCK_FLOOR_MS = Date.UTC(2025, 0, 1);
+/* recmgr's crash table, where every service failure it handles adds a row
+ * (its newest key read with the firmware's sqlite3, killed after
+ * SQLITE_MS). */
+var RECMGR_DB = (process.env.WOC_SIN_DIR || '/var/opt/public/sin') + '/recmgr/recmgr_stats.db';
+var SQLITE = process.env.WOC_SQLITE || 'sqlite3';
+var SQLITE_MS = 2000;
+/* The entries the state keeps of how each start was counted and what was
+ * restored (state.log), for Save logs: the newest LOG_MAX, each at most
+ * LOG_LINE characters. */
+var LOG_MAX = 16;
+var LOG_LINE = 240;
 var TICK_MS = parseInt(process.env.WOC_RECOVERY_TICK_MS, 10) || 1000;
 /* systemctl is asked this often while the service is down; while its main
  * PID is in /proc, which every tick checks, only every ALIVE_PROBE_MS, as a
@@ -355,15 +386,14 @@ function leftover(t) {
  * systemd started the service in that boot, up: the boot's uptime in s, or
  * null}. */
 function markOf(t, id) {
-    var m = /^(\S+) (running|failed|stopped)( crash)?( ran)?(?: up (\d+))?\s*$/.exec(readText(t.mark));
-    return m && m[1] === id ? { state: m[2], crash: !!m[3], ran: !!m[4], up: m[5] === undefined ? null : parseInt(m[5], 10) } : null;
+    var text = readText(t.mark), m = /^(\S+) (running|failed|stopped)( crash)?( ran)?(?: up (\d+))?\s*$/.exec(text);
+    return m && m[1] === id ? { state: m[2], crash: !!m[3], ran: !!m[4], up: m[5] === undefined ? null : parseInt(m[5], 10), text: text.trim().slice(0, 160) } : null;
 }
 
 /* A restart record of recmgr or crashhandler written in the armed boot: at
  * or after the arm, before this boot started (/proc/stat's btime), and not
  * ahead of the clock, each within FS_CLOCK_MS. */
-function restartRecorded(t, arm) {
-    var now = Date.now(), started = boot.bootTime();
+function restartRecorded(t, arm, now, started) {
     return !!arm.at && t.restartInfo.some(function (f) {
         var at;
         try { at = fs.statSync(f).mtime.getTime(); } catch (e) { return false; }
@@ -382,26 +412,80 @@ function otherCrashed(t, boot) {
     return arms.some(function (a) { return a.crashes > 0; }) || (!!m && m.state === 'failed');
 }
 
-/* How the armed boot arm ended for t: its shutdown mark's service state;
+/* How the armed boot arm ended for t, now the clock reads now and this boot
+ * started at started (null: unknown): its shutdown mark's service state;
  * crash, evidence of a restart recmgr or crashhandler asked for (the mark
  * says so, or, with no mark, their record of that boot); orderly, a
  * switch-off or a restart asked for (a mark without crash from a boot that
  * lasted the healthy window, patchd's restart-requested, the watcher
- * stopped while the system stopped); neverRan, the service never ran in it
- * (stopped at the shutdown, never started by systemd nor seen running, no
- * crash); explained, the
- * other service's patch crashed in it. A mark without crash from a shorter
- * boot is none of these: it may be a crash restart whose record was missed,
- * so it counts as a boot with no record. */
-function endOf(t, arm) {
+ * stopped while the system stopped), or a parked car's end (parked); off,
+ * the time off in ms or null (offOf); mark, the mark as written; asked, a
+ * restart asked for; neverRan, the service never ran in it (stopped at the
+ * shutdown, never started by systemd nor seen running, no crash);
+ * explained, the other service's patch crashed in it. A mark without crash
+ * from a shorter boot is none of these: it may be a crash restart whose
+ * record was missed, so it counts as a boot with no record.
+ *
+ * parked: no mark and no restart record, the time off OFF_MS or more, and
+ * recmgr's crash table (its newest key, crashKey(), read only then) no
+ * newer than at the arm. A key that cannot be read, now or at the arm,
+ * tells nothing (untold): not parked. */
+function endOf(t, arm, now, started, crashKey) {
     var m = markOf(t, arm.boot), long = !!m && m.up !== null && m.up * 1000 >= HEALTHY_MS;
+    var asked = readText(t.restart).trim() === arm.boot, crash = m ? m.crash : restartRecorded(t, arm, now, started);
+    var off = m || crash ? null : offOf(arm, now, started), key = null, failure = false, untold = false;
+    if (off !== null && off >= OFF_MS) {
+        key = typeof arm.crashKey === 'number' ? crashKey() : null;
+        untold = typeof key !== 'number';
+        failure = !untold && key > arm.crashKey;
+    }
+    var parked = off !== null && off >= OFF_MS && !untold && !failure;
     return {
         state: m ? m.state : null,
-        crash: m ? m.crash : restartRecorded(t, arm),
-        orderly: arm.clean || readText(t.restart).trim() === arm.boot || (!!m && !m.crash && long),
+        crash: crash,
+        orderly: arm.clean || asked || (!!m && !m.crash && long) || parked,
         neverRan: !!m && m.state === 'stopped' && !m.ran && !arm.ran && !arm.crashes,
         explained: otherCrashed(t, arm.boot),
+        mark: m ? m.text : null,
+        asked: asked,
+        off: off,
+        parked: parked,
+        failure: failure,
+        untold: untold,
     };
+}
+
+/* How long the head unit was off after the armed boot arm: from the last
+ * time the watcher saw its patched service healthy (arm.seen) to this
+ * boot's start (started), in ms, both by the wall clock; null when that
+ * cannot be told. A clock not yet set reads before CLOCK_FLOOR_MS, and one
+ * set back to an earlier time (the time kept from an earlier shutdown,
+ * before the real time comes) reads too early: either makes the time off
+ * shorter or negative, never longer, so a wrong clock now only takes the
+ * start for a short one. A seen before the boot's arm, or before
+ * CLOCK_FLOOR_MS, was stamped by a clock not set yet: null. So is a boot
+ * armed less than KEPT_MS after the start before it was last seen or
+ * armed (lastAt): it may have run on the time kept from its last shutdown
+ * throughout, and its seen would then be as early as that shutdown. */
+function offOf(arm, now, started) {
+    if (!arm.seen || !arm.at || started === null || arm.seen < CLOCK_FLOOR_MS || arm.at < CLOCK_FLOOR_MS || arm.seen < arm.at) return null;
+    if (!arm.lastAt || arm.at - arm.lastAt < KEPT_MS) return null;
+    if (started < arm.seen || started > now + FS_CLOCK_MS) return null;
+    return started - arm.seen;
+}
+
+/* recmgr's newest crash key in db (default RECMGR_DB), or null when it
+ * cannot be read. */
+function recmgrCrashKey(db) {
+    var r;
+    db = db || RECMGR_DB;
+    try {
+        if (!fs.statSync(db).isFile()) return null;
+        r = cp.spawnSync(SQLITE, ['file:' + db + '?mode=ro', 'SELECT COALESCE(MAX(CrashKey), 0) FROM Crash;'],
+            { cwd: '/', encoding: 'utf8', timeout: SQLITE_MS, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch (e) { return null; }
+    var n = r && r.status === 0 ? parseInt((r.stdout || '').trim(), 10) : NaN;
+    return isNaN(n) ? null : n;
 }
 
 /* The count ({fails, unknown}) after an armed boot (arm) that ended as end
@@ -411,17 +495,21 @@ function endOf(t, arm) {
  * crashed in it (it counts there); an orderly end counts nothing. A boot
  * that ended with no record (a power cut, a 12 V disconnect, a dealer
  * tool, or a restart whose records were lost) is unknown: two in a row
- * count one, so a loop that leaves no record is still caught. */
+ * count one, so a loop that leaves no record is still caught; one after
+ * which the head unit was off OFF_MS is an orderly end (endOf). */
 function tally(count, arm, end) {
     var crashes = arm.crashes || (end.state === 'failed' ? 1 : 0);
     if (crashes) return { fails: count.fails + crashes, unknown: 0, own: true, why: 'saw ' + crashes + ' crash' + (crashes === 1 ? '' : 'es') + ' of the service' };
     /* A start armed in memory clears the count only when it ran healthy and
      * ended in order (a switch-off or restart with its shutdown mark, a
-     * restart asked for): a restart for a crash counts even after a healthy
-     * run, and a healthy run that ended with no record at all (a reset that
-     * beat the shutdown mark, a power cut) counts as a boot with no record,
-     * two in a row one failure. */
-    if (arm.confirmed && !(arm.inmem && (end.crash || !end.orderly))) return { fails: 0, unknown: 0, why: 'ran healthy' };
+     * restart asked for, or no record and the head unit off OFF_MS after
+     * it): a restart for a crash counts even after a healthy run, and a
+     * healthy run that ended with no record and a short time off (a reset
+     * that beat the shutdown mark) counts as a boot with no record, two in a
+     * row one failure. */
+    if (arm.confirmed && !(arm.inmem && (end.crash || !end.orderly))) {
+        return { fails: 0, unknown: 0, why: end.parked ? 'ran healthy; no record, then off ' + Math.round(end.off / 60000) + ' min' : 'ran healthy' };
+    }
     if (end.neverRan) return { fails: count.fails, unknown: count.unknown, why: 'ended before the service ran' };
     if (end.explained) return { fails: count.fails, unknown: 0, why: 'ended for the other service\'s crash' };
     if (end.crash) return { fails: count.fails + 1, unknown: 0, why: 'ended in a restart for a crash' };
@@ -672,8 +760,8 @@ function startTarget(t, cb) {
 
 /* ---- the counter ---- */
 
-function newArm(id, patch, inMem) {
-    var a = { boot: id, at: Date.now(), patch: patch, crashes: 0, ran: false, confirmed: false, clean: false };
+function newArm(id, patch, inMem, at) {
+    var a = { boot: id, at: at, patch: patch, crashes: 0, ran: false, confirmed: false, seen: 0, clean: false };
     if (inMem) a.inmem = true;
     return a;
 }
@@ -683,7 +771,32 @@ function newArm(id, patch, inMem) {
 function normArm(a) {
     if (!a || typeof a !== 'object') return null;
     return { boot: a.boot, at: a.at || 0, patch: a.patch || 'unknown', crashes: a.crashes || 0, ran: !!a.ran, confirmed: !!(a.confirmed || a.state === 'confirmed'),
+        seen: typeof a.seen === 'number' ? a.seen : 0, lastAt: typeof a.lastAt === 'number' ? a.lastAt : 0, crashKey: typeof a.crashKey === 'number' ? a.crashKey : null,
         clean: !!(a.clean || a.state === 'clean'), own: !!a.own, inmem: !!a.inmem };
+}
+
+function logOf(st) {
+    return Array.isArray(st.log) ? st.log.filter(function (l) { return typeof l === 'string'; }).slice(-LOG_MAX) : [];
+}
+
+/* One entry of st's log: the time (UTC; the clock may not be set yet at
+ * the boot step), this boot and the uptime, then what happened. */
+function note(st, bootId, what) {
+    var up = parseInt(readText('/proc/uptime'), 10);
+    st.log = logOf(st).concat((new Date().toISOString() + ' boot ' + String(bootId || '?').slice(0, 8) +
+        (up >= 0 ? ' up ' + up + ' s' : '') + ': ' + what).slice(0, LOG_LINE)).slice(-LOG_MAX);
+}
+
+/* How the armed boot arm ended, as the boot step read it, for the log:
+ * its shutdown mark as written, or that there was none and whether a
+ * restart record of that boot was found; what the watcher saw. */
+function endText(arm, end) {
+    return 'boot ' + String(arm.boot).slice(0, 8) + ' ' + (end.mark !== null ? 'mark "' + end.mark.replace(/^\S+ /, '') + '"' : 'no shutdown mark' + (end.crash ? ', a restart record' : '')) +
+        (end.asked ? ', restart asked for' : '') + (end.failure ? ', a crash in recmgr\'s table' : '') +
+        (end.untold ? ', recmgr\'s table unreadable' : '') +
+        (end.off !== null ? ', off ' + Math.round(end.off / 60000) + ' min after last seen' : '') +
+        '; ' + (arm.crashes ? arm.crashes + ' crash' + (arm.crashes === 1 ? '' : 'es') : arm.confirmed ? 'healthy' : arm.ran ? 'ran' : 'never seen running') +
+        (arm.clean ? ', stopped in order' : '');
 }
 
 function Recovery(opts) {
@@ -717,6 +830,9 @@ function Recovery(opts) {
     this._recmgrLoaded = opts.recmgrLoaded || recmgr.recmgrLoaded;
     this._lock = opts.lock || lock;
     this._now = opts.now || monoMs;
+    this._wall = opts.wall || Date.now;
+    this._bootTime = opts.bootTime || boot.bootTime;
+    this._crashKey = opts.crashKey || recmgrCrashKey;
     this._log = opts.log || log;
 
     this.restoring = false;
@@ -726,7 +842,10 @@ function Recovery(opts) {
     this._run = '';             /* the active run, for the healthy timer */
     this._lastProbe = -Infinity;
     this._activeSince = null;   /* start of the current continuous-active run */
-    this._settled = null;       /* the run whose healthy minute needs nothing more */
+    this._settled = null;       /* the run whose healthy minute is done; only seen times follow */
+    this._seenAt = -Infinity;   /* when the run was last looked at for a seen time (this._now) */
+    this._seenFailing = false;  /* the last seen time could not be saved */
+    this._trialRun = null;      /* the run a trial was settled for as the patch's */
     this._startAt = null;       /* when the scheduled start is due */
     this._proveAt = -Infinity;  /* when a patch on trial is next recorded proven */
     /* This boot's ended run, crashes and starts, also kept here so a state
@@ -810,30 +929,43 @@ Recovery.prototype._load = function () {
          * rules: its counts start again. */
         var legacy = !!st && typeof st === 'object' && !('unknown' in st);
         if (st && typeof st === 'object') return { fails: legacy ? 0 : st.fails || 0, unknown: legacy ? 0 : st.unknown || 0, arm: normArm(st.arm),
-            prev: normArm(st.prev), starts: st.starts || null, ended: st.ended || null, read: true };
+            prev: normArm(st.prev), starts: st.starts || null, ended: st.ended || null, log: logOf(st), read: true };
     } catch (e) { read = e.code === 'ENOENT'; }
-    return { fails: 0, unknown: 0, arm: null, prev: null, starts: null, ended: null, read: read };
+    return { fails: 0, unknown: 0, arm: null, prev: null, starts: null, ended: null, log: [], read: read };
 };
 
 /* Persist durably: the state must survive the reboot a crash can cause the
  * moment after, so it is on disk, renamed into place, before this returns. A
- * write that fails leaves the previous state whole. false when it failed. */
-Recovery.prototype._save = function (st) {
+ * write that fails leaves the previous state whole, and is tried once more
+ * without the log, so the log never keeps the count from being saved.
+ * quiet: no line for it. false when it failed. */
+Recovery.prototype._save = function (st, quiet) {
     this._stateLock();
     /* The boot step, the watcher and patchd each write it: a temporary
      * file of each process's own, so no write lands in another's. */
-    var dir = path.dirname(this.statePath), tmp = this.statePath + '.tmp.' + process.pid, fd;
-    try {
+    var dir = path.dirname(this.statePath), tmp = this.statePath + '.tmp.' + process.pid, log = (st.log || []).slice(-LOG_MAX);
+    function write(entries) {
+        var fd;
         try { fs.mkdirSync(dir, 0o755); } catch (e) { if (e.code !== 'EEXIST') throw e; }
         fd = fs.openSync(tmp, 'w', 0o644);
         try {
-            fs.writeFileSync(fd, JSON.stringify({ fails: st.fails || 0, unknown: st.unknown || 0, arm: st.arm || null, prev: st.prev || null, starts: st.starts || null, ended: st.ended || null }) + '\n');
+            fs.writeFileSync(fd, JSON.stringify({ fails: st.fails || 0, unknown: st.unknown || 0, arm: st.arm || null, prev: st.prev || null, starts: st.starts || null, ended: st.ended || null,
+                log: entries }) + '\n');
             fs.fsyncSync(fd);
         } finally { fs.closeSync(fd); }
         fs.renameSync(tmp, this.statePath);
+    }
+    try {
+        try { write.call(this, log); } catch (e) {
+            if (!log.length) throw e;
+            try { fs.unlinkSync(tmp); } catch (e2) {}
+            write.call(this, []);
+            st.log = [];
+            if (!quiet) this._log('state saved without its log (' + e.message + ')');
+        }
     } catch (e) {
         try { fs.unlinkSync(tmp); } catch (e2) {}
-        this._log('could not persist state: ' + e.message);
+        if (!quiet) this._log('could not persist state: ' + e.message);
         this._saveError = e.code;
         return false;
     }
@@ -887,7 +1019,9 @@ Recovery.prototype._decide = function (cb) {
         return;
     }
     if (st.arm && !this._armed(st)) {
-        var was = st.fails, r = tally(st, st.arm, endOf(t, st.arm));
+        var was = st.fails, wasUnknown = st.unknown;
+        var end = endOf(t, st.arm, this._wall(), this._bootTime(), this._crashKey), r = tally(st, st.arm, end);
+        note(st, this.bootId, t.name + ': ' + endText(st.arm, end) + ': failed ' + was + ' -> ' + r.fails + ', no record ' + wasUnknown + ' -> ' + r.unknown + ' (' + r.why + ')');
         st.fails = r.fails;
         st.unknown = r.unknown;
         st.prev = st.arm;
@@ -931,7 +1065,11 @@ Recovery.prototype._decide = function (cb) {
         cb({ action: 'idle' });
         return;
     }
-    if (!st.arm) st.arm = newArm(this.bootId, kind, inMem);
+    if (!st.arm) {
+        st.arm = newArm(this.bootId, kind, inMem, this._wall());
+        st.arm.lastAt = st.prev ? Math.max(st.prev.seen, st.prev.at) : 0;
+        st.arm.crashKey = this._crashKey();
+    }
     else if (inMem && !st.arm.inmem) st.arm.inmem = true;
     var saved = this._save(st);
     /* A service with a crash threshold of its own (aapd) is restored at it
@@ -976,7 +1114,9 @@ Recovery.prototype._restoreWith = function (fails, saved, cb, refused, why) {
                     (self.target.crashThreshold ? ' or an update brings a newer patch' : '')
                 : outcome === 'other' ? n + ' is another build than our backup (a firmware update): not ours to restore'
                 : n + ' is the original already');
-            self._clear();
+            self._clear(outcome !== 'restored' ? null : refused ? n + ': patch ' + (inMem ? 'turned off' : 'restored') + ': ' + refused
+                : why === 'file' ? n + ': a patch in its files put back as they ship'
+                : n + ': patch ' + (inMem ? 'turned off' : 'restored') + ' after ' + fails + ' failed starts or crashes' + (why === 'crash' ? ' (its own crash)' : ''));
             r = outcome === 'restored' ? { action: 'restored', fails: fails } : { action: 'idle' };
         }
         cb(r);
@@ -989,6 +1129,7 @@ Recovery.prototype._restoreWith = function (fails, saved, cb, refused, why) {
  * new one. */
 Recovery.prototype.resetCount = function () {
     var st = this._load();
+    if (st.fails || st.unknown) note(st, this.bootId, this.target.name + ': a new patch; failed ' + st.fails + ' and no record ' + st.unknown + ' set to 0');
     st.fails = 0;
     st.unknown = 0;
     st.arm = null;
@@ -996,8 +1137,9 @@ Recovery.prototype.resetCount = function () {
     this._save(st);
 };
 
-Recovery.prototype._clear = function () {
+Recovery.prototype._clear = function (what) {
     var st = this._load();
+    if (what) note(st, this.bootId, what);
     st.fails = 0;
     st.unknown = 0;
     st.arm = null;
@@ -1020,8 +1162,9 @@ Recovery.prototype.whenRestored = function (cb) {
  * carplay.service drop-in, SuccessExitStatus=SIGKILL) is no crash; unless
  * patchd killed it, which starts it itself, the service is started again
  * like after a crash. A run continuously active for HEALTHY_MS confirms the
- * boot. cb(result) for tests; result.action is 'skip' | 'watch' |
- * 'confirmed' | 'crash' | 'killed' | 'exited' | 'started' | 'start-skipped'. */
+ * boot, and every SEEN_MS after records when it was last seen (_healthy).
+ * cb(result) for tests; result.action is 'skip' | 'watch' | 'confirmed' |
+ * 'crash' | 'killed' | 'exited' | 'started' | 'start-skipped'. */
 Recovery.prototype.tick = function (cb) {
     cb = cb || function () {};
     var self = this;
@@ -1041,7 +1184,7 @@ Recovery.prototype.tick = function (cb) {
             else if (self._pendingRun === null) self._pendingRun = info.run || '-';
         }
         if (info.state === 'active') {
-            if (info.run !== self._run) { self._run = info.run; self._activeSince = now; self._ran(); }
+            if (info.run !== self._run) { self._run = info.run; self._activeSince = now; self._seenAt = -Infinity; self._ran(); }
             self._pid = info.pid;
         } else {
             self._run = '';
@@ -1081,27 +1224,54 @@ Recovery.prototype._ran = function () {
     if (this._armed(st) && !st.arm.ran) { st.arm.ran = true; this._save(st); }
 };
 
-/* A run's healthy minute confirms this boot's arm once, and records a
- * patch on trial that the run runs proven (_trial). Only the watcher
- * changes the arm once the run is up, so after the state was read (or the
- * confirmation saved) and the trial settled the run needs no more reads. */
+/* A run's healthy minute confirms this boot's arm once and records a
+ * patch on trial that the run runs proven (_trial); from then on the arm
+ * records, every SEEN_MS, when the run was last seen healthy (arm.seen, by
+ * the wall clock once it reads after the arm), for the time the head unit
+ * was off after it (offOf). A patch in memory is confirmed and seen only
+ * from a run of it (_runsTarget): a run of the file a change waiting for
+ * the next start replaced, or a start the patch was not applied to, shows
+ * nothing of the patch. Once the run is settled the state is read only
+ * every SEEN_MS, and a seen time written only while the run is one of the
+ * patch. */
 Recovery.prototype._healthy = function (now) {
-    if (this._activeSince === null || now - this._activeSince < this.healthyMs || this._settled === this._run) return 'watch';
-    var st = this._load(), action = 'watch', settled = st.read;
+    if (this._activeSince === null || now - this._activeSince < this.healthyMs) return 'watch';
+    if (this._settled === this._run && now - this._seenAt < SEEN_MS) return 'watch';
+    var st = this._load(), action = 'watch', settled = st.read, save = false;
     /* aapd: a healthy run makes its next start after an end quick again. */
     if (this.target.startDelays && this._startsThisBoot() > 0) {
         this._starts = 0;
         st.starts = { boot: this.bootId, n: 0 };
         settled = this._save(st) && settled;
     }
-    if (this._armed(st) && !st.arm.confirmed) {
+    var armed = this._armed(st), ofPatch = armed && (!st.arm.inmem || this._runsTarget()), wall = this._wall();
+    if (ofPatch && !st.arm.confirmed) {
         st.arm.confirmed = true;
-        settled = this._save(st);
+        save = true;
         this._log(this.target.name + ' healthy');
         action = 'confirmed';
     }
-    if (this._trial(now, st)) settled = false;
-    if (settled) this._settled = this._run;
+    var seen = false;
+    if (now - this._seenAt >= SEEN_MS) {
+        this._seenAt = now;
+        if (ofPatch && wall >= st.arm.at && wall >= CLOCK_FLOOR_MS) { st.arm.seen = wall; save = seen = true; }
+    }
+    if (save) {
+        /* A seen time that cannot be saved is logged once until one is. */
+        var ok = this._save(st, seen && this._seenFailing);
+        if (seen) {
+            if (!ok && !this._seenFailing) this._log(this.target.name + ': its seen time cannot be saved; tried again every ' + SEEN_MS / 1000 + ' s');
+            if (ok && this._seenFailing) this._log(this.target.name + ': its seen time is saved again');
+            this._seenFailing = !ok;
+        }
+        settled = ok;
+    }
+    /* A trial is settled once per run, at the first look that reads it as the patch's. */
+    if ((this._settled !== this._run || (ofPatch && this._trialRun !== this._run)) && this._trial(now, st)) settled = false;
+    if (settled) {
+        this._settled = this._run;
+        if (ofPatch) this._trialRun = this._run;
+    }
     return action;
 };
 
@@ -1168,7 +1338,11 @@ Recovery.prototype._onCrash = function (info, cb) {
     }
     this._crashes++;
     var st = this._load();
-    if (this._armed(st)) { st.arm.crashes = Math.max(st.arm.crashes + 1, this._crashes); saved = this._save(st); }
+    if (this._armed(st)) {
+        st.arm.crashes = Math.max(st.arm.crashes + 1, this._crashes);
+        note(st, this.bootId, t.name + ' ended: ' + info.result + (info.code ? ' (code ' + info.code + ', status ' + info.status + ')' : ''));
+        saved = this._save(st);
+    }
     if (goingDown()) return;
     if (saved && !loaded) {
         this._log('recmgr did not load a ' + t.name + ' entry this boot: the boot step decides at the next start');
@@ -1177,7 +1351,7 @@ Recovery.prototype._onCrash = function (info, cb) {
     }
     var kind = patchKind(t);
     if (kind === 'none' || kind === 'original') { this._clear(); next(); return; }
-    if (!this._armed(st)) { st.arm = newArm(this.bootId, kind); st.arm.crashes = this._crashes; saved = this._save(st); }
+    if (!this._armed(st)) { st.arm = newArm(this.bootId, kind, false, this._wall()); st.arm.crashes = this._crashes; saved = this._save(st); }
     if (goingDown()) return;
     var total = st.fails + Math.max(st.arm.crashes, this._crashes), limit = Math.min(THRESHOLD[kind], t.crashThreshold || Infinity);
     this._log(t.name + ' crashes while patched: ' + total);
@@ -1274,7 +1448,7 @@ module.exports = {
     Recovery: Recovery, tally: tally, parseShow: parseShow, targets: targets, TARGETS: TARGETS, THRESHOLD: THRESHOLD,
     RESTORE_BOUND_MS: RESTORE_BOUND_MS, BOOT_BOUND_MS: BOOT_BOUND_MS, BOOT_EXIT_MS: BOOT_EXIT_MS, restoreTarget: restoreTarget, repairModes: repairModes,
     PROVE_RETRY_MS: PROVE_RETRY_MS,
-    realSystemState: realSystemState, keepRestartRecords: keepRestartRecords, RECORD_MAX: RECORD_MAX, RECORD_BOOTS: RECORD_BOOTS,
+    realSystemState: realSystemState, recmgrCrashKey: recmgrCrashKey, retryPlan: retryPlan, codingMoved: codingMoved, keepRestartRecords: keepRestartRecords, RECORD_MAX: RECORD_MAX, RECORD_BOOTS: RECORD_BOOTS,
 };
 
 /* ---- run as the boot step or the watcher ---- */
@@ -1306,12 +1480,14 @@ function runBoot(name) {
             ' in ' + Math.round(monoMs() - t0) + ' ms, ' + Math.round(process.uptime() * 1000) + ' ms since node started');
         process.exit(0);
     }
-    /* A plan still to make is made first (BOOT_PLAN_MS at most), unless
+    /* A plan made for another coding than the car reads becomes a plan
+     * still to make (codingMoved). A plan still to make is made first
+     * (BOOT_PLAN_MS at most), unless
      * our backup is beside the binary: the step puts that back first.
      * After the step put a patch in the file back, an enabled record is
      * planned (when it has no plan) and armed, so this start applies it;
      * the boot's bound still holds over all of it. */
-    (t.inmem && !exists(t.backups[0]) ? function (cb) { retryPlan(t.name, cb, BOOT_CODING_WAIT_MS, BOOT_PLAN_MS); } : function (cb) { cb(false); })(function () {
+    (t.inmem && !exists(t.backups[0]) ? function (cb) { codingMoved(t.name); retryPlan(t.name, cb, BOOT_CODING_WAIT_MS, BOOT_PLAN_MS); } : function (cb) { cb(false); })(function () {
         rec.startBoot(function (r) {
             var ir = t.inmem && rec._putBack && r.action !== 'restore-failed' ? inmem.readRecord(t.name) : null;
             if (!ir || ir.enabled !== true) { done(r); return; }
@@ -1330,14 +1506,29 @@ function runBoot(name) {
  * plan that failed, a put-back cut short, a patch in the file put back at
  * the start) is planned again: at the boot step, before carplay starts, so
  * this start applies it, and at the watcher's start if that did not get to
- * it. The cluster coding the plan reads is waited for up to waitMs.
- * cb(planned). */
-function retryPlan(name, cb, waitMs, planMs) {
+ * it. The cluster coding the plan reads is waited for up to waitMs; a
+ * coding still not readable then is planned for only when anyCoding is
+ * set (the watcher's try), since at the boot step it may be one not yet
+ * published and the plan is made for the coding it reads. counter: the
+ * service's Recovery whose count a new plan starts at nothing. cb(planned). */
+function retryPlan(name, cb, waitMs, planMs, anyCoding, counter) {
     var rec = inmem.readRecord(name);
     if (!rec || !rec.needsPlan || rec.enabled !== true) { cb(false); return; }
+    /* A car software update replaced the service's binary since, or the
+     * record cannot tell (an earlier release's, with no build-id): it runs
+     * as it ships until the next install or the Patch button plans it. */
+    var now = inmem.buildOf(TARGETS[name].target);
+    if (!rec.build || now !== rec.build) {
+        log(name + ': ' + (rec.build ? 'another build than the patch was to be planned for (a car software update)' : 'the plan to make names no build') + ': ' + name + ' runs as it ships until the next install or its Patch button');
+        try { inmem.remove(name); } catch (e) {}
+        cb(false);
+        return;
+    }
     var until = Date.now() + (waitMs || 0);
     (function wait() {
-        if (!exists(CODING) && Date.now() < until) { setTimeout(wait, 1000); return; }
+        var cd = require('./aapd_patch.js').readCoding(CODING);
+        if (cd.err && Date.now() < until) { setTimeout(wait, 1000); return; }
+        if (cd.err && !anyCoding) { log(name + ': the cluster coding cannot be read yet (' + cd.err + '); the watcher plans the patch'); cb(false); return; }
         plan();
     })();
     function plan() {
@@ -1349,50 +1540,95 @@ function retryPlan(name, cb, waitMs, planMs) {
                 else { try { inmem.planFailed(name, rec.args || [], err.message); } catch (e) {} }
             } else {
                 log(name + ': in-memory patch planned (' + r.edits.join(', ') + ')');
-                new Recovery({ target: TARGETS[name] }).resetCount();
+                (counter || new Recovery({ target: TARGETS[name] })).resetCount();
             }
             cb(!err);
         });
     }
 }
 
-/* The watcher plans what the boot steps did not get to, carplay's then
- * aapd's, then watches. */
-function runWatcher() {
-    retryPlan('carplay', function () {
-        if (!exists(TARGETS.aapd.target)) { watch(); return; }
-        retryPlan('aapd', watch, 120000, 60000);
-    }, 120000, 60000);
+/* A plan made for another cluster coding than the car reads (one made
+ * while the coding could not be read, or by a release that did not record
+ * it, is for 7): it cannot work there, so its record becomes a plan still
+ * to make, nothing is armed for the next start, and retryPlan plans it for
+ * the coding the car reads, with every check a plan has. Only a coding
+ * that reads, and a record that describes the file as it is, count.
+ * true when so. */
+function codingMoved(name) {
+    var rec = inmem.readRecord(name);
+    if (!rec || rec.enabled !== true || rec.needsPlan || !inmem.describes(name, rec)) return false;
+    var cd = require('./aapd_patch.js').readCoding(CODING), was = typeof rec.coding === 'number' ? rec.coding : 7;
+    if (cd.err || cd.variant === was) return false;
+    log(name + ': the patch was planned for KI_KOMBI_VARIANT ' + was + ' and the car reads ' + cd.variant + ': planned again for it');
+    try {
+        inmem.disarm(name);
+        inmem.planFailed(name, rec.args || [], 'planned for KI_KOMBI_VARIANT ' + was + ', the car reads ' + cd.variant);
+    } catch (e) { log(name + ': ' + e.message); return false; }
+    return true;
 }
 
-/* The watcher follows carplay, and aapd where the unit has it; each has its
- * own counter and acts alone. */
-function watch() {
-    var recs = [new Recovery({ target: TARGETS.carplay })];
-    if (exists(TARGETS.aapd.target)) recs.push(new Recovery({ target: TARGETS.aapd }));
-    var timer = null;
-    var starting = recs.length;
-    var stopping = false;
-    function each(fn, cb) {
-        var left = recs.length;
-        recs.forEach(function (r) { fn(r, function () { if (--left === 0) cb(); }); });
-    }
+/* cb() once the cluster coding reads, polled every second for up to ms;
+ * never when it does not. */
+function whenCoding(ms, cb) {
+    var until = Date.now() + ms;
+    (function poll() {
+        if (!require('./aapd_patch.js').readCoding(CODING).err) { cb(); return; }
+        if (Date.now() < until) setTimeout(poll, 1000);
+    })();
+}
+
+/* The watcher follows carplay, and aapd where the unit has it, each with
+ * its own counter, from its start. A plan the boot steps did not get to is
+ * made first for its own service (followed once it is made or given up,
+ * the cluster coding waited for up to 120 s); a plan made for another
+ * coding than the car's is planned again once the coding reads, for the
+ * service's next start. */
+function runWatcher() {
+    var names = ['carplay'].concat(exists(TARGETS.aapd.target) ? ['aapd'] : []);
+    watch(names.map(function (n) {
+        var r = new Recovery({ target: TARGETS[n] });
+        r.before = function (go) {
+            var rec = inmem.readRecord(n);
+            if (rec && rec.needsPlan && rec.enabled === true) retryPlan(n, function () { go(); }, 120000, 60000, true, r);
+            else go();
+        };
+        r.after = function () {
+            whenCoding(120000, function () { if (codingMoved(n)) retryPlan(n, function () {}, 0, 60000, true, r); });
+        };
+        return r;
+    }));
+}
+
+/* Follows each Recovery of recs: its `before` first, then its boot
+ * decision, then a poll every TICK_MS, and its `after`. */
+function watch(recs) {
+    var timer = null, booting = 0, stopping = false, finished = false;
     /* A stop waits for a restore in progress, so / is not left writable. */
     function finish() {
+        if (finished) return;
+        finished = true;
         if (timer) clearInterval(timer);
-        each(function (r, cb) { r.whenRestored(function () { r.onShutdown(cb); }); }, function () { process.exit(0); });
+        var on = recs.filter(function (r) { return r.watching; }), left = on.length;
+        if (!left) process.exit(0);
+        on.forEach(function (r) { r.whenRestored(function () { r.onShutdown(function () { if (--left === 0) process.exit(0); }); }); });
     }
     recs.forEach(function (r) {
-        r.startBoot(function () {
-            if (--starting) return;
-            if (stopping) { finish(); return; }
-            /* Polled even with no patch to watch: the service stays up, since
-             * Restart=always would otherwise start it again every few seconds
-             * and the deploy tool's health check takes that for a crash loop. */
-            timer = setInterval(function () { recs.forEach(function (x) { x.tick(); }); }, TICK_MS);
+        (r.before || function (go) { go(); })(function () {
+            if (stopping) return;
+            booting++;
+            r.startBoot(function () {
+                booting--;
+                r.watching = true;
+                if (stopping) { if (!booting) finish(); return; }
+                if (r.after) r.after();
+            });
         });
     });
-    function stop() { if (stopping) return; stopping = true; if (!starting) finish(); }   /* else finish() runs when startBoot returns */
+    /* Polled even with no patch to watch: the service stays up, since
+     * Restart=always would otherwise start it again every few seconds and
+     * the deploy tool's health check takes that for a crash loop. */
+    timer = setInterval(function () { recs.forEach(function (x) { if (x.watching) x.tick(); }); }, TICK_MS);
+    function stop() { if (stopping) return; stopping = true; if (!booting) finish(); }   /* else finish() runs when startBoot returns */
     process.on('SIGTERM', stop);
     process.on('SIGINT', stop);
 }

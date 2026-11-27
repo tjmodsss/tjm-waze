@@ -18,8 +18,10 @@
  * An earlier patch beside another tool's change (foreign) is left as it is,
  * a conflict. A plan that cannot be made (an I/O error) leaves carplay
  * stock, the error in patchd's status, until the watcher plans it at the
- * next head-unit start. On a car coded otherwise an earlier release's patch
- * is put back as it ships. A stock build outside the proven list is left as
+ * next head-unit start. On a car coded KI_KOMBI_VARIANT 7, or whose coding
+ * cannot be read, an earlier release's patch is put back as it ships and
+ * planned in memory; on any other coding it is put back and nothing is
+ * planned (9 and 10 built in, 0 and the rest not supported). A stock build outside the proven list is left as
  * a conflict. Removal (deactivate) disarms the next start, deletes the plan
  * and its record, reverts an earlier release's patch left on disk and drops
  * our backup: a revert is pending only while the running carplay's memory
@@ -33,7 +35,7 @@
  * patchd refuses CarPlay's Patch button and the removal turns the patch
  * off; MID and HIGH F plan as HIGH. The first install on HIGH F applies the
  * patch again to an original 0.8.2's boot recovery restored. The cluster
- * coding: an install plans only on a car coded KI_KOMBI_VARIANT 7. The
+ * coding: an install plans on 7 or an unreadable coding only. The
  * pending marker is the world-readable JSON patchd and the app read. Runs
  * the real patchd.js and carplay_patch.js on a temporary copy, with a fake
  * /proc (carplay's process: its exe, maps and mem, carplay_proc.js), a fake
@@ -353,6 +355,8 @@ async function main() {
         !armed() && m.pending === 'revert' && m.carplay === 'deferred', JSON.stringify([m, rec()]));
     headUnitStart();
     ok('Remove patch: the next start runs carplay as it ships', mem() === 'stock');
+    st = await daemonStatus();
+    ok('Remove patch: patchd reports it removed by the user', st.state === 'original' && st.removed === 'user' && !st.pending, JSON.stringify(st));
     r = hook('activate');
     ok('reverted: activate leaves it off', r.code === 0 && disk() === sha(SRCBUF) && !r.result.reboot && !armed() && rec().enabled === false &&
         /turned off/.test(r.result.status), JSON.stringify(r.result));
@@ -516,6 +520,18 @@ async function main() {
     ok('boot recovery\'s restore: an install leaves the patch off, and says why', r.code === 0 && disk() === before && marker() === null && rec() === null &&
         /boot recovery removed the patch after 2 failed head-unit starts/.test(r.result.status || ''), JSON.stringify(r.result));
 
+    /* An earlier release's patch on disk the user turned off (the original,
+     * our backup beside it): patchd reports it removed by the user, and an
+     * install leaves it off. */
+    fresh(SRCBUF);
+    earlierPatch();
+    patcher(['revert', '--target', TGT, '--yes']);
+    ok('earlier release\'s Remove patch: the original, our backup beside it', disk() === sha(SRCBUF) && fs.existsSync(TGT + '.woc-orig'));
+    st = await daemonStatus();
+    ok('earlier release\'s Remove patch: patchd reports it removed by the user', st.state === 'original' && st.removed === 'user' && !st.recovered, JSON.stringify(st));
+    r = hook('activate');
+    ok('earlier release\'s Remove patch: an install leaves it off', r.code === 0 && disk() === sha(SRCBUF) && !armed() && /the patch was turned off/.test(r.result.status || ''), JSON.stringify(r.result));
+
     /* Boot recovery turned the patch in memory off at its threshold: patchd
      * reports it, and an install leaves it off. */
     fresh(SRCBUF);
@@ -592,6 +608,12 @@ async function main() {
         /variant: slot 0 handler not a store$/.test(r.result.conflict || '') && !r.result.reboot, JSON.stringify(r.result));
     r = hook('deactivate');
     ok('unpatchable binary: deactivate leaves it, exit 0', r.code === 0 && disk() === sha(unknown), JSON.stringify(r.result));
+    /* On a car coded 9 or 10 the coding comes first: built in, not this build. */
+    headUnit.coding(9);
+    st = await daemonStatus();
+    ok('unpatchable binary on a car coded 9: patchd reports it built in', st.conflict === 'built in on this cluster (KI_KOMBI_VARIANT 9: CarPlay and Android Auto stream the cluster map themselves)',
+        JSON.stringify(st));
+    headUnit.coding(7);
 
     /* What an older release patched where the locator now refuses a site
      * (with its backup and record): activate leaves it, a conflict; the
@@ -831,10 +853,10 @@ async function main() {
      * KI_KOMBI_VARIANT 7, and its first patch there is on trial (unproven
      * until boot recovery's watcher sees it run healthy). An earlier
      * release's patch it migrates is on trial too, whatever that release
-     * recorded: the plan has not run here. On another coding, or one that
-     * cannot be read, it plans nothing and reports the conflict the app
-     * shows, also on HIGH F over 0.8.2's restore; a patch CarPlay's Patch
-     * button planned there is left as it is. */
+     * recorded: the plan has not run here. A coding that cannot be read is
+     * planned as 7; on any other coding it plans nothing, drops a plan of
+     * ours and reports the conflict the app shows, also on HIGH F over
+     * 0.8.2's restore. */
     var record = require('../patch_record.js');
     function trial() { var x = rec(); return x ? { enabled: x.enabled, proven: x.proven, trial: x.trial } : null; }
     var TRIAL = JSON.stringify({ enabled: true, proven: false, trial: true });
@@ -993,27 +1015,27 @@ async function main() {
         replanned() && !!inmem.current('carplay') && armed() && disk() === sha(SRCBUF), JSON.stringify(rec()));
     noInmem();
 
-    var CODINGS = [['coding 9', 9, undefined, 'not supported on this car (KI_KOMBI_VARIANT 9)'],
-        ['invalid coding flags', 7, 0x0b, 'cluster coding unreadable'], ['no coding', null, undefined, 'cluster coding unreadable']];
+    /* A coding that cannot be read: the install plans it by itself as on a
+     * car coded 7, pending, on trial, no conflict; the removal turns it off;
+     * HIGH F restored by 0.8.2 is applied again as on a car coded 7. */
+    var CODINGS = [['invalid coding flags', 7, 0x0b, null], ['no coding', null, undefined, null]];
     for (var k = 0; k < CODINGS.length; k++) {
         var c = CODINGS[k];
         fresh(SRCBUF);
         headUnit.coding(c[1], c[2]);
         r = hook('activate');
-        ok(c[0] + ': the install plans nothing, no marker, the conflict', r.code === 0 && disk() === sha(SRCBUF) && !fs.existsSync(BAK) &&
-            marker() === null && !r.result.reboot && r.result.conflict === c[3] && rec() === null && !armed() && ro(), JSON.stringify(r.result));
+        var cm = rec();
+        ok(c[0] + ': the install plans it, pending, on trial, no conflict' + (c[3] ? ', with ' + c[3] : ''), r.code === 0 && disk() === sha(SRCBUF) && !fs.existsSync(BAK) &&
+            marker() && marker().action === 'apply' && !r.result.conflict && /map patch armed in memory/.test(r.result.status || '') && JSON.stringify(trial()) === TRIAL &&
+            armed() && ro() && cm.coding === 'unreadable', JSON.stringify([r.result, trial(), cm && cm.coding]));
         st = await daemonStatus();
-        ok(c[0] + ': patchd reports the original and the conflict', st.state === 'original' && st.conflict === c[3], JSON.stringify(st));
-        /* CarPlay's Patch button (patchd plans with --unproven). */
-        await button({ cmd: 'apply', panel: 'high', mode: 'avb' });
+        ok(c[0] + ': patchd reports it patched after the restart, no conflict', st.pending === 'apply' && !st.conflict, JSON.stringify(st));
         headUnitStart();
-        var buttonRec = JSON.stringify(c[1] === 9 ? { enabled: true, proven: false, trial: false } : { enabled: true, proven: false, trial: true });
-        ok(c[0] + ': CarPlay\'s Patch button plans it (' + (c[1] === 9 ? 'unproven' : 'on trial') + ')', JSON.stringify(trial()) === buttonRec && mem() === 'patched',
-            JSON.stringify(trial()));
-        before = fs.readFileSync(IP.record, 'utf8');
+        ok(c[0] + ': the next start runs it', mem() === 'patched', mem());
+        var was = rec();
         r = hook('activate');
-        ok(c[0] + ': the install leaves the Patch button\'s plan and its record', r.code === 0 && fs.readFileSync(IP.record, 'utf8') === before && armed() &&
-            marker() === null && r.result.conflict === c[3], JSON.stringify([r.result, trial()]));
+        ok(c[0] + ': the next install keeps the plan, on trial, nothing pending', r.code === 0 && rec().planSha256 === was.planSha256 && JSON.stringify(trial()) === TRIAL &&
+            armed() && marker() === null && !r.result.conflict, JSON.stringify([r.result, trial()]));
         r = hook('deactivate');
         ok(c[0] + ': the removal turns it off as ever', r.code === 0 && disk() === sha(SRCBUF) && rec() === null && !armed() && marker() && marker().action === 'revert' && ro(),
             JSON.stringify(r.result));
@@ -1022,20 +1044,56 @@ async function main() {
         ok(c[0] + ', HIGH F restored by 0.8.2: the original with our trusted backup', disk() === sha(SRCBUF) && fs.existsSync(BAK) && marker() === null);
         headUnit.coding(c[1], c[2]);
         r = hook('activate');
-        ok(c[0] + ', HIGH F restored by 0.8.2: the re-apply plans nothing, the conflict, left for the next install', r.code === 0 && disk() === sha(SRCBUF) &&
-            marker() === null && !armed() && !r.result.reset && r.result.conflict === c[3] && !fs.existsSync(MARK), JSON.stringify(r.result));
-        headUnit.coding(7);
-        r = hook('activate');
-        ok(c[0] + ', HIGH F restored by 0.8.2: coded 7 again, the next install applies it, on trial', r.code === 0 && r.result.reset === true &&
+        ok(c[0] + ', HIGH F restored by 0.8.2: the install applies it, on trial', r.code === 0 && r.result.reset === true &&
             marker() && marker().action === 'apply' && JSON.stringify(trial()) === TRIAL, JSON.stringify([r.result, trial()]));
         try { fs.unlinkSync(MARK); } catch (e) {}
         headUnit.set(headUnit.HIGH);
+        headUnit.coding(7);
+    }
+    /* A car coded with no cluster display or another cluster: the install
+     * plans nothing, the conflict; patchd says not supported. A plan made
+     * for 7 goes once the car reads another coding. */
+    var NOT = function (v) { return v === 0 ? 'not supported on this car (KI_KOMBI_VARIANT 0: no cluster display is coded)'
+        : v === 9 || v === 10 ? 'built in on this cluster (KI_KOMBI_VARIANT ' + v + ': CarPlay and Android Auto stream the cluster map themselves)'
+        : 'not supported on this cluster (KI_KOMBI_VARIANT ' + v + '; the map is made for KI_KOMBI_VARIANT 7)'; };
+    for (var v of [0, 9, 10, 4, 12]) {
+        fresh(SRCBUF);
+        headUnit.coding(v);
+        r = hook('activate');
+        ok('coding ' + v + ': the install plans nothing, no marker, not supported', r.code === 0 && disk() === sha(SRCBUF) && marker() === null && !r.result.reboot &&
+            r.result.conflict === NOT(v) && rec() === null && !armed() && ro(), JSON.stringify(r.result));
+        st = await daemonStatus();
+        ok('coding ' + v + ': patchd reports the original and not supported', st.state === 'original' && st.conflict === NOT(v), JSON.stringify(st));
+    }
+    headUnit.coding(7);
+    fresh(SRCBUF);
+    hook('activate');
+    headUnitStart();
+    ok('recoded: a plan made for 7, running', rec().coding === 7 && armed() && mem() === 'patched', JSON.stringify(rec()));
+    headUnit.coding(4);
+    st = await daemonStatus();
+    ok('recoded 4: patchd reports the patch running and not supported', st.state === 'patched' && st.conflict === NOT(4), JSON.stringify(st));
+    r = hook('activate');
+    ok('recoded 4: the install drops the plan, nothing armed, not supported', r.code === 0 && rec() === null && !armed() && r.result.conflict === NOT(4) && ro(), JSON.stringify(r.result));
+    headUnit.coding(7);
+    for (var bv of [9, 10]) {
+        fresh(SRCBUF);
+        hook('activate');
+        headUnitStart();
+        headUnit.coding(bv);
+        st = await daemonStatus();
+        ok('recoded ' + bv + ' under a patch made for 7: patchd reports it built in', st.conflict === NOT(bv), JSON.stringify(st));
+        r = hook('activate');
+        ok('recoded ' + bv + ': the install drops the plan, nothing armed, built in', r.code === 0 && rec() === null && !armed() && r.result.conflict === NOT(bv) && ro(), JSON.stringify(r.result));
+        headUnit.coding(7);
     }
 
-    /* A car coded otherwise on which an earlier release's install wrote the
-     * patch to the file: an install puts carplay back as it ships, drops our
-     * backup and plans nothing (the conflict), whether that patch has
-     * started or not; / read-only after. A remount that fails leaves carplay
+    /* An earlier release's patch of the file on a car coded otherwise
+     * (its install's, recorded proven or on trial, or CarPlay's Patch
+     * button's, unproven): put back as it ships, our backup dropped, nothing
+     * planned, the coding's conflict; / read-only after. Beside a
+     * carplay.service that starts another program, on a car coded 7, it is
+     * put back and nothing is planned. A remount that fails leaves carplay
      * as it was and exits non-zero. */
     function drec() { var x = record.current(TGT); return x ? { patched: x.patched, proven: x.proven, trial: x.trial } : null; }
     function earlierOnDisk(started, pending) {
@@ -1048,14 +1106,30 @@ async function main() {
         record.write(TGT, { patched: true, proven: true });
         if (started) headUnitStart();
     }
-    [['its apply pending', false, true], ['carplay running the file it replaced, no marker', false, false], ['started', true, false]].forEach(function (c) {
-        earlierOnDisk(c[1], c[2]);
-        headUnit.coding(9);
-        r = hook('activate');
-        ok('coding 9, an earlier release\'s patch on disk (' + c[0] + '): put back as it ships, the backup dropped, nothing armed, the conflict, / read-only',
-            r.code === 0 && disk() === sha(SRCBUF) && !fs.existsSync(BAK) && rec() === null && !armed() &&
-            r.result.conflict === 'not supported on this car (KI_KOMBI_VARIANT 9)' && /put back as it ships/.test(r.result.status || '') && ro(), JSON.stringify([r.result, drec()]));
+    [['its apply pending', false, true, { patched: true, proven: true }], ['carplay running the file it replaced, no marker', false, false, { patched: true, proven: true }],
+     ['started', true, false, { patched: true, proven: true }], ['the Patch button\'s, started', true, false, { patched: true, proven: false }],
+     ['an install\'s on trial', true, false, { patched: true, proven: false, trial: true }]].forEach(function (c) {
+        [9, 10, 4].forEach(function (v) {
+            earlierOnDisk(c[1], c[2]);
+            record.write(TGT, c[3]);
+            headUnit.coding(v);
+            r = hook('activate');
+            var m = rec();
+            ok('coding ' + v + ', an earlier release\'s patch on disk (' + c[0] + '): put back as it ships (' + (v === 4 ? 'not supported' : 'the cluster\'s own map takes over') +
+                '), the backup dropped, nothing planned, / read-only',
+                r.code === 0 && disk() === sha(SRCBUF) && !fs.existsSync(BAK) && m === null && !armed() && r.result.conflict === NOT(v) && /put back as it ships/.test(r.result.status || '') && ro(),
+                JSON.stringify([r.result, m]));
+            hook('deactivate');
+        });
     });
+    earlierOnDisk(true, false);
+    fs.mkdirSync(path.join(UNITS, 'carplay.service.d'), { recursive: true });
+    fs.writeFileSync(dropin, '[Service]\nExecStart=\nExecStart=/bin/sh -c \'exec /var/opt/other/carplay "$$@"\' -- -c /etc/cinemo/cinemo_options.xml\n');
+    r = hook('activate');
+    fs.unlinkSync(dropin);
+    ok('an earlier release\'s patch, carplay.service starting another program: put back as it ships, nothing armed, the conflict', r.code === 0 &&
+        disk() === sha(SRCBUF) && rec() === null && !armed() && /carplay\.service starts \/bin\/sh/.test(r.result.conflict || '') && /put back as it ships/.test(r.result.status || ''),
+        JSON.stringify([r.result, drec()]));
     earlierOnDisk(false, true);
     before = disk();
     headUnit.coding(9);
@@ -1063,8 +1137,47 @@ async function main() {
     r = hook('activate');
     fs.unlinkSync(RW_FAILS);
     ok('coding 9, / cannot be remounted: carplay and our backup as they were, exit 1, the reason named', r.code === 1 && disk() === before && fs.existsSync(BAK) &&
-        /putting carplay back failed/.test(r.result.status || ''), JSON.stringify([r.result, drec()]));
+        /remount/.test(r.result.status || ''), JSON.stringify([r.result, drec()]));
     headUnit.coding(7);
+
+    /* An earlier release's patch on disk, then a car software update put
+     * another build of carplay in place (its build-id differs) beside our
+     * backup: patchd reports it not patched, neither removed nor changed by
+     * another tool; the install drops the backup of the build no longer
+     * there, leaves the new carplay as it is and plans it. A file it cannot
+     * tell from another tool's change (the same build-id, bytes appended):
+     * the conflict, nothing dropped or planned. */
+    var LOC = require('../carplay_locate.js'), id = LOC.buildId(SRCBUF), at = SRCBUF.indexOf(Buffer.from(id, 'hex'));
+    var NEWER = Buffer.from(SRCBUF);
+    NEWER[at + 19] ^= 0xff;
+    function updated(buf) {
+        fresh(SRCBUF);
+        earlierPatch();
+        fs.writeFileSync(TGT + '.fw', buf, { mode: 0o755 });
+        fs.renameSync(TGT + '.fw', TGT);
+        headUnitStart();   /* the update is in place when carplay starts */
+    }
+    updated(NEWER);
+    st = await daemonStatus();
+    ok('a car software update beside our backup: patchd reports it not patched, no conflict, not removed', st.state === 'original' && !st.conflict && !st.removed &&
+        fs.existsSync(BAK), JSON.stringify(st));
+    r = hook('activate');
+    ok('a car software update beside our backup: the install drops the backup, leaves carplay as it is and plans it', r.code === 0 && fs.readFileSync(TGT).equals(NEWER) &&
+        !fs.existsSync(BAK) && !!rec() && rec().enabled === true && armed() && !r.result.conflict && /map patch armed in memory/.test(r.result.status || '') && ro() &&
+        !!marker() && marker().action === 'apply', JSON.stringify([r.result, marker(), ro()]));
+    hook('deactivate');
+    var NOID = Buffer.concat([SRCBUF, Buffer.from('appended')]);
+    updated(NOID);
+    var noidOther = /^restorable:\s+no \(another build: (.*)\)$/m.exec(cp.execFileSync(process.execPath, [PATCHER, 'status', '--target', TGT], { encoding: 'utf8' }) || '');
+    if (noidOther && noidOther[1] !== LOC.BUILD_ID_DIFFERS) {
+        st = await daemonStatus();
+        ok('another build it cannot tell from a change (' + noidOther[1] + '): the conflict', st.conflict === 'carplay is another build than our backup', JSON.stringify(st));
+        r = hook('activate');
+        ok('another build it cannot tell from a change: the install leaves it and our backup, nothing planned', r.code === 0 && fs.readFileSync(TGT).equals(NOID) &&
+            fs.existsSync(BAK) && rec() === null && r.result.conflict === 'carplay is another build than our backup', JSON.stringify(r.result));
+    } else ok('another build it cannot tell from a change: set up', false, noidOther && noidOther[1]);
+    hook('deactivate');
+    fresh(SRCBUF);
 
     ok('never a systemctl start, stop or restart, a kill or a reboot', changes().length === 0, changes().join('; '));
 }

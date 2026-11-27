@@ -99,6 +99,11 @@ function mk(rel, text) {
 }
 mk('usr/bin/carplay.woc-patch.json', '{"patched":true,"proven":true,"trial":false,"ino":5,"size":3484912,"mtime":1794170822000}\n');
 mk('usr/bin/aapd.woc-patch.json', '{"patched":false,"proven":true,"ino":6,"size":7367952,"mtime":1794170823000}\n');
+/* boot recovery's state with its log, and the services' last shutdown marks */
+mk('var/opt/waze-on-cluster/boot-recovery.json', '{"fails":0,"unknown":1,"arm":null,"prev":null,"starts":null,"ended":null,' +
+    '"log":["2026-11-26T06:00:00.000Z boot b2 up 9 s: carplay: boot b1 no shutdown mark, off 600 min after last seen; healthy: failed 0 -> 0, no record 0 -> 0"]}\n');
+mk('var/opt/waze-on-cluster/shutdown', 'b1 running ran up 900\n');
+mk('var/opt/waze-on-cluster/shutdown-aapd', 'b1 stopped up 900\n');
 mk('var/opt/waze-on-cluster/aa-boot-recovery.json', '{"fails":1,"unknown":0,"arm":null,"prev":"b1","starts":null,"ended":null}\n');
 /* the coding image: KI_KOMBI_VARIANT 7, a VIN elsewhere in it */
 var coding = Buffer.alloc(0x1030);
@@ -172,6 +177,9 @@ function get(n) { return fs.readFileSync(path.join(A, n), 'utf8'); }
 
 assert.strictEqual(get('patch-record-carplay.json'), fs.readFileSync(path.join(U, 'usr/bin/carplay.woc-patch.json'), 'utf8'));
 assert.strictEqual(get('patch-record-aapd.json'), fs.readFileSync(path.join(U, 'usr/bin/aapd.woc-patch.json'), 'utf8'));
+['boot-recovery.json', 'boot-recovery-shutdown', 'boot-recovery-shutdown-aapd'].forEach(function (n, i) {
+    assert.strictEqual(get(n), fs.readFileSync(path.join(U, 'var/opt/waze-on-cluster', ['boot-recovery.json', 'shutdown', 'shutdown-aapd'][i]), 'utf8'), n);
+});
 assert.strictEqual(get('aa-boot-recovery.json'), fs.readFileSync(path.join(U, 'var/opt/waze-on-cluster/aa-boot-recovery.json'), 'utf8'));
 assert.strictEqual(get('coding.txt'), 'KI_KOMBI_VARIANT 7\n');
 assert(/^target: +\/usr\/bin\/aapd$|^error: /m.test(get('aapd-status.txt')), get('aapd-status.txt'));

@@ -38,7 +38,7 @@ Android Auto. The app's **Status** for each tells you.
 No. Leave them alone unless something is wrong.
 
 - Press **Patch** when that phone type's **Status** says `Not patched`,
-  `Update needed`, `Removed — head unit kept restarting` or
+  `Removed`, `Update needed`, `Removed — head unit kept restarting` or
   `Removed — Android Auto crashed`. For any other Status, see
   [If the map doesn't show](#if-the-map-doesnt-show).
 - **Remove patch** turns the map off for that phone type. Use it only if
@@ -104,8 +104,14 @@ want first, then restart once.
 | `Status: Patched after restart` or `Removed after restart` | Restart the head unit. If **Restart head unit** shows on the app's page, press it. |
 | `Status: Removed — head unit kept restarting` | The patch was removed because the head unit kept restarting. Press **Patch** to try again. If it happens again, [report it](#logs-and-reporting-a-problem). |
 | `Status: Removed — Android Auto crashed` | The patch was removed because Android Auto crashed with it. Press **Patch** to try again. If it happens again, [report it](#logs-and-reporting-a-problem). |
-| `Status: Not supported on this car` | Your car doesn't support the map for this phone type. |
+| `Status: Removed` | You removed the patch. Press **Patch** to apply it again. |
+| `Status: Not supported on this head unit` | Your head unit doesn't support the map. |
+| `Status: Not supported — no cluster display` | Your car is coded without a cluster display. |
+| `Status: Built in` | Your car's cluster shows the CarPlay or Android Auto map by itself. Nothing to patch. |
+| `Status: Not supported — this cluster` | The map is made for another cluster than your car's. |
+| `Status: Not supported — this CarPlay version` or `this Android Auto version` | The map can't be added to your car's version of CarPlay or Android Auto. A car software update may change that. [Report it](#logs-and-reporting-a-problem) with your logs. |
 | `Status: Unavailable` | If it stays once the head unit has fully started, [report it](#logs-and-reporting-a-problem). |
+| `Status: Failed — press Patch to try again` | Press **Patch**. If it fails again, [report it](#logs-and-reporting-a-problem). |
 | `Status: Failed`, `Partly patched` or `Changed by another tool` | [Report it](#logs-and-reporting-a-problem). |
 | `Cluster map: Off` | Check **Show on**: **Off** and **HUD (experimental)** keep the map off the cluster. Check that CarPlay's or Android Auto's Status is `Patched`. |
 | `Cluster map: Waiting for the phone` | Connect your phone. |

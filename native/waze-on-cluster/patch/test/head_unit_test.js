@@ -82,7 +82,7 @@ try {
     [['HIGH', headUnit.HIGH], ['HIGH F', headUnit.HIGHF]].forEach(function (u) {
         headUnit.set(u[1]);
         r = run(AAPD_PATCH, aa);
-        ok(u[0] + ': aapd plan gets past the gate (to the coding check)', r.code !== 0 && /cluster coding cannot be read/.test(r.out), r.out);
+        ok(u[0] + ': aapd plan gets past the gate (to reading aapd)', r.code !== 0 && /^error: cannot read /.test(r.out), r.out);
     });
 } finally {
     cp.execFileSync('rm', ['-rf', dir]);

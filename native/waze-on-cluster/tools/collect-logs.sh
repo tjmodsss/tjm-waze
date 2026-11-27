@@ -10,7 +10,8 @@
 # default) and prints its path: both tools' log files (with their .1), the
 # journal lines the journal service keeps (in RAM: journal.log and its
 # rotations; on /var/opt: the journal-*.log written around failures and at
-# shutdowns),
+# shutdowns), CarPlay's boot recovery state with its log of how each start
+# was counted, and the shutdown marks of carplay and aapd,
 # the renderer's and the capture's status files, this boot's journal of the
 # tools and of carplay (what the journal still holds), the list of boots,
 # the carplay patch probe (where its edit sites are in this carplay), the
@@ -83,6 +84,7 @@ for f in "$ROOT"/run/waze-on-cluster-journal/journal.log* "$ROOT"/var/opt/waze-o
 done
 copy "$ROOT/var/opt/waze-on-cluster/boot-recovery.json" boot-recovery.json
 copy "$ROOT/var/opt/waze-on-cluster/shutdown" boot-recovery-shutdown
+copy "$ROOT/var/opt/waze-on-cluster/shutdown-aapd" boot-recovery-shutdown-aapd
 
 for f in /run/cluster-render/*; do
     copy "$f" "run-cluster-render-${f##*/}"

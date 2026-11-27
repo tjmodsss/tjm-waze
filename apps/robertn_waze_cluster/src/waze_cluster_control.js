@@ -249,25 +249,48 @@ function headUnitRefused(conflict) {
     return /^not supported on this car \(head unit:/.test(conflict || '');
 }
 
+/* A conflict no Patch can get past: a head unit that refuses our parts or
+ * has no Android Auto, a cluster coding the patch is not made for (or one
+ * that streams the map itself, built in), a build whose edit sites the
+ * patcher cannot find or verify. It is shown whatever the section's state,
+ * and Patch is not offered. */
+function unsupported(conflict) {
+    return headUnitRefused(conflict) || /^(no Android Auto|not supported on this cluster|built in on this cluster|not patchable)/.test(conflict || '') ||
+        /no cluster display is coded/.test(conflict || '');
+}
+
+/* A conflict of the patch in memory that Patch plans again past (patchd
+ * aaRetryable): a plan the patcher no longer reads as patched, or one the
+ * library refused for the running process. */
+function retryable(conflict) {
+    return /^(not applied in memory|in-memory plan unusable)/.test(conflict || '');
+}
+
 /* A patch state the conflict keeps from being applied, in the words both
- * sections use. */
-function conflictText(conflict) {
-    return /^not supported|^not patchable|^no Android Auto/.test(conflict) ? t('Not supported on this car')
+ * sections use; product names the section ('CarPlay', 'Android Auto').
+ * patchd's reason itself goes to its log, never on screen. */
+function conflictText(conflict, product) {
+    return headUnitRefused(conflict) || /^no Android Auto/.test(conflict) ? t('Not supported on this head unit')
+        : /no cluster display is coded/.test(conflict) ? t('Not supported — no cluster display')
+        : /^not supported on this cluster/.test(conflict) ? t('Not supported — this cluster')
+        : /^built in on this cluster/.test(conflict) ? t('Built in')
+        : /^not patchable/.test(conflict) ? (product === 'CarPlay' ? t('Not supported — this CarPlay version') : t('Not supported — this Android Auto version'))
         : /unreadable/.test(conflict) ? t('Unavailable')
+        : retryable(conflict) ? t('Failed — press Patch to try again')
         : t('Changed by another tool');
 }
 
-/* A change that failed, with its reason: the conflict that refused it in
- * the words both sections use, else patchd's own words. */
-function failedText(st) {
+/* A change that failed: the conflict that refused it in the words both
+ * sections use, else that it failed, and Patch where the section offers it. */
+function failedText(st, product, canPatch) {
     const why = st.error || st.reason;
     if (st.conflict && why && why.indexOf(st.conflict) >= 0) {
-        return conflictText(st.conflict);
+        return conflictText(st.conflict, product);
     }
-    if (why && /^(not supported|not patchable)/.test(why)) {
-        return conflictText(why);
+    if (why && /^(not supported|not patchable|built in)/.test(why)) {
+        return conflictText(why, product);
     }
-    return why ? t('Failed, {0}', why) : t('Failed');
+    return canPatch ? t('Failed — press Patch to try again') : t('Failed');
 }
 
 /* Where a render status shows the map: 'cluster', 'hud', 'both', 'off'
@@ -733,7 +756,7 @@ class WazeClusterControl extends EventEmitter {
      * unknown or failed state, or an outdated patch, with nothing pending. */
     canEnable() {
         const ps = this._idleStatus();
-        return !!ps && !headUnitRefused(ps.conflict) &&
+        return !!ps && !unsupported(ps.conflict) &&
             (['original', 'unknown', 'error'].includes(ps.state) || (ps.state === 'patched' && this._outdated(ps)));
     }
 
@@ -776,8 +799,8 @@ class WazeClusterControl extends EventEmitter {
             return t('Connecting…');
         }
         const pending = this.pending(), ps = this.patchStatus;
-        if (pending === 'apply' && ps && headUnitRefused(ps.conflict)) {
-            return conflictText(ps.conflict);
+        if (pending === 'apply' && ps && unsupported(ps.conflict)) {
+            return conflictText(ps.conflict, 'CarPlay');
         }
         if (pending) {
             return pending === 'revert' ? t('Removed after restart') : t('Patched after restart');
@@ -789,18 +812,20 @@ class WazeClusterControl extends EventEmitter {
             return this._lastPatchCmd === 'revert' ? t('Removing patch…') : t('Patching…');
         }
         if (ps.state === 'error') {
-            return failedText(ps);
+            return unsupported(ps.conflict) ? conflictText(ps.conflict, 'CarPlay') : failedText(ps, 'CarPlay', this.canEnable());
         }
-        if (ps.recovered && ps.state !== 'patched' && !headUnitRefused(ps.conflict)) {
+        if (ps.recovered && ps.state !== 'patched' && !unsupported(ps.conflict)) {
             return t('Removed — head unit kept restarting');
         }
-        if (ps.conflict && (ps.state !== 'patched' || headUnitRefused(ps.conflict))) {
-            return conflictText(ps.conflict);
+        if (ps.conflict && (ps.state !== 'patched' || unsupported(ps.conflict))) {
+            return conflictText(ps.conflict, 'CarPlay');
         }
         if (ps.state === 'patched') {
             return this._outdated(ps) ? t('Update needed') : t('Patched');
         }
-        return ps.state === 'original' ? t('Not patched') : t('Partly patched');
+        /* Not applied: turned off with Remove patch, or not yet (an install
+         * that could not plan it, a car software update since). */
+        return ps.state === 'original' ? (ps.removed === 'user' ? t('Removed') : t('Not patched')) : t('Partly patched');
     }
 
     /* The cluster map row: the shared render's map, while CarPlay's patch
@@ -907,7 +932,7 @@ class WazeClusterControl extends EventEmitter {
     /* Patch: also over a Remove patch that waits for the next start. */
     canEnableAa() {
         const aa = this.aa();
-        return this._aaFree() && !this._aaBlocked() && aa.pending !== 'apply' && ['original', 'unknown', 'error'].includes(aa.state);
+        return this._aaFree() && (!this._aaBlocked() || retryable(aa.conflict)) && aa.pending !== 'apply' && ['original', 'unknown', 'error'].includes(aa.state);
     }
 
     canDisableAa() {
@@ -998,20 +1023,20 @@ class WazeClusterControl extends EventEmitter {
             return aa.reason === 'reverting' ? t('Removing patch…') : t('Patching…');
         }
         if (aa.state === 'error' || aa.error) {
-            return failedText(aa);
+            return unsupported(aa.conflict) ? conflictText(aa.conflict, 'Android Auto') : failedText(aa, 'Android Auto', this.canEnableAa());
         }
-        if (aa.pending && !(aa.pending === 'apply' && headUnitRefused(aa.conflict))) {
+        if (aa.pending && !(aa.pending === 'apply' && unsupported(aa.conflict))) {
             return aa.pending === 'revert' ? t('Removed after restart') : t('Patched after restart');
         }
-        if (aa.recovered && aa.state !== 'patched' && !headUnitRefused(aa.conflict)) {
+        if (aa.recovered && aa.state !== 'patched' && !unsupported(aa.conflict)) {
             return aa.recoveredWhy === 'crash' ? t('Removed — Android Auto crashed') : t('Removed — head unit kept restarting');
         }
         /* A conflict patchd refuses changes for is named also while patched,
          * since it greys Zoom and the turn card. */
         if (aa.state === 'absent' || (aa.conflict && (aa.state !== 'patched' || this._aaBlocked()))) {
-            return conflictText(aa.conflict || 'no Android Auto');
+            return conflictText(aa.conflict || 'no Android Auto', 'Android Auto');
         }
-        return aa.state === 'patched' ? t('Patched') : aa.state === 'original' ? t('Not patched') : t('Partly patched');
+        return aa.state === 'patched' ? t('Patched') : aa.state === 'original' ? (aa.removed === 'user' ? t('Removed') : t('Not patched')) : t('Partly patched');
     }
 
     /* ---- CarPlay's Wi-Fi band ---- */

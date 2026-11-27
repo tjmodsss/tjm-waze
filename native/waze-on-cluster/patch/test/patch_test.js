@@ -675,11 +675,9 @@ try {
     try { fs.readdirSync(dir).forEach(function (f) { fs.unlinkSync(path.join(dir, f)); }); fs.rmdirSync(dir); } catch (e) {}
 }
 
-/* The cluster-coding gate and the patch record: a car not coded
- * KI_KOMBI_VARIANT 7, or whose coding cannot be read, is planned only with
- * --unproven, the plan's summary saying how the coding read; a revert of an
- * earlier release's patch records whether it ran healthy, with the URLs and
- * the geometry it held. */
+/* The cluster coding and the patch record: the plan's summary says how the
+ * coding read; a revert of an earlier release's patch records whether it ran
+ * healthy, with the URLs and the geometry it held. */
 function codingAndRecord() {
     var r, ct = path.join(dir, 'carplay_coding');
     function fresh() {
@@ -705,21 +703,37 @@ function codingAndRecord() {
         ok('coding: status names it', /^coding:\s+KI_KOMBI_VARIANT 7$/m.test(r.out), r.out);
         r = plan(ct, ['--panel', 'high']);
         ok('coding: variant 7, the plan says the coding is ok', r.code === 0 && !!r.plan && (summaryOf(r.out) || {}).coding === 'ok', r.out);
-        [[function () { car.coding(9); }, 'KI_KOMBI_VARIANT 9 is not the supported cluster coding (7)', /^coding:\s+KI_KOMBI_VARIANT 9$/m, 'refused'],
-         [function () { car.coding(7, 0x0b); }, 'the cluster coding cannot be read (coding not valid (flags 0xb))', /^coding:\s+unreadable \(coding not valid/m, 'unreadable'],
-         [function () { car.coding(null); }, 'the cluster coding cannot be read', /^coding:\s+unreadable \(.* unreadable\)$/m, 'unreadable']].forEach(function (c) {
+        /* KI_KOMBI_VARIANT 7 and a coding that cannot be read (as 7) are
+         * planned, the summary naming the coding; 0 (no cluster display)
+         * and every other cluster are refused, --unproven (what earlier
+         * releases' records pass) or not. */
+        ok('coding: variant 7, the summary names it', (summaryOf(r.out) || {}).variant === 7, r.out);
+        [[function () { car.coding(7, 0x0b); }, /^coding:\s+unreadable \(coding not valid/m],
+         [function () { car.coding(null); }, /^coding:\s+unreadable \(.* unreadable\)$/m]].forEach(function (c) {
             fresh();
             c[0]();
             r = run(['status', '--target', ct]);
-            ok('coding: status reads ' + c[2], c[2].test(r.out), r.out);
+            ok('coding: status reads ' + c[1], c[1].test(r.out), r.out);
             r = plan(ct, ['--panel', 'high']);
-            ok('coding: plan refused (' + c[1] + '), no plan, nothing written', r.code !== 0 && r.out.indexOf('refusing: ' + c[1]) >= 0 && /pass --unproven/.test(r.out) &&
-                !r.plan && sha256(ct) === ORIG_SHA && !fs.existsSync(ct + '.woc-orig') && rec() === 'none', r.out);
-            r = plan(ct, ['--panel', 'high', '--unproven']);
-            ok('coding: with --unproven (the Patch button) planned, the coding ' + c[3], r.code === 0 && !!r.plan && (summaryOf(r.out) || {}).coding === c[3] &&
-                sha256(ct) === ORIG_SHA, r.out);
+            var sum = summaryOf(r.out) || {};
+            ok('coding: ' + c[1] + ' planned as 7, the coding unreadable', r.code === 0 && !!r.plan && sum.coding === 'unreadable' && sum.variant === null &&
+                sha256(ct) === ORIG_SHA && rec() === 'none', r.out);
             car.coding(7);
         });
+        [[0, 'not supported on this car (KI_KOMBI_VARIANT 0: no cluster display is coded)'],
+         [9, 'built in on this cluster (KI_KOMBI_VARIANT 9: CarPlay and Android Auto stream the cluster map themselves)'],
+         [10, 'built in on this cluster (KI_KOMBI_VARIANT 10: CarPlay and Android Auto stream the cluster map themselves)'],
+         [4, 'not supported on this cluster (KI_KOMBI_VARIANT 4; the map is made for KI_KOMBI_VARIANT 7)'],
+         [12, 'not supported on this cluster (KI_KOMBI_VARIANT 12; the map is made for KI_KOMBI_VARIANT 7)']].forEach(function (c) {
+            fresh();
+            car.coding(c[0]);
+            [[], ['--unproven']].forEach(function (extra) {
+                r = plan(ct, ['--panel', 'high'].concat(extra));
+                ok('coding: KI_KOMBI_VARIANT ' + c[0] + ' refused' + (extra.length ? ' with --unproven too' : '') + ', no plan, nothing written',
+                    r.code !== 0 && r.out.indexOf('error: refusing: ' + c[1] + '\n') >= 0 && !r.plan && sha256(ct) === ORIG_SHA, r.out);
+            });
+        });
+        car.coding(7);
 
         /* An earlier release's first patch, recorded on trial: its revert
          * leaves no healthy mark. */

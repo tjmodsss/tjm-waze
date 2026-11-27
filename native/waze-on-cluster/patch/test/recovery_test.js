@@ -75,10 +75,14 @@ const ro = () => /\bro\b/.test(fs.readFileSync(MOUNTS, 'utf8'));
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-function clock() {
-    let t = 1000000;
+/* The watcher's clock, and the wall clock moving with it from wallBase
+ * (setWall sets it, as the head unit's time being set does). */
+function clock(wallBase) {
+    let t = 1000000, base = wallBase || Date.now();
     const fn = () => t;
     fn.advance = (ms) => { t += ms; };
+    fn.wall = () => base + t - 1000000;
+    fn.setWall = (ms) => { base = ms - t + 1000000; };
     return fn;
 }
 
@@ -123,7 +127,8 @@ function makeWorld(opts) {
     clearInmem();
     const T = recovery.targets({ state: path.join(dir, 'var', 'boot-recovery.json'), sock: path.join(dir, 'shm', 'patch.sock'),
         carplay: CARPLAY, aapd: path.join(dir, 'aapd'), aapdConf: path.join(dir, 'aapd.conf'), sin: path.join(dir, 'sin') });
-    const w = { dir, T, system: 'running', recmgr: !!opts.recmgr, lockHeld: false, now: clock(), events: [], logs: [], svc: {}, bin: {} };
+    const w = { dir, T, system: 'running', recmgr: !!opts.recmgr, lockHeld: false, now: clock(opts.wallBase), events: [], logs: [], svc: {}, bin: {},
+        bootAt: undefined, crashKey: 0 };
     let nextPid = 100;
     ['carplay', 'aapd'].forEach((name) => {
         const s = w.svc[name] = { run: '', pid: 0, state: 'inactive', result: 'success', alive: new Set() };
@@ -195,6 +200,12 @@ function makeWorld(opts) {
         arm: (n) => inmem.arm(n, { preload: '', user: 'cia_13002' }),
         /* Whether the service runs its target's own file (w.runs). */
         runsTarget: () => !!w.runs,
+        /* the wall clock, this boot's start by it (null: unknown) and
+         * recmgr's newest crash key (null: unreadable); bootAt unset:
+         * /proc/stat's, as WOC_PROC_STAT points it */
+        wall: w.now.wall,
+        bootTime: () => (w.bootAt === undefined ? require('../boot_id.js').bootTime() : w.bootAt),
+        crashKey: () => w.crashKey,
         log: (l) => w.logs.push(l),
     }, extra || {}));
     w.state = (name) => readJson(T[name].state);
@@ -436,7 +447,7 @@ test('a patch on trial is not recorded proven for a run of another file (a chang
     const { watcher } = await bootUp(w, 'A');
     fs.writeFileSync(MOUNT_LOG, '');
     w.now.advance(61000);
-    assert.strictEqual((await tick(watcher)).action, 'confirmed');
+    assert.strictEqual((await tick(watcher)).action, 'watch', 'a run of another file confirms nothing');
     for (let i = 0; i < 5; i++) { w.now.advance(1000); await tick(watcher); }
     assert.deepStrictEqual(recordOf(w), { patched: true, proven: false, trial: true });
     assert.strictEqual(mountLog(), '', 'no remount');
@@ -450,7 +461,7 @@ test('a patch on trial is not recorded proven for a run of another file (a chang
     w.now.advance(5000);
     await tick(watcher);
     w.now.advance(61000);
-    assert.strictEqual((await tick(watcher)).action, 'watch', 'this boot was confirmed already');
+    assert.strictEqual((await tick(watcher)).action, 'confirmed', 'the run of the patch confirms the boot');
     await whenRestored(watcher);
     assert.deepStrictEqual(recordOf(w), { patched: true, proven: true, trial: false }, 'the new run\'s healthy minute records it');
     assert(ro());
@@ -586,6 +597,7 @@ test('a state written before the counting rules (no unknown) starts its counts a
 test('proven: two failed boots with no healthy boot between restore; a healthy boot between does not', async () => {
     for (const healthyBetween of [false, true]) {
         const w = makeWorld();
+        w.runs = true;
         w.install('carplay', 'proven');
         await bootUp(w, 'A');
         END.otherCrash(w, 'A');
@@ -751,6 +763,526 @@ test('a healthy boot clears the counter; a crash restart after a healthy minute 
     }
 });
 
+/* One boot of the patch in memory: armed, carplay up for runMs without a
+ * break (the watcher ticking at the healthy minute, then every minute, so
+ * it records when it last saw carplay healthy), then ended as end does. The
+ * boot step's action. */
+async function runFor(w, boot, runMs, end) {
+    const { step, watcher } = await bootUp(w, boot);
+    if (step.action !== 'armed') return step.action;
+    w.now.advance(61000);
+    await tick(watcher);
+    for (let t = 61000; t < runMs; t += 60000) { w.now.advance(Math.min(60000, runMs - t)); await tick(watcher); }
+    end(w, boot, 'carplay');
+    return step.action;
+}
+
+/* The head unit off for ms; the next boot starts then, by the wall clock. */
+function offFor(w, ms) {
+    w.now.advance(ms);
+    w.bootAt = w.now.wall();
+}
+
+/* Boots of runMs each, ended as end does, each followed by offMs off: the
+ * boot at which the patch was turned off, or 0 within max. */
+async function trips(w, kind, runMs, end, offMs, max) {
+    w.install('carplay', kind);
+    for (let i = 1; i <= max; i++) {
+        if (await runFor(w, 'boot-' + i, runMs, end) === 'restored') return i;
+        offFor(w, offMs);
+    }
+    return 0;
+}
+
+test('short trips that end with no record and 3 minutes or more off never turn the patch off; a shorter time off still counts', async () => {
+    for (const kind of ['proven', 'unproven']) {
+        const w = makeWorld();
+        w.runs = true;
+        assert.strictEqual(await trips(w, kind, 2 * 60000, END.powerCut, 3 * 3600000, 8), 0, kind + ': 2-minute trips, 3 hours off');
+        assert.strictEqual((await bootUp(w, 'last')).step.action, 'armed', kind + ': still on');
+        assert.deepStrictEqual([w.state('carplay').fails, w.state('carplay').unknown], [0, 0], kind + ': nothing counted');
+        assert(/no record, then off 18\d min/.test(w.state('carplay').log.slice(-1)[0]), w.state('carplay').log.slice(-1)[0]);
+        const x = makeWorld();
+        x.runs = true;
+        assert.strictEqual(await trips(x, kind, 2 * 60000, END.powerCut, 2 * 60000, 8), kind === 'proven' ? 5 : 3, kind + ': 2 minutes off: a start with no record');
+        /* a start never seen (unlocked and locked within a minute), then a
+         * trip: the trip's park counts by the brief start's arm */
+        const b = makeWorld();
+        b.runs = true;
+        b.install('carplay', kind);
+        await runFor(b, 'A', 3 * 60000, END.powerCut);
+        offFor(b, 3 * 3600000);
+        const ba = await bootUp(b, 'B');
+        b.now.advance(30000);
+        await tick(ba.watcher);
+        END.powerCut(b);
+        offFor(b, 3 * 3600000);
+        await runFor(b, 'C', 3 * 60000, END.powerCut);
+        offFor(b, 3 * 3600000);
+        await bootUp(b, 'D');
+        assert.deepStrictEqual([b.state('carplay').fails, b.state('carplay').unknown], [0, 0], kind + ': after a brief start, a trip and a long park: parked');
+    }
+});
+
+test('a loop that resets the head unit 15 minutes into each start, leaving no record, is still turned off', async () => {
+    for (const [kind, at] of [['proven', 5], ['unproven', 3]]) {
+        const w = makeWorld();
+        w.runs = true;
+        assert.strictEqual(await trips(w, kind, 15 * 60000, END.powerCut, 30000, 6), at, kind);
+    }
+});
+
+test('a time off that cannot be told falls back to counting the start as one with no record', async () => {
+    /* each case: how the boot after a 2-minute start ended with no record
+     * starts; that boot then ends the same way; two in a row count one */
+    const cases = [
+        ['no boot time', (w) => { w.now.advance(3 * 3600000); w.bootAt = null; }],
+        ['this boot started before the start was last seen (the clock went back)', (w) => { w.now.advance(3 * 3600000); w.bootAt = w.now.wall() - 4 * 3600000; }],
+        ['this boot\'s start ahead of the clock', (w) => { w.now.advance(3 * 3600000); w.bootAt = w.now.wall() + 3600000; }],
+    ];
+    for (const [what, off] of cases) {
+        const w = makeWorld();
+        w.runs = true;
+        w.install('carplay', 'proven');
+        for (const b of ['A', 'B', 'C']) { await runFor(w, b, 2 * 60000, END.powerCut); offFor(w, 3 * 3600000); }
+        assert.deepStrictEqual([w.state('carplay').fails, w.state('carplay').unknown], [0, 0], what + ': B parked');
+        await runFor(w, 'D', 2 * 60000, END.powerCut);
+        off(w);
+        await bootUp(w, 'E');
+        assert.deepStrictEqual([w.state('carplay').fails, w.state('carplay').unknown], [0, 1], what + ': a start with no record');
+    }
+    /* a run that is not one of the patch is never seen: nothing to tell by */
+    const n = makeWorld();
+    n.runs = false;
+    n.install('carplay', 'proven');
+    for (const b of ['A', 'B']) { await runFor(n, b, 2 * 60000, END.powerCut); offFor(n, 3 * 3600000); }
+    await bootUp(n, 'C');
+    assert.deepStrictEqual([n.state('carplay').fails, n.state('carplay').unknown, n.state('carplay').prev.seen, n.state('carplay').prev.confirmed], [1, 0, 0, false],
+        'a run of another file: neither confirmed nor seen, counted');
+    /* the clock not set (the software's build time) */
+    const c = makeWorld({ wallBase: Date.UTC(2023, 7, 18) });
+    c.runs = true;
+    assert.strictEqual(await trips(c, 'proven', 2 * 60000, END.powerCut, 3 * 3600000, 6), 5, 'a clock before 2025: starts with no record');
+    /* nor is the state read every tick for want of a set clock */
+    const u = makeWorld({ wallBase: Date.UTC(2023, 7, 18) });
+    u.runs = true;
+    u.install('carplay', 'proven');
+    const uw = (await bootUp(u, 'A')).watcher;
+    u.now.advance(61000);
+    await tick(uw);
+    let uloads = 0;
+    const uload = uw._load;
+    uw._load = function () { uloads++; return uload.call(this); };
+    for (let i = 0; i < 100; i++) { u.now.advance(1000); await tick(uw); }
+    assert.deepStrictEqual([uloads, u.state('carplay').arm.seen, u.state('carplay').arm.confirmed], [1, 0, true], 'a clock before 2025: confirmed, never seen, one read a minute');
+    /* a boot that ran throughout on a time kept from its last shutdown
+     * (about when the start before was last seen) */
+    const k = makeWorld();
+    k.runs = true;
+    k.install('carplay', 'proven');
+    for (const b of ['A', 'B']) { await runFor(k, b, 2 * 60000, END.powerCut); offFor(k, 3 * 3600000); }
+    await runFor(k, 'C', 2 * 60000, END.powerCut);
+    const seenC = k.state('carplay').arm.seen;
+    k.now.advance(3 * 3600000);
+    k.now.setWall(seenC + 30000);
+    k.bootAt = k.now.wall();
+    await runFor(k, 'D', 2 * 60000, END.powerCut);
+    assert.deepStrictEqual([k.state('carplay').fails, k.state('carplay').unknown], [0, 1], 'C, judged on the kept time: off 30 s, a start with no record');
+    k.now.advance(3 * 3600000);
+    k.now.setWall(seenC + 4 * 3600000);
+    k.bootAt = k.now.wall();
+    await bootUp(k, 'E');
+    assert.deepStrictEqual([k.state('carplay').fails, k.state('carplay').unknown], [1, 0], 'D, which ran on the kept time: counted');
+});
+
+test('an off gap never makes a start healthy after the service\'s own crash, a restart record or a crash in recmgr\'s table', async () => {
+    /* its own crash after its last seen time */
+    const a = makeWorld();
+    a.runs = true;
+    a.install('carplay', 'proven');
+    for (const b of ['A', 'B']) { await runFor(a, b, 2 * 60000, END.powerCut); offFor(a, 3 * 3600000); }
+    const ab = await bootUp(a, 'C');
+    a.now.advance(61000);
+    await tick(ab.watcher);
+    a.svc.carplay.crashes();
+    await tick(ab.watcher);
+    END.powerCut(a);
+    offFor(a, 3 * 3600000);
+    await bootUp(a, 'D');
+    assert.strictEqual(a.state('carplay').fails, 1, 'its own crash');
+    /* a restart record of recmgr, no mark */
+    const r = makeWorld({ wallBase: Date.now() - 24 * 3600000 });
+    r.runs = true;
+    r.install('carplay', 'proven');
+    for (const b of ['A', 'B']) { await runFor(r, b, 2 * 60000, END.powerCut); offFor(r, 3 * 3600000); }
+    await runFor(r, 'C', 2 * 60000, END.powerCut);
+    const info = path.join(r.dir, 'sin', 'recmgr', 'restartInfo.xml');
+    fs.writeFileSync(info, '<x/>');
+    fs.utimesSync(info, r.now.wall() / 1000, r.now.wall() / 1000);   /* the crash, in boot C */
+    offFor(r, 3 * 3600000);
+    await bootUp(r, 'D');
+    assert.strictEqual(r.state('carplay').fails, 1, 'a restart record');
+    /* recmgr's crash table grew in that boot */
+    const t = makeWorld();
+    t.runs = true;
+    t.crashKey = 3;
+    t.install('carplay', 'proven');
+    for (const b of ['A', 'B']) { await runFor(t, b, 2 * 60000, END.powerCut); offFor(t, 3 * 3600000); }
+    await runFor(t, 'C', 2 * 60000, END.powerCut);
+    assert.strictEqual(t.state('carplay').unknown, 0, 'unchanged table: B parked');
+    t.crashKey = 4;
+    offFor(t, 3 * 3600000);
+    await bootUp(t, 'D');
+    assert.strictEqual(t.state('carplay').unknown, 1, 'a crash in the table: a start with no record');
+    assert(/a crash in recmgr's table/.test(t.state('carplay').log.slice(-1)[0]), t.state('carplay').log.slice(-1)[0]);
+});
+
+test('the watcher records when it last saw the patched service healthy, every minute, and reads the state only then; a run not of the patch is not seen, the next run of it is', async () => {
+    const w = makeWorld();
+    w.runs = true;
+    w.install('carplay', 'proven');
+    const { watcher } = await bootUp(w, 'A');
+    let loads = 0;
+    const load = watcher._load;
+    watcher._load = function () { loads++; return load.call(this); };
+    w.now.advance(61000);
+    assert.strictEqual((await tick(watcher)).action, 'confirmed');
+    const first = w.state('carplay').arm.seen;
+    assert.strictEqual(first, w.now.wall(), 'seen at the healthy minute');
+    loads = 0;
+    for (let i = 0; i < 50; i++) { w.now.advance(1000); await tick(watcher); }
+    assert.deepStrictEqual([loads, w.state('carplay').arm.seen], [0, first], 'nothing read or written within a minute');
+    for (let i = 0; i < 15; i++) { w.now.advance(1000); await tick(watcher); }
+    const second = w.state('carplay').arm.seen;
+    assert(second > first && loads === 1, 'seen again after a minute: ' + loads);
+    /* a run that is not the patch's, then one that is (patchd restarted
+     * carplay onto the plan) */
+    w.svc.carplay.ends('2', '9');
+    fs.writeFileSync(w.T.carplay.killed, w.svc.carplay.run + '\n');
+    w.now.advance(5000);
+    await tick(watcher);
+    w.runs = false;
+    w.svc.carplay.starts();
+    w.now.advance(5000);
+    await tick(watcher);
+    w.now.advance(61000);
+    await tick(watcher);
+    assert.strictEqual(w.state('carplay').arm.seen, second, 'a run of another file: not seen');
+    w.svc.carplay.ends('2', '9');
+    fs.writeFileSync(w.T.carplay.killed, w.svc.carplay.run + '\n');
+    w.now.advance(5000);
+    await tick(watcher);
+    w.runs = true;
+    w.svc.carplay.starts();
+    w.now.advance(5000);
+    await tick(watcher);
+    w.now.advance(61000);
+    await tick(watcher);
+    assert.strictEqual(w.state('carplay').arm.seen, w.now.wall(), 'the run of the patch: seen at its healthy minute');
+});
+
+test('a seen time is written at most every minute, also while a run is not settled (a trial waiting to be recorded proven); one that cannot be saved is logged once', async () => {
+    const w = makeWorld();
+    w.runs = true;
+    w.install('carplay', 'trial');
+    const { watcher } = await bootUp(w, 'A');
+    let seenWrites = 0, last = 0;
+    const save = watcher._save;
+    watcher._save = function (st) { if (st.arm && st.arm.seen !== last) { seenWrites++; last = st.arm.seen; } return save.call(this, st); };
+    fs.writeFileSync(process.env.WOC_REMOUNT_LOCK, 'patchd\n');
+    try {
+        w.now.advance(61000);
+        await tick(watcher);
+        for (let i = 0; i < 50; i++) { w.now.advance(1000); await tick(watcher); }
+        assert.deepStrictEqual([seenWrites, recordOf(w).trial], [1, true], 'one seen write while the trial waits');
+    } finally { fs.unlinkSync(process.env.WOC_REMOUNT_LOCK); }
+    /* saves of the seen time fail for 5 minutes: one line, then one when they work */
+    const f = makeWorld();
+    f.runs = true;
+    f.install('carplay', 'proven');
+    const fw = (await bootUp(f, 'A')).watcher;
+    f.now.advance(61000);
+    await tick(fw);
+    let failing = true;
+    const fsave = fw._save;
+    fw._save = function (st, quiet) {
+        if (failing) { if (!quiet) this._log('could not persist state: EROFS'); return false; }
+        return fsave.call(this, st, quiet);
+    };
+    const before = f.logs.length;
+    for (let i = 0; i < 300; i++) { f.now.advance(1000); await tick(fw); }
+    failing = false;
+    for (let i = 0; i < 61; i++) { f.now.advance(1000); await tick(fw); }
+    const lines = f.logs.slice(before);
+    assert.deepStrictEqual(lines, ['could not persist state: EROFS', 'carplay: its seen time cannot be saved; tried again every 60 s', 'carplay: its seen time is saved again'], lines.join('\n'));
+});
+
+test('a save of the state that fails says so in one line, quiet says nothing; the count is saved without the log', async () => {
+    const w = makeWorld();
+    w.install('carplay', 'proven');
+    const rec = w.recovery('carplay', 'A');
+    await startBoot(rec);
+    const write = fs.writeFileSync;
+    let failAll = true;
+    fs.writeFileSync = function (f, data) {
+        if (typeof f === 'number' && (failAll || /"log":\["/.test(String(data)))) { const e = new Error('ENOSPC: no space left on device'); e.code = 'ENOSPC'; throw e; }
+        return write.apply(fs, arguments);
+    };
+    try {
+        const st = rec._load();
+        st.log = ['a line'];
+        let n = w.logs.length;
+        assert.strictEqual(rec._save(st, true), false);
+        assert.strictEqual(w.logs.length, n, 'quiet: no line');
+        assert.strictEqual(rec._save(st), false);
+        assert.deepStrictEqual(w.logs.slice(n), ['could not persist state: ENOSPC: no space left on device'], 'one line');
+        failAll = false;
+        n = w.logs.length;
+        st.log = ['a line'];
+        assert.strictEqual(rec._save(st, true), true);
+        assert.deepStrictEqual([w.logs.length, st.log], [n, []], 'quiet: saved without the log, no line');
+        st.log = ['a line'];
+        assert.strictEqual(rec._save(st), true);
+        assert.deepStrictEqual(w.logs.slice(n), ['state saved without its log (ENOSPC: no space left on device)']);
+    } finally { fs.writeFileSync = write; }
+});
+
+test('a run not seen as the patch\'s at one look is looked at again a minute later; a trial is recorded proven then', async () => {
+    const w = makeWorld();
+    w.runs = false;
+    w.install('carplay', 'proven');
+    const { watcher } = await bootUp(w, 'A');
+    w.now.advance(61000);
+    await tick(watcher);
+    assert.deepStrictEqual([w.state('carplay').arm.confirmed, w.state('carplay').arm.seen], [false, 0], 'not the patch\'s: neither confirmed nor seen');
+    w.runs = true;
+    for (let i = 0; i < 61; i++) { w.now.advance(1000); await tick(watcher); }
+    assert.deepStrictEqual([w.state('carplay').arm.confirmed, w.state('carplay').arm.seen > 0], [true, true], 'the same run, now read as the patch\'s: confirmed and seen');
+    const t = makeWorld();
+    t.runs = false;
+    t.install('carplay', 'trial');
+    const tw = (await bootUp(t, 'A')).watcher;
+    t.now.advance(61000);
+    await tick(tw);
+    t.runs = true;
+    for (let i = 0; i < 61; i++) { t.now.advance(1000); await tick(tw); }
+    await whenRestored(tw);
+    assert.deepStrictEqual(recordOf(t), { patched: true, proven: true, trial: false }, 'a trial read as the patch\'s at a later look: recorded proven');
+});
+
+test('recmgr\'s crash table read at the count only when it decides; unreadable then, or at the arm, tells nothing', async () => {
+    /* read only for a start with no record and a long time off */
+    const w = makeWorld();
+    w.runs = true;
+    w.install('carplay', 'proven');
+    let reads = 0;
+    const key = () => { reads++; return w.crashKey; };
+    const rec = (b, extra) => w.recovery('carplay', b, Object.assign({ crashKey: key }, extra || {}));
+    await runFor(w, 'A', 2 * 60000, END.switchOff);
+    reads = 0;
+    await startBoot(rec('B', { bootStep: true }));
+    assert.strictEqual(reads, 1, 'a shutdown mark: only the arm reads it');
+    /* unreadable at the count: a start with no record */
+    const u = makeWorld();
+    u.runs = true;
+    u.install('carplay', 'proven');
+    for (const b of ['A', 'B']) { await runFor(u, b, 2 * 60000, END.powerCut); offFor(u, 3 * 3600000); }
+    await runFor(u, 'C', 2 * 60000, END.powerCut);
+    assert.strictEqual(u.state('carplay').unknown, 0, 'B parked');
+    u.crashKey = null;
+    offFor(u, 3 * 3600000);
+    await bootUp(u, 'D');
+    assert.strictEqual(u.state('carplay').unknown, 1, 'unreadable at the count: a start with no record');
+    assert(/recmgr's table unreadable/.test(u.state('carplay').log.slice(-1)[0]), u.state('carplay').log.slice(-1)[0]);
+    /* unreadable at the arm, readable at the count */
+    const v = makeWorld();
+    v.runs = true;
+    v.install('carplay', 'proven');
+    for (const b of ['A', 'B']) { await runFor(v, b, 2 * 60000, END.powerCut); offFor(v, 3 * 3600000); }
+    v.crashKey = null;
+    await runFor(v, 'C', 2 * 60000, END.powerCut);
+    assert.strictEqual(v.state('carplay').unknown, 0, 'B parked');
+    v.crashKey = 0;
+    offFor(v, 3 * 3600000);
+    await bootUp(v, 'D');
+    assert.strictEqual(v.state('carplay').unknown, 1, 'unreadable at the arm: a start with no record');
+});
+
+test('recmgrCrashKey reads recmgr\'s newest crash key with sqlite3, read-only; a missing or unreadable table is null', () => {
+    const has = cp.spawnSync('sqlite3', ['-version'], { stdio: 'ignore' });
+    if (has.error || has.status !== 0) { process.stdout.write('     (skipped: no sqlite3)\n'); return; }
+    const d = fs.mkdtempSync(path.join(ROOT, 'db-')), db = path.join(d, 'recmgr_stats.db');
+    cp.execFileSync('sqlite3', [db, 'CREATE TABLE Crash(CrashKey INTEGER PRIMARY KEY AUTOINCREMENT, Timestamp DATETIME, AppID INTEGER, UserID VARCHAR (7), CrashID VARCHAR (256), LC INTEGER);']);
+    assert.strictEqual(recovery.recmgrCrashKey(db), 0, 'an empty table');
+    cp.execFileSync('sqlite3', [db, "INSERT INTO Crash(AppID, UserID, CrashID, LC) VALUES (1, 'guest', 'a', 0), (2, 'guest', 'b', 0), (1, 'guest', 'c', 0);"]);
+    const before = fs.statSync(db).mtimeMs;
+    assert.strictEqual(recovery.recmgrCrashKey(db), 3, 'three rows');
+    assert.strictEqual(fs.statSync(db).mtimeMs, before, 'read-only');
+    assert.strictEqual(recovery.recmgrCrashKey(path.join(d, 'none.db')), null, 'no file');
+    fs.writeFileSync(path.join(d, 'junk.db'), 'not a database');
+    assert.strictEqual(recovery.recmgrCrashKey(path.join(d, 'junk.db')), null, 'not a database');
+    fs.mkdirSync(path.join(d, 'dir.db'));
+    assert.strictEqual(recovery.recmgrCrashKey(path.join(d, 'dir.db')), null, 'a folder');
+});
+
+test('the state keeps a log of how each start was counted and of the restore, the newest 16 entries; a log that cannot be saved is dropped, never the count', async () => {
+    const w = makeWorld();
+    w.runs = true;
+    w.install('carplay', 'proven');
+    await runFor(w, 'boot-1', 2 * 60000, END.switchOff);
+    await runFor(w, 'boot-2', 2 * 60000, END.powerCut);
+    await runFor(w, 'boot-3', 2 * 60000, END.otherCrash);
+    let log = w.state('carplay').log;
+    assert.strictEqual(log.length, 2, JSON.stringify(log));
+    assert(/boot boot-1 mark "running ran up 300"; healthy: failed 0 -> 0, no record 0 -> 0 \(ran healthy\)$/.test(log[0]), log[0]);
+    assert(/boot boot-2 no shutdown mark; healthy: failed 0 -> 0, no record 0 -> 1 \(ended with no record\)$/.test(log[1]), log[1]);
+    await bootUp(w, 'boot-4');
+    END.otherCrash(w, 'boot-4');
+    assert.strictEqual((await bootUp(w, 'boot-5')).step.action, 'restored');
+    log = w.state('carplay').log;
+    assert(/boot boot-3 mark "running crash ran up 20"; healthy: failed 0 -> 1, no record 1 -> 0 \(ended in a restart for a crash\)$/.test(log[2]), log[2]);
+    assert(/^\S+Z boot boot-5 .*: carplay: boot boot-4 mark "running crash ran up 20"; ran: failed 1 -> 2/.test(log[3]), log[3]);
+    assert(/carplay: patch turned off after 2 failed starts or crashes$/.test(log[4]), log[4]);
+    const st = JSON.parse(fs.readFileSync(w.T.carplay.state, 'utf8'));
+    st.log = Array.from({ length: 40 }, (x, i) => 'old ' + i);
+    fs.writeFileSync(w.T.carplay.state, JSON.stringify(st));
+    w.install('carplay', 'proven');
+    await runFor(w, 'boot-6', 61000, END.switchOff);
+    await bootUp(w, 'boot-7');
+    log = w.state('carplay').log;
+    assert.strictEqual(log.length, 16, 'the newest 16');
+    assert(/boot boot-6 /.test(log[15]) && log[0] === 'old 25', log[0] + ' ... ' + log[15]);
+    /* a write with the log fails (a full file system): saved without it */
+    const write = fs.writeFileSync;
+    fs.writeFileSync = function (f, data) {
+        if (typeof f === 'number' && /"log":\["/.test(String(data))) { const e = new Error('ENOSPC: no space left on device'); e.code = 'ENOSPC'; throw e; }
+        return write.apply(fs, arguments);
+    };
+    try { END.powerCut(w); await bootUp(w, 'boot-8'); } finally { fs.writeFileSync = write; }
+    const saved = w.state('carplay');
+    assert.deepStrictEqual([saved.log, saved.arm.boot, saved.unknown], [[], 'boot-8', 1], 'the count and the arm saved, the log dropped');
+});
+
+test('the newest release reads and writes a state this version left, log and all, and counts its starts', async () => {
+    const tags = require('./release_tags.js');
+    if (tags.list() === null) { process.stdout.write('     (skipped: not in a git checkout)\n'); return; }
+    tags.fetch('waze-on-cluster@*');
+    const list = tags.list();
+    /* the newest release that keeps no log */
+    const rels = list.filter((t) => /^waze-on-cluster@\d+\.\d+\.\d+$/.test(t)).sort((a, b) => {
+        const x = a.split('@')[1].split('.').map(Number), y = b.split('@')[1].split('.').map(Number);
+        return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+    }).reverse();
+    let d = null, newest = null;
+    for (const tag of rels) {
+        const dir = fs.mkdtempSync(path.join(ROOT, 'rel-'));
+        cp.execSync('git archive "' + tag + '" native/waze-on-cluster/patch | tar -x -C "' + dir + '" --strip-components=3', { cwd: path.join(PATCH, '..', '..', '..') });
+        if (!/LOG_MAX/.test(fs.readFileSync(path.join(dir, 'recovery.js'), 'utf8'))) { d = dir; newest = tag; break; }
+    }
+    assert(d, 'a release without the log');
+    const w = makeWorld();
+    w.runs = true;
+    w.install('carplay', 'proven');
+    for (const b of ['A', 'B']) { await runFor(w, b, 4 * 60000, END.powerCut); offFor(w, 3 * 3600000); }
+    const before = JSON.parse(fs.readFileSync(w.T.carplay.state, 'utf8'));
+    assert(before.log.length && before.arm.seen, 'this version left a log and a seen time');
+    const script = 'var r = require(' + JSON.stringify(path.join(d, 'recovery.js')) + ');' +
+        'var t = r.targets({ state: ' + JSON.stringify(w.T.carplay.state) + ', sock: ' + JSON.stringify(path.join(w.dir, 'shm', 'patch.sock')) +
+        ', carplay: "/nonexistent", aapd: "/nonexistent", aapdConf: "/nonexistent" }).carplay;' +
+        'var x = new r.Recovery({ target: t, bootId: "old-boot" }), st = x._load();' +
+        'var e = { state: null, crash: false, orderly: true, neverRan: false, explained: false };' +
+        'var n = r.tally(st, st.arm, e); st.fails = n.fails; st.unknown = n.unknown; st.prev = st.arm; st.arm = null;' +
+        'process.stdout.write(JSON.stringify({ saved: x._save(st), n: n }));';
+    const text = cp.execFileSync(process.execPath, ['-e', script], { encoding: 'utf8' }), out = JSON.parse(text.slice(text.lastIndexOf('{"saved"')));
+    const after = JSON.parse(fs.readFileSync(w.T.carplay.state, 'utf8'));
+    assert(out.saved && out.n.fails === 0 && out.n.unknown === 0, newest + ': counted the start: ' + JSON.stringify(out));
+    assert(!('log' in after) && !('seen' in after.prev) && after.fails === 0 && after.unknown === 0, newest + ': its save keeps only what it knows: ' + JSON.stringify(after));
+});
+
+test('a plan still to make is made again only for the build it was for: after a car software update the service runs as it ships', async () => {
+    if (!fs.existsSync(CARPLAY_BIN)) { console.log('     (skipped: CARPLAY_BIN not set)'); return; }
+    makeWorld();
+    const bin = fs.readFileSync(CARPLAY_BIN);
+    fs.writeFileSync(CARPLAY, bin, { mode: 0o755 });
+    inmem.planFailed('carplay', ['--panel', 'high'], 'the coding was not published yet');
+    const id = require('../carplay_locate.js').buildId(bin);
+    assert.strictEqual(inmem.readRecord('carplay').build, id, 'the record keeps the build-id');
+    /* another build: the build-id note's last byte changed */
+    const other = Buffer.from(bin), at = other.indexOf(Buffer.from(id, 'hex'));
+    assert(at > 0, 'the build-id is in the file');
+    other[at + 19] ^= 0xff;
+    fs.writeFileSync(CARPLAY, other, { mode: 0o755 });
+    const planned = await new Promise((resolve) => recovery.retryPlan('carplay', resolve, 0, 1000));
+    assert.deepStrictEqual([planned, inmem.readRecord('carplay')], [false, null], 'another build: not planned, the record dropped');
+    /* an earlier release's record, with no build-id: it cannot tell, so it is dropped too */
+    fs.writeFileSync(CARPLAY, bin, { mode: 0o755 });
+    inmem.planFailed('carplay', ['--panel', 'high'], 'the coding was not published yet');
+    inmem.update('carplay', { build: undefined });
+    const planned2 = await new Promise((resolve) => recovery.retryPlan('carplay', resolve, 0, 1000));
+    assert.deepStrictEqual([planned2, inmem.readRecord('carplay')], [false, null], 'no build-id: not planned, the record dropped');
+    clearInmem();
+});
+
+test('a plan still to make waits for a readable coding at the boot step, and the watcher plans it whatever the coding reads', async () => {
+    if (!fs.existsSync(CARPLAY_BIN)) { console.log('     (skipped: CARPLAY_BIN not set)'); return; }
+    makeWorld();
+    fs.writeFileSync(CARPLAY, fs.readFileSync(CARPLAY_BIN), { mode: 0o755 });
+    const args = ['--panel', 'high', '--coding', process.env.WOC_CODING];
+    try {
+        headUnit.coding(null);
+        inmem.planFailed('carplay', args, 'the coding was not published yet');
+        let planned = await new Promise((resolve) => recovery.retryPlan('carplay', resolve, 0, 60000));
+        assert.deepStrictEqual([planned, inmem.readRecord('carplay').needsPlan], [false, true], 'boot step, no coding: not planned, still to plan');
+        headUnit.coding(7, 0);
+        planned = await new Promise((resolve) => recovery.retryPlan('carplay', resolve, 0, 60000));
+        assert.deepStrictEqual([planned, inmem.readRecord('carplay').needsPlan], [false, true], 'boot step, a coding not yet valid: not planned, still to plan');
+        headUnit.coding(7);
+        planned = await new Promise((resolve) => recovery.retryPlan('carplay', resolve, 0, 60000));
+        const m = inmem.readRecord('carplay');
+        assert(planned && !m.needsPlan && m.enabled === true && m.coding === 7, 'boot step, coding 7: planned for it ' + JSON.stringify(m));
+        clearInmem();
+        headUnit.coding(null);
+        inmem.planFailed('carplay', args, 'the coding was not published yet');
+        planned = await new Promise((resolve) => recovery.retryPlan('carplay', resolve, 0, 60000, true));
+        assert(planned && !inmem.readRecord('carplay').needsPlan && inmem.readRecord('carplay').coding === 'unreadable', 'the watcher, no coding: planned, as 7');
+    } finally { headUnit.coding(7); clearInmem(); }
+});
+
+test('a plan records the coding it was made for; one made for another coding than the car reads is planned again for it, which refuses a coding the patch is not made for', async () => {
+    if (!fs.existsSync(CARPLAY_BIN)) { console.log('     (skipped: CARPLAY_BIN not set)'); return; }
+    makeWorld();
+    fs.writeFileSync(CARPLAY, fs.readFileSync(CARPLAY_BIN), { mode: 0o755 });
+    const args = ['--panel', 'high', '--coding', process.env.WOC_CODING];
+    const planned = (c) => { headUnit.coding(c); return new Promise((resolve) => inmem.makePlan('carplay', args, 60000, (e, rec) => resolve(e ? e.message : rec))); };
+    try {
+        let rec = await planned(7);
+        assert.deepStrictEqual([rec.coding, rec.v], [7, 1], 'made for 7');
+        assert.strictEqual(recovery.codingMoved('carplay'), false, 'the car reads 7: kept');
+        headUnit.coding(null);
+        assert.strictEqual(recovery.codingMoved('carplay'), false, 'the coding unreadable: kept');
+        headUnit.coding(4);
+        assert.strictEqual(recovery.codingMoved('carplay'), true, 'the car reads 4: planned again');
+        let m = inmem.readRecord('carplay');
+        assert.deepStrictEqual([m.enabled, m.needsPlan, m.args, inmem.armed('carplay')], [true, true, args, false], 'a plan still to make, nothing armed');
+        const again = await new Promise((resolve) => recovery.retryPlan('carplay', resolve, 0, 60000));
+        assert.deepStrictEqual([again, inmem.readRecord('carplay')], [false, null], 'coding 4: the plan refused, the record gone');
+        clearInmem();
+        rec = await planned(null);
+        assert.deepStrictEqual([rec.coding, rec.v], ['unreadable', 2], 'made while the coding could not be read: a record releases before this one do not read');
+        headUnit.coding(7);
+        assert.strictEqual(recovery.codingMoved('carplay'), false, 'then it reads 7: kept');
+        headUnit.coding(9);
+        assert.strictEqual(recovery.codingMoved('carplay'), true, 'then it reads 9: planned again');
+        clearInmem();
+        rec = await planned(7);
+        inmem.update('carplay', { coding: undefined });
+        assert.strictEqual(inmem.readRecord('carplay').coding, undefined, 'a record of a release that did not keep the coding');
+        headUnit.coding(10);
+        assert.strictEqual(recovery.codingMoved('carplay'), true, 'taken as made for 7: the car reads 10, planned again');
+        clearInmem();
+    } finally { headUnit.coding(7); clearInmem(); }
+});
+
 test('the original (Disable used) or no backup of ours: nothing armed, counted or restored', async () => {
     for (const kind of ['original', 'none']) {
         const w = makeWorld();
@@ -774,8 +1306,8 @@ test('a missing or corrupt state file restores nothing on its own; the boot is a
 
 test('a patch of ours found in carplay\'s file is put back at the boot step at once, whatever the count or its record, nothing armed over it, our backup dropped, and recorded as a plan to make', async () => {
     const CODING = process.env.WOC_CODING;
-    for (const [kind, rec, unproven] of [['file-proven', null, false], ['file-unproven', null, true], ['file-trial', null, false], ['unknown', null, false],
-        ['unknown', '{oops', false], ['unknown', '{"patched":true,"proven":false}\n', false]]) {
+    for (const [kind, rec] of [['file-proven', null], ['file-unproven', null], ['file-trial', null], ['unknown', null],
+        ['unknown', '{oops'], ['unknown', '{"patched":true,"proven":false}\n']]) {
         const what = kind + (rec ? ' ' + JSON.stringify(rec) : '');
         const w = makeWorld();
         w.install('carplay', kind);
@@ -788,7 +1320,7 @@ test('a patch of ours found in carplay\'s file is put back at the boot step at o
         assert(!fs.existsSync(w.T.carplay.target + '.woc-orig') && !fs.existsSync(w.T.carplay.target + '.woc-orig.json') &&
             !fs.existsSync(record.recordPath(w.T.carplay.target)), what + ': no backup or record of ours left beside it');
         const m = inmem.readRecord('carplay');
-        assert.deepStrictEqual([m.enabled, m.needsPlan, m.args], [true, true, ['--panel', 'high', '--coding', CODING].concat(unproven ? ['--unproven'] : [])],
+        assert.deepStrictEqual([m.enabled, m.needsPlan, m.args], [true, true, ['--panel', 'high', '--coding', CODING]],
             what + ': a plan to make, for the watcher');
         assert(ro(), what + ': / read-only again');
     }
@@ -1425,6 +1957,7 @@ test('systemctl is asked every 60 s while the service\'s main PID is in /proc, e
 
 test('the state is read for a run\'s healthy minute until it is settled, then not again in that run', async () => {
     const w = makeWorld();
+    w.runs = true;
     w.install('carplay', 'proven');
     let loads = 0, failSave = true;
     const watcher = w.recovery('carplay', 'A');
@@ -1894,6 +2427,9 @@ for (const confLeft of [true, false]) test('the boot step over patchd\'s put-bac
     /* patchd's order: the record to plan first, then the files back */
     const args = ['--conf', conf, '--dpi', '170', '--card', 'shown', '--unproven'];
     inmem.planFailed('aapd', args, 'not planned yet: putting aapd back was cut short');
+    /* the build-id patchd records, of the aapd it puts back (this process's
+     * inmem.js names another aapd path) */
+    inmem.update('aapd', { build: inmem.buildOf(target) });
     fs.writeFileSync(target + '.new', fs.readFileSync(AAPD_BIN), { mode: 0o755 });
     fs.renameSync(target + '.new', target);
     if (!confLeft) { fs.writeFileSync(conf + '.new', fs.readFileSync(AAPD_CONF), { mode: 0o644 }); fs.renameSync(conf + '.new', conf); }

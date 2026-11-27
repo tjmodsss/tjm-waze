@@ -434,16 +434,21 @@ function statusStores(buf, from, to, v, d) {
  *   ready-tail   the 23 bytes after that call are the stock or the patched
  *                form, the stock jne landing on the call right after them
  *                (the stack-check failure);
- *   ready-into   no branch lands on or inside them. */
+ *   ready-into   no branch lands on or inside them.
+ * A function whose frame, flag-and-call or own `this` differ is a build
+ * without the site (absent: true; the patch in memory is planned without
+ * the ready start); an end that is neither form, or a branch into it, is
+ * a site changed (refused). */
+function absent(reason) { return { ok: false, reason: reason, absent: true }; }
 var READY_STOCK = '488b442408' + '644833042528000000' + '7507' + '4883c418' + '5b5dc3', READY_LEN = 23;
 function readyStart(im, ready, F, rs) {
     var buf = im.buf;
     if (on('ready-frame') && !(buf.toString('hex', ready.off, ready.off + 5) === '554889fd53' &&
         E.scan(buf, ready.off + 5, Math.min(ready.end, ready.off + 0x10), [0x48, 0x83, 0xec, 0x18]).length === 1))
-        return fail('self-start: onAlternateVideoReady\'s frame is not the one the ready start returns from');
+        return absent('self-start: onAlternateVideoReady\'s frame is not the one the ready start returns from');
     var hits = E.scan(buf, ready.off, ready.end, [0xc6, 0x45, F, 0x01, null, null, null, 0xe8]), h = hits[0];
-    if (hits.length !== 1) return fail(count(hits, 'self-start: onAlternateVideoReady\'s call after its ready flag'));
-    if (on('ready-this') && buf.toString('hex', h + 4, h + 7) !== '4889ef') return fail('self-start: onAlternateVideoReady subscribes another object than its own');
+    if (hits.length !== 1) return absent(count(hits, 'self-start: onAlternateVideoReady\'s call after its ready flag'));
+    if (on('ready-this') && buf.toString('hex', h + 4, h + 7) !== '4889ef') return absent('self-start: onAlternateVideoReady subscribes another object than its own');
     var at = h + 12, cur = buf.toString('hex', at, at + READY_LEN);
     var patched = '4889ef' + '4883c418' + '5b5d' + 'e9' + E.hex32(im.va(rs.off) - im.va(at + 14)) + '0f1f8000000000' + '6690';
     var state = cur === READY_STOCK ? 'original' : cur === patched ? 'patched' : null;

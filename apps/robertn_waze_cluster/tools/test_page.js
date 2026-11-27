@@ -408,14 +408,14 @@ async function main() {
         await until('waiting for a restart', () => byName.wocAaZoom.text === 'Zoom: 160 dpi (after restart)' &&
             byName.wocAaCard.text === "Hide phone's turn card (after restart)" && byName.wocAaCard.selected === true &&
             byName.wocAaStatus.text === 'Status: Patched after restart' && byName.wocRestart.visible === true);
-        patch.aa = { state: 'original', density: 160, densities: [150, 400, 10], conflict: 'not supported on this car (KI_KOMBI_VARIANT 9)' };
+        patch.aa = { state: 'original', density: 160, densities: [150, 400, 10], conflict: 'not supported on this cluster (KI_KOMBI_VARIANT 4; the map is made for KI_KOMBI_VARIANT 7)' };
         patch.announce('patched', 'high', null);
-        await until('not supported', () => byName.wocAaStatus.text === 'Status: Not supported on this car' &&
+        await until('not supported', () => byName.wocAaStatus.text === 'Status: Not supported — this cluster' &&
             JSON.stringify(aaRow()) === JSON.stringify([false, false, false, false, false]) && byName.wocRestart.visible === false);
         patch.aa = { state: 'patched', dpi: 160, density: 160, densities: [150, 400, 10] };
         patch.announce('patched', 'high', null);
         console.log('ok   Android Auto: its own line, Patch, Remove patch, the zoom and the Hide phone\'s turn card checkbox with their values, marked while waiting; ' +
-            'not supported on this car: every button greyed');
+            'not supported on this cluster: every button greyed');
 
         const guide = byName.wocGuide;
         await until('the switch enabled, ticked', () => guide.enabled === true && guide.selected === true);

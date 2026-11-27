@@ -70,8 +70,8 @@
  * is refused. Any build whose sites are all found and verified is planned:
  * no list of builds decides it.
  * The edits are applied in carplay's memory (PATCH.md "In memory"): `plan`
- * reads the stock file, runs every check (the head unit, the coding, unless
- * --unproven, the locator) and writes the plan libwocpatch.so applies;
+ * reads the stock file, runs every check (the head unit, the coding, the
+ * locator) and writes the plan libwocpatch.so applies;
  * `overlay` reads the file with a plan laid over it.
  * This version writes carplay only to put back a patch an earlier release
  * wrote into the file (`revert`): the edits' regions or the whole verified
@@ -159,7 +159,7 @@ function die(msg) { process.stderr.write('error: ' + msg + '\n'); process.exit(1
 function hex(n) { return '0x' + n.toString(16); }
 
 /* The cluster coding, read and judged as aapd_patch.js does: {variant} or
- * {err}, and why it is not KI_KOMBI_VARIANT 7 (null when it is). Loaded on use,
+ * {err}, and why the patch cannot work with it (null when it can). Loaded on use,
  * so boot recovery, which loads this file for its backup check, does not
  * load the Android Auto patcher. */
 function readCoding(file) { return require('./aapd_patch.js').readCoding(file); }
@@ -376,6 +376,7 @@ function cmdStatus(target, codingFile) {
     var p;
     try { p = restorePlan(target, buf, c); } catch (e) { p = { err: e.message }; }
     line('restorable', p.err ? 'no (' + p.err + ')' : p.b.other ? 'no (another build: ' + p.b.other + ')' : !p.out.equals(buf) || modeOnly(target, buf, p) ? 'yes' : 'no');
+    line('replaced', replaced(p) ? 'yes' : 'no');
     /* Our edits beside another change: the file differs from its original
      * outside the sites of our edits. */
     var fo = foreignIn(target);
@@ -383,9 +384,11 @@ function cmdStatus(target, codingFile) {
     var bad = unrecognised(c);
     if (!c.ok) { line('known', 'NO — ' + c.reason); return; }
     /* A backup the patch would refuse (another build's original, or
-     * not the original recorded) makes the build one this tool cannot patch. */
+     * not the original recorded) makes the build one this tool cannot patch,
+     * unless the target is another build by its build-id (a car software
+     * update replaced it: the backup goes when the patch is planned). */
     var bak = backupPath(target), hasBak = fs.existsSync(bak), bakWhy = '';
-    if (hasBak && !bad.length) {
+    if (hasBak && !bad.length && !replaced(p)) {
         var b;
         try { b = checkedBackup(target, p.bc && !p.b.stock ? { buf: p.b.buf, c: p.bc } : null); } catch (e) { b = { err: e.message }; }
         bakWhy = b.err ? 'backup ' + bak + ' is not a pristine original'
@@ -489,13 +492,18 @@ function checkedBackup(target, pre) {
  * URL 64 + 11), twice over. */
 var SAME_BUILD_MAX_DIFF = 2 * (4 + 59 + 5 + 4 * 8 + 55 + 7 + 64 + 11);
 
+/* Whether a restore plan's backup is of a build a car software update
+ * replaced (by the target's build-id). */
+function replaced(p) { return !!p && !!p.b && p.b.other === locator.BUILD_ID_DIFFERS; }
+
 /* Why `cur` is not the build `orig` is the original of, or null when it is:
  * the same build-id and size, or, when either has no build-id, the same size
  * and at most SAME_BUILD_MAX_DIFF bytes apart. */
 function otherBuild(cur, orig) {
-    if (cur.length !== orig.length) return 'its size differs';
     var a = locator.buildId(cur), b = locator.buildId(orig);
-    if (a && b) return a === b ? null : 'its build-id differs';
+    if (a && b && a !== b) return locator.BUILD_ID_DIFFERS;
+    if (cur.length !== orig.length) return 'its size differs';
+    if (a && b) return null;
     for (var i = 0, n = 0; i < cur.length; i++) {
         if (cur[i] !== orig[i] && ++n > SAME_BUILD_MAX_DIFF) return 'no build-id, and more than ' + SAME_BUILD_MAX_DIFF + ' bytes differ';
     }
@@ -645,7 +653,14 @@ function cmdRevert(target, yes, force, dropBackup) {
         process.stdout.write('already at the original; nothing to do\n'); record.ensure(target, revRec); drop(); return;
     }
     /* Another build (a firmware update replaced carplay and left the old
-     * backup behind): restoring would downgrade it. */
+     * backup behind): restoring would downgrade it. One by its build-id:
+     * with --drop-backup the backup, of a build no longer there, goes and
+     * carplay stays. */
+    if (replaced(p) && !force && dropBackup) {
+        process.stdout.write('current ' + target + ' is another build than the backup (' + b.other + '); left as it is, nothing to do\n');
+        drop();
+        return;
+    }
     if (b.other && !force) {
         die('current ' + target + ' is another build than the backup (' + b.other + ').' +
             '\n  It may have been replaced (e.g. a firmware update). Refusing to overwrite it.' +
@@ -813,18 +828,20 @@ function overlay(buf, text) {
 /* `plan`: the patch, as a plan for libwocpatch.so, made from
  * the file on disk, which must be the pristine build (it is what the
  * process maps) and stays as it is. Checks: the head unit, the coding
- * (KI_KOMBI_VARIANT 7; --unproven, CarPlay's Patch button, plans on another
- * or an unreadable one too), the locator: every edit site found and
- * verified, on any build. Writes the plan to `outFile` by rename and prints
+ * (aapd_patch.js codingRefusal: KI_KOMBI_VARIANT 7, or one that cannot be
+ * read, planned as 7), the locator: every edit site found and
+ * verified, on any build. --unproven, which earlier releases' records
+ * pass, changes nothing. Writes the plan to `outFile` by rename and prints
  * one JSON line: build, version, sha256, size, edits, coding ('ok',
- * 'refused', 'unreadable'), writes, planSha256. */
-function cmdPlan(target, panel, capture, sink, res, safe, unproven, codingFile, outFile) {
+ * 'unreadable'), variant (the coding read, null when unreadable), writes,
+ * planSha256. */
+function cmdPlan(target, panel, capture, sink, res, safe, codingFile, outFile) {
     var hu = headUnit.refused();
     if (hu) die('refusing: ' + hu);
     if (!outFile) die('plan needs --out <file>');
     if (panel !== 'high' && panel !== 'mid') die('--panel must be high or mid');
     var coding = readCoding(codingFile), codingBad = codingRefusal(coding);
-    if (codingBad && !unproven) die('refusing: ' + codingBad + '; pass --unproven to patch it anyway');
+    if (codingBad) die('refusing: ' + codingBad);
     var wantRes = resFor(panel, res, safe);
     var sinkUrl = sinkUrlFor(capture, sink);
     if (sinkUrl !== undefined && Buffer.byteLength(sinkUrl, 'latin1') > locator.SINK_STOCK.length) die('sink URL too long');
@@ -843,9 +860,8 @@ function cmdPlan(target, panel, capture, sink, res, safe, unproven, codingFile, 
     fsyncFile(tmp);
     fs.renameSync(tmp, outFile);
     process.stdout.write(JSON.stringify({ build: c.loc.buildId, version: c.loc.version ? 'carplay ' + c.loc.version : label(c), sha256: sha256(buf), size: buf.length, edits: p.edits,
-        coding: cd(coding), writes: { mapurl: e.writes.mapurl, showui: e.writes.showui, res: e.writes.res ? resKey(e.writes.res) : null },
+        coding: coding.err ? 'unreadable' : 'ok', variant: coding.err ? null : coding.variant, writes: { mapurl: e.writes.mapurl, showui: e.writes.showui, res: e.writes.res ? resKey(e.writes.res) : null },
         planSha256: sha256(Buffer.from(p.text)) }) + '\n');
-    function cd(x) { return x.err ? 'unreadable' : codingRefusal(x) ? 'refused' : 'ok'; }
 }
 
 /* `overlay`: the edit lines of `status` for the file with the plan laid
@@ -917,7 +933,7 @@ function main() {
     else if (cmd === 'probe') cmdProbe(a.target || a._[1] || '/usr/bin/carplay');
     else if (cmd === 'revert') cmdRevert(target, a.yes, a.force, a.dropBackup);
     else if (cmd === 'verify') cmdVerify(target);
-    else if (cmd === 'plan') cmdPlan(target, a.panel, a.capture, a.sink, a.res, a.safe, a.unproven, coding, a.out);
+    else if (cmd === 'plan') cmdPlan(target, a.panel, a.capture, a.sink, a.res, a.safe, coding, a.out);
     else if (cmd === 'overlay') { cmdOverlay(target, a.plan); line('end', 'complete'); }
     else { process.stderr.write('usage: carplay_patch.js status|probe|revert|verify|plan|overlay [--target <file>] [--coding <shm>] [--panel high|mid] [--capture <fifo> | --sink <url>] [--res WxH|stock] [--safe WxH+X+Y|full] [--unproven] [--yes] [--force] [--drop-backup]\n'); process.exit(2); }
 }
